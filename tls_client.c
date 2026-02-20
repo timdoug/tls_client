@@ -871,6 +871,213 @@ static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bi
     *r=result;
 }
 
+static void bn_add(bignum *r, const bignum *a, const bignum *b) {
+    int ml=a->len>b->len?a->len:b->len;
+    uint128_t c=0;
+    for(int i=0;i<ml;i++){
+        c+=(uint128_t)(i<a->len?a->v[i]:0)+(i<b->len?b->v[i]:0);
+        r->v[i]=(uint64_t)c; c>>=64;
+    }
+    r->len=ml;
+    if(c&&r->len<BN_MAX_LIMBS) r->v[r->len++]=(uint64_t)c;
+    while(r->len>0&&r->v[r->len-1]==0) r->len--;
+}
+
+static void bn_modadd(bignum *r, const bignum *a, const bignum *b, const bignum *m) {
+    bn_add(r,a,b);
+    if(bn_cmp(r,m)>=0) bn_sub(r,r,m);
+}
+
+static void bn_modsub(bignum *r, const bignum *a, const bignum *b, const bignum *m) {
+    if(bn_cmp(a,b)>=0){ bn_sub(r,a,b); }
+    else { bignum t; bn_sub(&t,b,a); bn_sub(r,m,&t); }
+}
+
+static void bn_modinv(bignum *r, const bignum *a, const bignum *m) {
+    bignum exp=*m, two; bn_zero(&two); two.v[0]=2; two.len=1;
+    bn_sub(&exp,&exp,&two);
+    bn_modexp(r,a,&exp,m);
+}
+
+/* ================================================================
+ * P-256 (secp256r1) via bignum arithmetic
+ * ================================================================ */
+static const uint8_t P256_P[32]={
+    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+};
+static const uint8_t P256_GX[32]={
+    0x6B,0x17,0xD1,0xF2,0xE1,0x2C,0x42,0x47,0xF8,0xBC,0xE6,0xE5,0x63,0xA4,0x40,0xF2,
+    0x77,0x03,0x7D,0x81,0x2D,0xEB,0x33,0xA0,0xF4,0xA1,0x39,0x45,0xD8,0x98,0xC2,0x96
+};
+static const uint8_t P256_GY[32]={
+    0x4F,0xE3,0x42,0xE2,0xFE,0x1A,0x7F,0x9B,0x8E,0xE7,0xEB,0x4A,0x7C,0x0F,0x9E,0x16,
+    0x2B,0xCE,0x33,0x57,0x6B,0x31,0x5E,0xCE,0xCB,0xB6,0x40,0x68,0x37,0xBF,0x51,0xF5
+};
+static const uint8_t P256_B[32]={
+    0x5A,0xC6,0x35,0xD8,0xAA,0x3A,0x93,0xE7,0xB3,0xEB,0xBD,0x55,0x76,0x98,0x86,0xBC,
+    0x65,0x1D,0x06,0xB0,0xCC,0x53,0xB0,0xF6,0x3B,0xCE,0x3C,0x3E,0x27,0xD2,0x60,0x4B
+};
+
+static bignum p256_p, p256_b, p256_gx, p256_gy;
+static int p256_inited=0;
+
+static void p256_init(void) {
+    if(p256_inited) return;
+    bn_from_bytes(&p256_p,P256_P,32);
+    bn_from_bytes(&p256_b,P256_B,32);
+    bn_from_bytes(&p256_gx,P256_GX,32);
+    bn_from_bytes(&p256_gy,P256_GY,32);
+    p256_inited=1;
+}
+
+typedef struct { bignum x,y,z; } ec256;
+
+static int ec256_is_inf(const ec256 *p){return p->z.len==0;}
+static void ec256_set_inf(ec256 *p){
+    bn_zero(&p->x);p->x.v[0]=1;p->x.len=1;
+    bn_zero(&p->y);p->y.v[0]=1;p->y.len=1;
+    bn_zero(&p->z);
+}
+
+static int ec256_on_curve(const bignum *x, const bignum *y) {
+    bignum y2,x2,x3,t,three;
+    bn_modmul(&y2,y,y,&p256_p);
+    bn_modmul(&x2,x,x,&p256_p);
+    bn_modmul(&x3,&x2,x,&p256_p);
+    bn_zero(&three);three.v[0]=3;three.len=1;
+    bn_modmul(&t,x,&three,&p256_p);
+    bn_modsub(&x3,&x3,&t,&p256_p);
+    bn_modadd(&x3,&x3,&p256_b,&p256_p);
+    return bn_cmp(&y2,&x3)==0;
+}
+
+/* Jacobian point doubling, a=-3 */
+static void ec256_double(ec256 *r, const ec256 *pt) {
+    if(ec256_is_inf(pt)){ec256_set_inf(r);return;}
+    bignum z2,m,y2,s,x3,y3,z3,t1,t2,y4,s2;
+    bn_modmul(&z2,&pt->z,&pt->z,&p256_p);
+    /* m = 3*(x-z2)*(x+z2) */
+    bn_modsub(&t1,&pt->x,&z2,&p256_p);
+    bn_modadd(&t2,&pt->x,&z2,&p256_p);
+    bn_modmul(&m,&t1,&t2,&p256_p);
+    bn_modadd(&t1,&m,&m,&p256_p); bn_modadd(&m,&t1,&m,&p256_p);
+    /* s = 4*x*y^2 */
+    bn_modmul(&y2,&pt->y,&pt->y,&p256_p);
+    bn_modmul(&s,&pt->x,&y2,&p256_p);
+    bn_modadd(&s,&s,&s,&p256_p); bn_modadd(&s,&s,&s,&p256_p);
+    /* x3 = m^2 - 2s */
+    bn_modmul(&x3,&m,&m,&p256_p);
+    bn_modadd(&s2,&s,&s,&p256_p);
+    bn_modsub(&x3,&x3,&s2,&p256_p);
+    /* y3 = m*(s-x3) - 8*y^4 */
+    bn_modsub(&t1,&s,&x3,&p256_p);
+    bn_modmul(&y3,&m,&t1,&p256_p);
+    bn_modmul(&y4,&y2,&y2,&p256_p);
+    bn_modadd(&y4,&y4,&y4,&p256_p);bn_modadd(&y4,&y4,&y4,&p256_p);bn_modadd(&y4,&y4,&y4,&p256_p);
+    bn_modsub(&y3,&y3,&y4,&p256_p);
+    /* z3 = 2*y*z */
+    bn_modmul(&z3,&pt->y,&pt->z,&p256_p);
+    bn_modadd(&z3,&z3,&z3,&p256_p);
+    r->x=x3;r->y=y3;r->z=z3;
+}
+
+/* Jacobian point addition */
+static void ec256_add(ec256 *r, const ec256 *p, const ec256 *q) {
+    if(ec256_is_inf(p)){*r=*q;return;}
+    if(ec256_is_inf(q)){*r=*p;return;}
+    bignum z1s,z2s,u1,u2,z1c,z2c,s1,s2,h,rr,h2,h3,u1h2,x3,y3,z3,t,u1h2_2,s1h3;
+    bn_modmul(&z1s,&p->z,&p->z,&p256_p); bn_modmul(&z2s,&q->z,&q->z,&p256_p);
+    bn_modmul(&u1,&p->x,&z2s,&p256_p); bn_modmul(&u2,&q->x,&z1s,&p256_p);
+    bn_modmul(&z1c,&z1s,&p->z,&p256_p); bn_modmul(&z2c,&z2s,&q->z,&p256_p);
+    bn_modmul(&s1,&p->y,&z2c,&p256_p); bn_modmul(&s2,&q->y,&z1c,&p256_p);
+    bn_modsub(&h,&u2,&u1,&p256_p); bn_modsub(&rr,&s2,&s1,&p256_p);
+    if(h.len==0){
+        if(rr.len==0){ec256_double(r,p);return;}
+        ec256_set_inf(r);return;
+    }
+    bn_modmul(&h2,&h,&h,&p256_p); bn_modmul(&h3,&h2,&h,&p256_p);
+    bn_modmul(&u1h2,&u1,&h2,&p256_p);
+    bn_modmul(&x3,&rr,&rr,&p256_p); bn_modsub(&x3,&x3,&h3,&p256_p);
+    bn_modadd(&u1h2_2,&u1h2,&u1h2,&p256_p);
+    bn_modsub(&x3,&x3,&u1h2_2,&p256_p);
+    bn_modsub(&t,&u1h2,&x3,&p256_p); bn_modmul(&y3,&rr,&t,&p256_p);
+    bn_modmul(&s1h3,&s1,&h3,&p256_p); bn_modsub(&y3,&y3,&s1h3,&p256_p);
+    bn_modmul(&z3,&p->z,&q->z,&p256_p); bn_modmul(&z3,&z3,&h,&p256_p);
+    r->x=x3;r->y=y3;r->z=z3;
+}
+
+static void ec256_to_affine(bignum *ax, bignum *ay, const ec256 *p) {
+    bignum zi,zi2,zi3;
+    bn_modinv(&zi,&p->z,&p256_p);
+    bn_modmul(&zi2,&zi,&zi,&p256_p);
+    bn_modmul(&zi3,&zi2,&zi,&p256_p);
+    bn_modmul(ax,&p->x,&zi2,&p256_p);
+    bn_modmul(ay,&p->y,&zi3,&p256_p);
+}
+
+/* Montgomery ladder scalar multiplication (constant-time) */
+static void ec256_scalar_mul(ec256 *r, const ec256 *p, const uint8_t scalar[32]) {
+    ec256 R0,R1;
+    ec256_set_inf(&R0); R1=*p;
+    for(int i=255;i>=0;i--){
+        int byte_idx=31-(i/8), bit_pos=i%8;
+        uint64_t bit=(scalar[byte_idx]>>bit_pos)&1;
+        /* constant-time conditional swap */
+        uint64_t mask=-(uint64_t)bit;
+        for(int j=0;j<BN_MAX_LIMBS;j++){
+            uint64_t d;
+            d=mask&(R0.x.v[j]^R1.x.v[j]);R0.x.v[j]^=d;R1.x.v[j]^=d;
+            d=mask&(R0.y.v[j]^R1.y.v[j]);R0.y.v[j]^=d;R1.y.v[j]^=d;
+            d=mask&(R0.z.v[j]^R1.z.v[j]);R0.z.v[j]^=d;R1.z.v[j]^=d;
+        }
+        { int t=R0.x.len; R0.x.len=bit?R1.x.len:R0.x.len; R1.x.len=bit?t:R1.x.len; }
+        { int t=R0.y.len; R0.y.len=bit?R1.y.len:R0.y.len; R1.y.len=bit?t:R1.y.len; }
+        { int t=R0.z.len; R0.z.len=bit?R1.z.len:R0.z.len; R1.z.len=bit?t:R1.z.len; }
+        ec256_add(&R1,&R0,&R1);
+        ec256_double(&R0,&R0);
+        for(int j=0;j<BN_MAX_LIMBS;j++){
+            uint64_t d;
+            d=mask&(R0.x.v[j]^R1.x.v[j]);R0.x.v[j]^=d;R1.x.v[j]^=d;
+            d=mask&(R0.y.v[j]^R1.y.v[j]);R0.y.v[j]^=d;R1.y.v[j]^=d;
+            d=mask&(R0.z.v[j]^R1.z.v[j]);R0.z.v[j]^=d;R1.z.v[j]^=d;
+        }
+        { int t=R0.x.len; R0.x.len=bit?R1.x.len:R0.x.len; R1.x.len=bit?t:R1.x.len; }
+        { int t=R0.y.len; R0.y.len=bit?R1.y.len:R0.y.len; R1.y.len=bit?t:R1.y.len; }
+        { int t=R0.z.len; R0.z.len=bit?R1.z.len:R0.z.len; R1.z.len=bit?t:R1.z.len; }
+    }
+    *r=R0;
+}
+
+/* ECDHE P-256 keygen */
+static void ecdhe_p256_keygen(uint8_t priv[32], uint8_t pub[65]) {
+    p256_init();
+    random_bytes(priv,32);
+    priv[0]|=0x80;
+    ec256 G; G.x=p256_gx; G.y=p256_gy;
+    bn_zero(&G.z); G.z.v[0]=1; G.z.len=1;
+    ec256 Q; ec256_scalar_mul(&Q,&G,priv);
+    bignum ax,ay; ec256_to_affine(&ax,&ay,&Q);
+    pub[0]=0x04;
+    bn_to_bytes(&ax,pub+1,32);
+    bn_to_bytes(&ay,pub+33,32);
+    if(!ec256_on_curve(&ax,&ay)) fprintf(stderr,"BUG: P-256 point NOT on curve!\n");
+    else printf("  P-256 point verified on curve\n");
+}
+
+static void ecdhe_p256_shared_secret(const uint8_t priv[32], const uint8_t peer_pub[65], uint8_t secret[32]) {
+    p256_init();
+    bignum px,py;
+    bn_from_bytes(&px,peer_pub+1,32);
+    bn_from_bytes(&py,peer_pub+33,32);
+    if(!ec256_on_curve(&px,&py)) die("P-256 peer key not on curve");
+    ec256 P; P.x=px; P.y=py;
+    bn_zero(&P.z); P.z.v[0]=1; P.z.len=1;
+    ec256 S; ec256_scalar_mul(&S,&P,priv);
+    bignum sx,sy; ec256_to_affine(&sx,&sy,&S);
+    bn_to_bytes(&sx,secret,32);
+}
+
 /* OID constants */
 static const uint8_t OID_ECDSA_SHA384[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
 static const uint8_t OID_SHA256_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
@@ -1432,7 +1639,8 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
 }
 
 /* Build ClientHello for TLS 1.3 with secp384r1 */
-static size_t build_client_hello(uint8_t *buf, const uint8_t pub[97], const char *host) {
+static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
+                                  const uint8_t p384_pub[97], const char *host) {
     size_t p=0;
     /* Handshake header - fill length later */
     buf[p++]=0x01; /* ClientHello */
@@ -1472,8 +1680,9 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t pub[97], const char
 
     /* supported_groups */
     buf[p++]=0x00;buf[p++]=0x0a;
-    buf[p++]=0x00;buf[p++]=0x04; /* ext len */
-    buf[p++]=0x00;buf[p++]=0x02; /* list len */
+    buf[p++]=0x00;buf[p++]=0x06; /* ext len */
+    buf[p++]=0x00;buf[p++]=0x04; /* list len */
+    buf[p++]=0x00;buf[p++]=0x17; /* secp256r1 */
     buf[p++]=0x00;buf[p++]=0x18; /* secp384r1 */
 
     /* signature_algorithms */
@@ -1484,13 +1693,16 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t pub[97], const char
     buf[p++]=0x04;buf[p++]=0x03; /* ecdsa_secp256r1_sha256 */
     buf[p++]=0x08;buf[p++]=0x04; /* rsa_pss_rsae_sha256 */
 
-    /* key_share */
+    /* key_share (both P-256 and P-384) */
     buf[p++]=0x00;buf[p++]=0x33;
-    PUT16(buf+p,(uint16_t)(97+4+2));p+=2; /* ext data len */
-    PUT16(buf+p,(uint16_t)(97+4));p+=2;   /* client shares len */
-    buf[p++]=0x00;buf[p++]=0x18;           /* secp384r1 */
-    PUT16(buf+p,97);p+=2;                  /* key exchange len */
-    memcpy(buf+p,pub,97);p+=97;
+    PUT16(buf+p,(uint16_t)(65+4+97+4+2));p+=2; /* ext data len */
+    PUT16(buf+p,(uint16_t)(65+4+97+4));p+=2;   /* client shares len */
+    buf[p++]=0x00;buf[p++]=0x17;                /* secp256r1 */
+    PUT16(buf+p,65);p+=2;
+    memcpy(buf+p,p256_pub,65);p+=65;
+    buf[p++]=0x00;buf[p++]=0x18;                /* secp384r1 */
+    PUT16(buf+p,97);p+=2;
+    memcpy(buf+p,p384_pub,97);p+=97;
 
     /* supported_versions */
     buf[p++]=0x00;buf[p++]=0x2b;
@@ -1505,8 +1717,10 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t pub[97], const char
     return p;
 }
 
-/* Parse ServerHello, extract key_share public key */
-static int parse_server_hello(const uint8_t *msg, size_t len __attribute__((unused)), uint8_t server_pub[97]) {
+/* Parse ServerHello, extract key_share public key.
+   server_pub must be >= 97 bytes. Returns selected group (0x0017 or 0x0018). */
+static uint16_t parse_server_hello(const uint8_t *msg, size_t len __attribute__((unused)),
+                                    uint8_t *server_pub, size_t *pub_len) {
     if(msg[0]!=0x02) die("not ServerHello");
     const uint8_t *b=msg+4;
     /* version */ b+=2;
@@ -1520,16 +1734,21 @@ static int parse_server_hello(const uint8_t *msg, size_t len __attribute__((unus
     /* extensions */
     uint16_t ext_total=GET16(b); b+=2;
     const uint8_t *ext_end=b+ext_total;
-    int found_key=0;
+    uint16_t selected_group=0;
     while(b<ext_end) {
         uint16_t etype=GET16(b); b+=2;
         uint16_t elen=GET16(b); b+=2;
         if(etype==0x0033) { /* key_share */
             uint16_t group=GET16(b);
             uint16_t klen=GET16(b+2);
-            if(group==0x0018 && klen==97) {
+            if(group==0x0017 && klen==65) {
+                memcpy(server_pub,b+4,65);
+                *pub_len=65;
+                selected_group=0x0017;
+            } else if(group==0x0018 && klen==97) {
                 memcpy(server_pub,b+4,97);
-                found_key=1;
+                *pub_len=97;
+                selected_group=0x0018;
             }
         } else if(etype==0x002b) { /* supported_versions */
             uint16_t ver=GET16(b);
@@ -1537,8 +1756,8 @@ static int parse_server_hello(const uint8_t *msg, size_t len __attribute__((unus
         }
         b+=elen;
     }
-    if(!found_key) die("no key_share in ServerHello");
-    return 0;
+    if(!selected_group) die("no supported key_share in ServerHello");
+    return selected_group;
 }
 
 /* Decrypt a TLS 1.3 encrypted record.
@@ -1603,14 +1822,16 @@ static void do_https_get(const char *host, int port, const char *path) {
     int fd=tcp_connect(host,port);
     printf("Connected to %s:%d\n",host,port);
 
-    /* Generate ECDHE keypair */
-    uint8_t priv[48], pub[97];
-    ecdhe_keygen(priv,pub);
-    printf("Generated ECDHE-P384 keypair\n");
+    /* Generate ECDHE keypairs for both curves */
+    uint8_t p384_priv[48], p384_pub[97];
+    ecdhe_keygen(p384_priv,p384_pub);
+    uint8_t p256_priv[32], p256_pub[65];
+    ecdhe_p256_keygen(p256_priv,p256_pub);
+    printf("Generated ECDHE keypairs (P-256 + P-384)\n");
 
     /* Build & send ClientHello */
     uint8_t ch[1024];
-    size_t ch_len=build_client_hello(ch,pub,host);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,host);
     /* For the record layer, first ClientHello uses version 0x0301 */
     uint8_t ch_hdr[5]={0x16,0x03,0x01,0,0};
     PUT16(ch_hdr+3,(uint16_t)ch_len);
@@ -1629,15 +1850,23 @@ static void do_https_get(const char *host, int port, const char *path) {
     if(rtype==0x15 && rec_len>=2) { fprintf(stderr,"Alert: level=%d desc=%d\n",rec[0],rec[1]); die("server sent alert"); }
     if(rtype!=0x16) die("expected handshake record");
     if(rec[0]!=0x02) die("expected ServerHello");
-    uint8_t server_pub[97];
-    parse_server_hello(rec,rec_len,server_pub);
+    uint8_t server_pub[97]; size_t server_pub_len=0;
+    uint16_t selected_group=parse_server_hello(rec,rec_len,server_pub,&server_pub_len);
     sha256_update(&transcript,rec,rec_len);
-    printf("Received ServerHello\n");
+    printf("Received ServerHello (group=0x%04x)\n",selected_group);
 
-    /* Compute shared secret */
-    uint8_t shared[48];
-    ecdhe_shared_secret(priv,server_pub,shared);
-    printf("Computed ECDHE shared secret\n");
+    /* Compute shared secret based on negotiated group */
+    uint8_t shared[48]; size_t shared_len;
+    if(selected_group==0x0017) {
+        uint8_t ss[32];
+        ecdhe_p256_shared_secret(p256_priv,server_pub,ss);
+        memcpy(shared,ss,32);
+        shared_len=32;
+    } else {
+        ecdhe_shared_secret(p384_priv,server_pub,shared);
+        shared_len=48;
+    }
+    printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Derive handshake keys */
     uint8_t early_secret[32];
@@ -1646,7 +1875,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     { uint8_t empty_hash[32]; sha256_hash(NULL,0,empty_hash);
       hkdf_expand_label(early_secret,"derived",empty_hash,32,derived1,32); }
     uint8_t hs_secret[32];
-    hkdf_extract(derived1,32,shared,48,hs_secret);
+    hkdf_extract(derived1,32,shared,shared_len,hs_secret);
 
     uint8_t th1[32]; { sha256_ctx tc=transcript; sha256_final(&tc,th1); }
 
@@ -1819,7 +2048,8 @@ static void do_https_get(const char *host, int port, const char *path) {
     }
     printf("\n=== Done ===\n");
     free(saved_cert_msg);
-    secure_zero(priv,sizeof(priv));
+    secure_zero(p384_priv,sizeof(p384_priv));
+    secure_zero(p256_priv,sizeof(p256_priv));
     secure_zero(shared,sizeof(shared));
     secure_zero(hs_secret,sizeof(hs_secret));
     secure_zero(s_hs_traffic,sizeof(s_hs_traffic));
