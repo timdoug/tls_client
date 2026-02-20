@@ -283,9 +283,9 @@ static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
     for(int i=0;i<128;i++){
         uint8_t mask = -((x[i/8]>>(7-(i%8)))&1); /* 0x00 or 0xFF */
         for(int j=0;j<16;j++) z[j]^=v[j]&mask;
-        uint8_t lsb=v[15]&1;
+        uint8_t lsb_mask=-(v[15]&1); /* 0x00 or 0xFF */
         for(int j=15;j>0;j--) v[j]=(v[j]>>1)|(v[j-1]<<7);
-        v[0]>>=1; if(lsb) v[0]^=0xe1;
+        v[0]>>=1; v[0]^=0xe1&lsb_mask;
     }
     memcpy(r,z,16);
 }
@@ -894,13 +894,27 @@ static void bn_modmul(bignum *r, const bignum *a, const bignum *b, const bignum 
     bignum t; bn_mul(&t,a,b); bn_mod(r,&t,m);
 }
 
+/* Constant-time conditional copy: dst = src if bit==1, unchanged if bit==0 */
+static void bn_cmov(bignum *dst, const bignum *src, int bit) {
+    uint64_t mask = -(uint64_t)(bit&1); /* 0 or 0xFFFF... */
+    int max_len = dst->len > src->len ? dst->len : src->len;
+    for(int i=0;i<max_len;i++)
+        dst->v[i] = (dst->v[i] & ~mask) | (src->v[i] & mask);
+    dst->len = (dst->len & (int)~mask) | (src->len & (int)mask);
+}
+
 static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bignum *m) {
     bignum result; bn_zero(&result); result.v[0]=1; result.len=1;
     bignum b; bn_mod(&b,base,m);
-    int exp_bits=bn_bits(exp);
-    for(int i=0;i<exp_bits;i++){
-        if((exp->v[i/64]>>(i%64))&1) bn_modmul(&result,&result,&b,m);
-        if(i<exp_bits-1) bn_modmul(&b,&b,&b,m);
+    /* Use fixed bit count based on modulus size to avoid leaking exponent length */
+    int total_bits = m->len * 64;
+    for(int i=0;i<total_bits;i++){
+        /* Always multiply, conditionally keep result */
+        bignum tmp;
+        bn_modmul(&tmp,&result,&b,m);
+        int bit = (i < exp->len*64) ? (int)((exp->v[i/64]>>(i%64))&1) : 0;
+        bn_cmov(&result,&tmp,bit);
+        if(i<total_bits-1) bn_modmul(&b,&b,&b,m);
     }
     *r=result;
 }
@@ -1965,50 +1979,69 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
    Returns negotiated version (0x0303 for TLS 1.2, 0x0304 for TLS 1.3).
    For TLS 1.3: fills server_pub/pub_len from key_share.
    For TLS 1.2: *pub_len is set to 0. */
-static uint16_t parse_server_hello(const uint8_t *msg, size_t len __attribute__((unused)),
+static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
                                     uint8_t *server_pub, size_t *pub_len,
                                     uint8_t server_random[32],
                                     uint16_t *cipher_suite_out) {
+    const uint8_t *end=msg+len;
+    if(len<4) die("ServerHello too short");
     if(msg[0]!=0x02) die("not ServerHello");
+    uint32_t sh_len=GET24(msg+1);
+    if(4+sh_len>len) die("ServerHello length exceeds record");
+    const uint8_t *sh_end=msg+4+sh_len;
     const uint8_t *b=msg+4;
-    /* version */ b+=2;
+    /* version */
+    if(b+2>sh_end) die("ServerHello truncated at version");
+    b+=2;
     /* random - save it */
+    if(b+32>sh_end) die("ServerHello truncated at random");
     memcpy(server_random,b,32);
     b+=32;
     /* session id */
-    uint8_t sid_len=*b++; b+=sid_len;
+    if(b+1>sh_end) die("ServerHello truncated at session_id len");
+    uint8_t sid_len=*b++;
+    if(b+sid_len>sh_end) die("ServerHello session_id exceeds message");
+    b+=sid_len;
     /* cipher suite */
+    if(b+2>sh_end) die("ServerHello truncated at cipher suite");
     uint16_t cs=GET16(b); b+=2;
     *cipher_suite_out=cs;
     if(cs!=0x1301 && cs!=0xC02B && cs!=0xC02F) {
         fprintf(stderr,"cipher suite 0x%04x\n",cs);
         die("unexpected cipher suite");
     }
-    /* compression */ b++;
-    /* extensions */
-    uint16_t ext_total=GET16(b); b+=2;
-    const uint8_t *ext_end=b+ext_total;
+    /* compression */
+    if(b+1>sh_end) die("ServerHello truncated at compression");
+    b++;
+    /* extensions (may not be present for TLS 1.2 minimal hello) */
     uint16_t version=0x0303; /* default TLS 1.2 */
     *pub_len=0;
-    while(b<ext_end) {
-        uint16_t etype=GET16(b); b+=2;
-        uint16_t elen=GET16(b); b+=2;
-        if(etype==0x0033) { /* key_share */
-            uint16_t group=GET16(b);
-            uint16_t klen=GET16(b+2);
-            if(group==0x0017 && klen==65) {
-                memcpy(server_pub,b+4,65);
-                *pub_len=65;
-            } else if(group==0x0018 && klen==97) {
-                memcpy(server_pub,b+4,97);
-                *pub_len=97;
+    if(b+2<=sh_end) {
+        uint16_t ext_total=GET16(b); b+=2;
+        const uint8_t *ext_end=b+ext_total;
+        if(ext_end>sh_end) ext_end=sh_end;
+        while(b+4<=ext_end) {
+            uint16_t etype=GET16(b); b+=2;
+            uint16_t elen=GET16(b); b+=2;
+            if(b+elen>ext_end) break;
+            if(etype==0x0033 && elen>=4) { /* key_share */
+                uint16_t group=GET16(b);
+                uint16_t klen=GET16(b+2);
+                if(group==0x0017 && klen==65 && elen>=4+65) {
+                    memcpy(server_pub,b+4,65);
+                    *pub_len=65;
+                } else if(group==0x0018 && klen==97 && elen>=4+97) {
+                    memcpy(server_pub,b+4,97);
+                    *pub_len=97;
+                }
+            } else if(etype==0x002b && elen>=2) { /* supported_versions */
+                uint16_t ver=GET16(b);
+                if(ver==0x0304) version=0x0304;
             }
-        } else if(etype==0x002b) { /* supported_versions */
-            uint16_t ver=GET16(b);
-            if(ver==0x0304) version=0x0304;
+            b+=elen;
         }
-        b+=elen;
     }
+    (void)end;
     if(version==0x0304 && *pub_len==0) die("TLS 1.3 but no key_share in ServerHello");
     return version;
 }
@@ -2414,6 +2447,8 @@ static void do_https_get(const char *host, int port, const char *path) {
 
         free(cert12_msg);
         secure_zero(ss12,sizeof(ss12));
+        secure_zero(pms_seed,sizeof(pms_seed));
+        secure_zero(ke_seed,sizeof(ke_seed));
         secure_zero(tls12_master,sizeof(tls12_master));
         secure_zero(key_block,sizeof(key_block));
         secure_zero(c_wk,sizeof(c_wk)); secure_zero(s_wk,sizeof(s_wk));
@@ -2686,11 +2721,14 @@ static void do_https_get(const char *host, int port, const char *path) {
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(p256_priv,sizeof(p256_priv));
     secure_zero(shared,sizeof(shared));
+    secure_zero(early_secret,sizeof(early_secret));
+    secure_zero(derived1,sizeof(derived1));
     secure_zero(hs_secret,sizeof(hs_secret));
     secure_zero(s_hs_traffic,sizeof(s_hs_traffic));
     secure_zero(c_hs_traffic,sizeof(c_hs_traffic));
     secure_zero(s_hs_key,sizeof(s_hs_key)); secure_zero(s_hs_iv,sizeof(s_hs_iv));
     secure_zero(c_hs_key,sizeof(c_hs_key)); secure_zero(c_hs_iv,sizeof(c_hs_iv));
+    secure_zero(derived2,sizeof(derived2));
     secure_zero(master_secret,sizeof(master_secret));
     secure_zero(s_ap_key,sizeof(s_ap_key)); secure_zero(s_ap_iv,sizeof(s_ap_iv));
     secure_zero(c_ap_key,sizeof(c_ap_key)); secure_zero(c_ap_iv,sizeof(c_ap_iv));
