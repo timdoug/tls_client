@@ -1733,12 +1733,16 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
     if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA384,sizeof(OID_ECDSA_SHA384))){
         if(key_type!=1) return 0;
         uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
-        return ecdsa_p384_verify(h,48,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==97) return ecdsa_p384_verify(h,48,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==65) return ecdsa_p256_verify(h,48,sig,sig_len,pubkey,pubkey_len);
+        return 0;
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA256,sizeof(OID_ECDSA_SHA256))){
         if(key_type!=1) return 0;
         uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
-        return ecdsa_p256_verify(h,32,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==65) return ecdsa_p256_verify(h,32,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==97) return ecdsa_p384_verify(h,32,sig,sig_len,pubkey,pubkey_len);
+        return 0;
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA256_RSA,sizeof(OID_SHA256_RSA))){
         if(key_type!=2) return 0;
@@ -2305,13 +2309,17 @@ static void do_https_get(const char *host, int port, const char *path) {
                         if(x509_parse(&leaf,cp,first_cert_len)!=0) die("Failed to parse leaf cert");
 
                         int sig_ok=0;
-                        if(sig_algo==0x0403) { /* ecdsa_secp256r1_sha256 */
+                        if(sig_algo==0x0403) { /* ecdsa + sha256 */
                             uint8_t h[32]; sha256_hash(signed_data,signed_len,h);
                             if(leaf.key_type==1 && leaf.pubkey_len==65)
                                 sig_ok=ecdsa_p256_verify(h,32,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
-                        } else if(sig_algo==0x0503) { /* ecdsa_secp384r1_sha384 */
+                            else if(leaf.key_type==1 && leaf.pubkey_len==97)
+                                sig_ok=ecdsa_p384_verify(h,32,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                        } else if(sig_algo==0x0503) { /* ecdsa + sha384 */
                             uint8_t h[48]; sha384_hash(signed_data,signed_len,h);
-                            if(leaf.key_type==1 && leaf.pubkey_len==97)
+                            if(leaf.key_type==1 && leaf.pubkey_len==65)
+                                sig_ok=ecdsa_p256_verify(h,48,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                            else if(leaf.key_type==1 && leaf.pubkey_len==97)
                                 sig_ok=ecdsa_p384_verify(h,48,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
                         } else if(sig_algo==0x0401) { /* rsa_pkcs1_sha256 */
                             uint8_t h[32]; sha256_hash(signed_data,signed_len,h);
