@@ -173,11 +173,13 @@ static void hkdf_expand(const uint8_t prk[32], const uint8_t *info, size_t ilen,
 static void hkdf_expand_label(const uint8_t secret[32], const char *label,
                                const uint8_t *ctx, size_t clen, uint8_t *out, size_t olen) {
     uint8_t info[256]; size_t p=0;
+    size_t label_len=strlen(label);
+    if(2+1+6+label_len+1+clen>sizeof(info)) die("hkdf_expand_label: info overflow");
     info[p++]=(olen>>8)&0xFF; info[p++]=olen&0xFF;
-    size_t ll=6+strlen(label);
+    size_t ll=6+label_len;
     info[p++]=ll&0xFF;
     memcpy(info+p,"tls13 ",6); p+=6;
-    memcpy(info+p,label,strlen(label)); p+=strlen(label);
+    memcpy(info+p,label,label_len); p+=label_len;
     info[p++]=clen&0xFF;
     if(clen>0){memcpy(info+p,ctx,clen);p+=clen;}
     hkdf_expand(secret,info,p,out,olen);
@@ -193,6 +195,7 @@ static void tls12_prf(const uint8_t *secret, size_t secret_len,
     uint8_t lseed[256];
     size_t label_len = strlen(label);
     size_t ls_len = label_len + seed_len;
+    if(ls_len > sizeof(lseed)) die("tls12_prf: label+seed overflow");
     memcpy(lseed, label, label_len);
     memcpy(lseed + label_len, seed, seed_len);
 
@@ -1308,23 +1311,21 @@ static int rsa_pkcs1_verify_sha256(const uint8_t hash[32],
     if(mod_len>sizeof(m)) return 0;
     bn_to_bytes(&m_bn,m,mod_len);
 
-    /* Verify PKCS#1 v1.5: 00 01 [FF..FF] 00 [DigestInfo] */
-    if(m[0]!=0x00||m[1]!=0x01) return 0;
-    size_t i=2;
-    while(i<mod_len&&m[i]==0xFF) i++;
-    if(i<10||i>=mod_len||m[i]!=0x00) return 0;
-    i++;
-
-    /* DigestInfo for SHA-256 */
-    static const uint8_t di[]={
+    /* Verify PKCS#1 v1.5 in constant time: 00 01 [FF..FF] 00 [DigestInfo] [Hash]
+     * Build expected padding and compare entire buffer at once. */
+    static const uint8_t di256[]={
         0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
         0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20
     };
-    if(i+sizeof(di)+32!=mod_len) return 0;
-    if(memcmp(m+i,di,sizeof(di))!=0) return 0;
-    i+=sizeof(di);
-    if(memcmp(m+i,hash,32)!=0) return 0;
-    return 1;
+    if(mod_len < 2+8+1+sizeof(di256)+32) return 0; /* too short for valid padding */
+    uint8_t expected[512];
+    expected[0]=0x00; expected[1]=0x01;
+    size_t pad_len=mod_len-3-sizeof(di256)-32;
+    memset(expected+2,0xFF,pad_len);
+    expected[2+pad_len]=0x00;
+    memcpy(expected+3+pad_len,di256,sizeof(di256));
+    memcpy(expected+3+pad_len+sizeof(di256),hash,32);
+    return ct_memeq(m,expected,mod_len);
 }
 
 static int rsa_pkcs1_verify_sha384(const uint8_t hash[48],
@@ -1341,23 +1342,20 @@ static int rsa_pkcs1_verify_sha384(const uint8_t hash[48],
     if(mod_len>sizeof(m)) return 0;
     bn_to_bytes(&m_bn,m,mod_len);
 
-    /* Verify PKCS#1 v1.5: 00 01 [FF..FF] 00 [DigestInfo] */
-    if(m[0]!=0x00||m[1]!=0x01) return 0;
-    size_t i=2;
-    while(i<mod_len&&m[i]==0xFF) i++;
-    if(i<10||i>=mod_len||m[i]!=0x00) return 0;
-    i++;
-
-    /* DigestInfo for SHA-384 */
-    static const uint8_t di[]={
+    /* Verify PKCS#1 v1.5 in constant time */
+    static const uint8_t di384[]={
         0x30,0x41,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
         0x65,0x03,0x04,0x02,0x02,0x05,0x00,0x04,0x30
     };
-    if(i+sizeof(di)+48!=mod_len) return 0;
-    if(memcmp(m+i,di,sizeof(di))!=0) return 0;
-    i+=sizeof(di);
-    if(memcmp(m+i,hash,48)!=0) return 0;
-    return 1;
+    if(mod_len < 2+8+1+sizeof(di384)+48) return 0;
+    uint8_t expected[512];
+    expected[0]=0x00; expected[1]=0x01;
+    size_t pad_len=mod_len-3-sizeof(di384)-48;
+    memset(expected+2,0xFF,pad_len);
+    expected[2+pad_len]=0x00;
+    memcpy(expected+3+pad_len,di384,sizeof(di384));
+    memcpy(expected+3+pad_len+sizeof(di384),hash,48);
+    return ct_memeq(m,expected,mod_len);
 }
 
 static int rsa_pss_verify_sha256(const uint8_t hash[32],
@@ -1408,10 +1406,12 @@ static int rsa_pss_verify_sha256(const uint8_t hash[32],
     /* Clear top bits (8*emLen - emBits) */
     db[0]&=0x7F;
 
-    /* DB should be: 00...00 || 01 || salt */
+    /* DB should be: 00...00 || 01 || salt — verify in constant time */
     size_t pad_len=db_len-salt_len-1;
-    for(size_t i=0;i<pad_len;i++) if(db[i]!=0x00) return 0;
-    if(db[pad_len]!=0x01) return 0;
+    uint8_t ok=0;
+    for(size_t i=0;i<pad_len;i++) ok|=db[i];
+    ok|=db[pad_len]^0x01;
+    if(ok) return 0;
     const uint8_t *salt=db+pad_len+1;
 
     /* M' = (8 zero bytes) || mHash || salt */
@@ -1726,26 +1726,36 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
  * ================================================================ */
 static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                               const char *hostname, int is_tls13) {
-    (void)cert_msg_len;
     const uint8_t *p=cert_msg;
-    if(is_tls13) { uint8_t ctx_len=*p++; p+=ctx_len; }
+    const uint8_t *msg_end=cert_msg+cert_msg_len;
+    if(is_tls13) {
+        if(p>=msg_end) return -1;
+        uint8_t ctx_len=*p++;
+        if(p+ctx_len>msg_end) return -1;
+        p+=ctx_len;
+    }
+    if(p+3>msg_end) return -1;
     uint32_t list_len=GET24(p); p+=3;
     const uint8_t *end=p+list_len;
+    if(end>msg_end) end=msg_end;
 
     #define MAX_CHAIN 4
     const uint8_t *chain_der[MAX_CHAIN];
     size_t chain_len[MAX_CHAIN];
     int chain_count=0;
 
-    while(p<end&&chain_count<MAX_CHAIN){
+    while(p+3<=end&&chain_count<MAX_CHAIN){
         uint32_t cl=GET24(p); p+=3;
+        if(p+cl>end) break;
         chain_der[chain_count]=p;
         chain_len[chain_count]=cl;
         chain_count++;
         p+=cl;
         if(is_tls13) {
             if(p+2>end) break;
-            uint16_t el=GET16(p); p+=2+el;
+            uint16_t el=GET16(p); p+=2;
+            if(p+el>end) break;
+            p+=el;
         }
     }
     if(chain_count==0){fprintf(stderr,"No certificates in chain\n");return -1;}
@@ -2179,6 +2189,7 @@ static void do_https_get(const char *host, int port, const char *path) {
             rtype=tls_read_record(fd,rec,&rec_len);
             if(rtype!=0x16) die("expected handshake record in TLS 1.2");
 
+            if(hs12_len+rec_len>sizeof(hs12_buf)) die("TLS 1.2 handshake buffer overflow");
             memcpy(hs12_buf+hs12_len, rec, rec_len);
             hs12_len+=rec_len;
 
@@ -2195,11 +2206,13 @@ static void do_https_get(const char *host, int port, const char *path) {
                     case 11: /* Certificate */
                         printf("  Certificate (%u bytes)\n",(unsigned)mlen);
                         cert12_msg=malloc(mlen);
+                        if(!cert12_msg) die("malloc failed");
                         memcpy(cert12_msg, hs12_buf+pos+4, mlen);
                         cert12_msg_len=mlen;
                         break;
                     case 12: { /* ServerKeyExchange */
                         printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
+                        if(mlen<4+65+4) die("ServerKeyExchange too short");
                         const uint8_t *ske=hs12_buf+pos+4;
                         if(ske[0]!=0x03) die("expected named_curve type in SKE");
                         uint16_t curve=GET16(ske+1);
@@ -2209,9 +2222,11 @@ static void do_https_get(const char *host, int port, const char *path) {
                         memcpy(ske_pubkey, ske+4, 65);
 
                         size_t params_len=4+pk_len;
+                        if(params_len+4>mlen) die("SKE signature header truncated");
                         const uint8_t *sig_ptr=ske+params_len;
                         uint16_t sig_algo=GET16(sig_ptr); sig_ptr+=2;
                         uint16_t sig_len_val=GET16(sig_ptr); sig_ptr+=2;
+                        if(params_len+4+sig_len_val>mlen) die("SKE signature truncated");
 
                         /* Signed data: client_random || server_random || params */
                         uint8_t signed_data[200];
@@ -2222,10 +2237,13 @@ static void do_https_get(const char *host, int port, const char *path) {
 
                         /* Parse leaf cert for verification */
                         if(!cert12_msg) die("Certificate must precede ServerKeyExchange");
+                        if(cert12_msg_len<6) die("Certificate message too short");
                         const uint8_t *cp=cert12_msg;
                         uint32_t list_len12=GET24(cp); cp+=3;
-                        (void)list_len12;
+                        if(3+list_len12>cert12_msg_len) die("Certificate list length exceeds message");
+                        if(list_len12<3) die("Certificate list too short");
                         uint32_t first_cert_len=GET24(cp); cp+=3;
+                        if(6+first_cert_len>cert12_msg_len) die("First certificate exceeds message");
                         x509_cert leaf;
                         if(x509_parse(&leaf,cp,first_cert_len)!=0) die("Failed to parse leaf cert");
 
@@ -2291,6 +2309,8 @@ static void do_https_get(const char *host, int port, const char *path) {
         /* Compute ECDHE shared secret (P-256) */
         uint8_t ss12[32];
         ecdhe_p256_shared_secret(p256_priv, ske_pubkey, ss12);
+        secure_zero(p256_priv,sizeof(p256_priv));
+        secure_zero(p384_priv,sizeof(p384_priv));
         printf("Computed ECDHE shared secret (P-256)\n");
 
         /* TLS 1.2 key derivation */
@@ -2417,10 +2437,13 @@ static void do_https_get(const char *host, int port, const char *path) {
         ecdhe_p256_shared_secret(p256_priv,server_pub,ss);
         memcpy(shared,ss,32);
         shared_len=32;
+        secure_zero(ss,sizeof(ss));
     } else {
         ecdhe_shared_secret(p384_priv,server_pub,shared);
         shared_len=48;
     }
+    secure_zero(p256_priv,sizeof(p256_priv));
+    secure_zero(p384_priv,sizeof(p384_priv));
     printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Derive handshake keys */
@@ -2465,6 +2488,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         if(inner!=0x16) die("expected handshake inside encrypted record");
 
         /* Append to handshake buffer */
+        if(hs_buf_len+pt_len>sizeof(hs_buf)) die("TLS 1.3 handshake buffer overflow");
         memcpy(hs_buf+hs_buf_len,pt,pt_len);
         hs_buf_len+=pt_len;
 
@@ -2485,6 +2509,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                     printf("  Certificate (%u bytes)\n",(unsigned)mlen);
                     sha256_update(&transcript,hs_buf+pos,msg_total);
                     saved_cert_msg=malloc(mlen);
+                    if(!saved_cert_msg) die("malloc failed");
                     memcpy(saved_cert_msg,hs_buf+pos+4,mlen);
                     saved_cert_msg_len=mlen;
                     break;
