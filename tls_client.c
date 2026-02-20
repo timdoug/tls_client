@@ -1326,6 +1326,70 @@ static int rsa_pkcs1_verify_sha256(const uint8_t hash[32],
     return 1;
 }
 
+static int rsa_pss_verify_sha256(const uint8_t hash[32],
+                                  const uint8_t *sig, size_t sig_len,
+                                  const uint8_t *modulus, size_t mod_len,
+                                  const uint8_t *exponent, size_t exp_len) {
+    bignum s_bn, n_bn, e_bn, m_bn;
+    bn_from_bytes(&s_bn,sig,sig_len);
+    bn_from_bytes(&n_bn,modulus,mod_len);
+    bn_from_bytes(&e_bn,exponent,exp_len);
+    bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
+
+    uint8_t em[512];
+    if(mod_len>sizeof(em)) return 0;
+    bn_to_bytes(&m_bn,em,mod_len);
+
+    /* PSS verification: em = maskedDB || H || 0xBC */
+    size_t em_len=mod_len;
+    if(em[em_len-1]!=0xBC) return 0;
+
+    size_t h_len=32; /* SHA-256 */
+    size_t salt_len=32;
+    size_t db_len=em_len-h_len-1;
+    const uint8_t *masked_db=em;
+    const uint8_t *h=em+db_len;
+
+    /* MGF1-SHA256: dbMask = MGF1(H, db_len) */
+    uint8_t db_mask[512];
+    size_t done=0;
+    uint32_t counter=0;
+    while(done<db_len){
+        uint8_t cb[36];
+        memcpy(cb,h,32);
+        cb[32]=(counter>>24)&0xFF;
+        cb[33]=(counter>>16)&0xFF;
+        cb[34]=(counter>>8)&0xFF;
+        cb[35]=counter&0xFF;
+        uint8_t md[32]; sha256_hash(cb,36,md);
+        size_t use=db_len-done; if(use>32) use=32;
+        memcpy(db_mask+done,md,use);
+        done+=use; counter++;
+    }
+
+    /* DB = maskedDB XOR dbMask */
+    uint8_t db[512];
+    for(size_t i=0;i<db_len;i++) db[i]=masked_db[i]^db_mask[i];
+
+    /* Clear top bits (8*emLen - emBits) */
+    db[0]&=0x7F;
+
+    /* DB should be: 00...00 || 01 || salt */
+    size_t pad_len=db_len-salt_len-1;
+    for(size_t i=0;i<pad_len;i++) if(db[i]!=0x00) return 0;
+    if(db[pad_len]!=0x01) return 0;
+    const uint8_t *salt=db+pad_len+1;
+
+    /* M' = (8 zero bytes) || mHash || salt */
+    uint8_t mp[8+32+32];
+    memset(mp,0,8);
+    memcpy(mp+8,hash,32);
+    memcpy(mp+40,salt,salt_len);
+
+    uint8_t hp[32]; sha256_hash(mp,72,hp);
+    return ct_memeq(hp,h,32);
+}
+
 /* ================================================================
  * X.509 Certificate Parser
  * ================================================================ */
@@ -2140,6 +2204,10 @@ static void do_https_get(const char *host, int port, const char *path) {
                             uint8_t h[32]; sha256_hash(signed_data,signed_len,h);
                             if(leaf.key_type==2)
                                 sig_ok=rsa_pkcs1_verify_sha256(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                        } else if(sig_algo==0x0804) { /* rsa_pss_rsae_sha256 */
+                            uint8_t h[32]; sha256_hash(signed_data,signed_len,h);
+                            if(leaf.key_type==2)
+                                sig_ok=rsa_pss_verify_sha256(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                         }
                         if(!sig_ok) die("ServerKeyExchange signature verification failed");
                         printf("    SKE signature verified (algo=0x%04x)\n",sig_algo);
