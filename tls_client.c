@@ -1697,22 +1697,26 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         printf("    Certificate %d signature verified\n",i);
     }
 
-    /* Find root in trust store */
-    int last=chain_count-1;
-    for(int i=0;i<trust_store_count;i++){
-        if(certs[last].issuer_len!=trust_store[i].subject_len) continue;
-        if(memcmp(certs[last].issuer,trust_store[i].subject,certs[last].issuer_len)!=0) continue;
-        printf("    Verifying cert %d (root) signature...\n",last);
-        if(verify_signature(certs[last].tbs,certs[last].tbs_len,
-                             certs[last].sig_alg,certs[last].sig_alg_len,
-                             certs[last].sig,certs[last].sig_len,
-                             trust_store[i].key_type,
-                             trust_store[i].pubkey,trust_store[i].pubkey_len,
-                             trust_store[i].rsa_n,trust_store[i].rsa_n_len,
-                             trust_store[i].rsa_e,trust_store[i].rsa_e_len)){
-            printf("    Certificate %d root signature verified\n",last);
-            printf("    Certificate chain verified successfully!\n");
-            return 0;
+    /* Find root in trust store.
+     * Try each chain cert (last first): handles cross-signed roots where the
+     * server sends a redundant cross-signature cert whose issuer we lack,
+     * but we do have the direct root for an earlier cert. */
+    for(int c=chain_count-1;c>=0;c--){
+        for(int i=0;i<trust_store_count;i++){
+            if(certs[c].issuer_len!=trust_store[i].subject_len) continue;
+            if(memcmp(certs[c].issuer,trust_store[i].subject,certs[c].issuer_len)!=0) continue;
+            printf("    Verifying cert %d against trust store...\n",c);
+            if(verify_signature(certs[c].tbs,certs[c].tbs_len,
+                                 certs[c].sig_alg,certs[c].sig_alg_len,
+                                 certs[c].sig,certs[c].sig_len,
+                                 trust_store[i].key_type,
+                                 trust_store[i].pubkey,trust_store[i].pubkey_len,
+                                 trust_store[i].rsa_n,trust_store[i].rsa_n_len,
+                                 trust_store[i].rsa_e,trust_store[i].rsa_e_len)){
+                printf("    Certificate %d root signature verified\n",c);
+                printf("    Certificate chain verified successfully!\n");
+                return 0;
+            }
         }
     }
     fprintf(stderr,"No matching root CA found in trust store\n");
