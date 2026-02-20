@@ -1080,10 +1080,18 @@ static void ecdhe_p256_shared_secret(const uint8_t priv[32], const uint8_t peer_
 
 /* OID constants */
 static const uint8_t OID_ECDSA_SHA384[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
+static const uint8_t OID_ECDSA_SHA256[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
 static const uint8_t OID_SHA256_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
 static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
 static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
 static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
+
+/* P-256 curve order n (big-endian) */
+static const uint8_t P256_ORDER[32] = {
+    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xBC,0xE6,0xFA,0xAD,0xA7,0x17,0x9E,0x84,
+    0xF3,0xB9,0xCA,0xC2,0xFC,0x63,0x25,0x51
+};
 
 /* P-384 curve order n (big-endian) */
 static const uint8_t P384_ORDER[48] = {
@@ -1179,6 +1187,75 @@ static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
     bn_from_bytes(&rx_bn,rx_bytes,48);
     bn_mod(&rx_bn,&rx_bn,&n);
     return bn_cmp(&rx_bn,&r_bn)==0;
+}
+
+/* ECDSA-P256 signature verification using bignum EC ops */
+static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
+                              const uint8_t *sig_der, size_t sig_len,
+                              const uint8_t *pubkey, size_t pk_len) {
+    if(pk_len!=65||pubkey[0]!=0x04) return 0;
+    p256_init();
+
+    /* Parse DER signature → (r, s) */
+    const uint8_t *p=sig_der, *end=sig_der+sig_len;
+    uint8_t tag; size_t len;
+    p=der_read_tl(p,end,&tag,&len);
+    if(!p||tag!=0x30) return 0;
+    end=p+len;
+
+    const uint8_t *rval=der_read_tl(p,end,&tag,&len);
+    if(!rval||tag!=0x02) return 0;
+    const uint8_t *rp=rval; size_t rlen=len;
+    if(rlen>0&&rp[0]==0){rp++;rlen--;}
+    p=rval+len;
+
+    const uint8_t *sval=der_read_tl(p,end,&tag,&len);
+    if(!sval||tag!=0x02) return 0;
+    const uint8_t *sp=sval; size_t slen=len;
+    if(slen>0&&sp[0]==0){sp++;slen--;}
+
+    bignum r_bn, s_bn, n, hash_bn, w, u1, u2;
+    bn_from_bytes(&r_bn,rp,rlen);
+    bn_from_bytes(&s_bn,sp,slen);
+    bn_from_bytes(&n,P256_ORDER,32);
+    bn_from_bytes(&hash_bn,hash,hash_len>32?32:hash_len);
+
+    /* w = s^(-1) mod n via Fermat: s^(n-2) mod n */
+    bignum nm2;
+    bn_from_bytes(&nm2,P256_ORDER,32);
+    bignum two; bn_zero(&two); two.v[0]=2; two.len=1;
+    bn_sub(&nm2,&nm2,&two);
+    bn_modexp(&w,&s_bn,&nm2,&n);
+
+    /* u1 = hash * w mod n, u2 = r * w mod n */
+    bn_modmul(&u1,&hash_bn,&w,&n);
+    bn_modmul(&u2,&r_bn,&w,&n);
+
+    uint8_t u1_bytes[32], u2_bytes[32];
+    bn_to_bytes(&u1,u1_bytes,32);
+    bn_to_bytes(&u2,u2_bytes,32);
+
+    /* R = u1*G + u2*Q */
+    ec256 G;
+    G.x=p256_gx; G.y=p256_gy;
+    bn_zero(&G.z); G.z.v[0]=1; G.z.len=1;
+
+    bignum qx,qy;
+    bn_from_bytes(&qx,pubkey+1,32);
+    bn_from_bytes(&qy,pubkey+33,32);
+    ec256 Q; Q.x=qx; Q.y=qy;
+    bn_zero(&Q.z); Q.z.v[0]=1; Q.z.len=1;
+
+    /* Use variable-time scalar muls (verification is public) */
+    ec256 R1; ec256_scalar_mul(&R1,&G,u1_bytes);
+    ec256 R2; ec256_scalar_mul(&R2,&Q,u2_bytes);
+    ec256 R; ec256_add(&R,&R1,&R2);
+    if(ec256_is_inf(&R)) return 0;
+
+    bignum rx,ry;
+    ec256_to_affine(&rx,&ry,&R);
+    bn_mod(&rx,&rx,&n);
+    return bn_cmp(&rx,&r_bn)==0;
 }
 
 /* ================================================================
@@ -1496,6 +1573,11 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
         if(key_type!=1) return 0;
         uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
         return ecdsa_p384_verify(h,48,sig,sig_len,pubkey,pubkey_len);
+    }
+    if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA256,sizeof(OID_ECDSA_SHA256))){
+        if(key_type!=1) return 0;
+        uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
+        return ecdsa_p256_verify(h,32,sig,sig_len,pubkey,pubkey_len);
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA256_RSA,sizeof(OID_SHA256_RSA))){
         if(key_type!=2) return 0;
