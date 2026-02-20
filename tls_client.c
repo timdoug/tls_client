@@ -1,6 +1,6 @@
 /*
- * tls_client.c — TLS 1.3 HTTPS client from scratch in C.
- * Implements: SHA-256, HMAC, HKDF, AES-128-GCM, ECDHE-P384, TLS 1.3
+ * tls_client.c — TLS 1.2/1.3 HTTPS client from scratch in C.
+ * Implements: SHA-256, HMAC, HKDF, AES-128-GCM, ECDHE-P256/P384, TLS 1.2/1.3
  * No external crypto libraries.
  *
  * Compile:  cc -O2 -o tls_client tls_client.c
@@ -183,7 +183,38 @@ static void hkdf_expand_label(const uint8_t secret[32], const char *label,
     hkdf_expand(secret,info,p,out,olen);
 }
 
+/* ================================================================
+ * TLS 1.2 PRF (P_SHA256)
+ * ================================================================ */
+static void tls12_prf(const uint8_t *secret, size_t secret_len,
+                       const char *label,
+                       const uint8_t *seed, size_t seed_len,
+                       uint8_t *out, size_t out_len) {
+    uint8_t lseed[256];
+    size_t label_len = strlen(label);
+    size_t ls_len = label_len + seed_len;
+    memcpy(lseed, label, label_len);
+    memcpy(lseed + label_len, seed, seed_len);
 
+    uint8_t a[32];
+    hmac_sha256(secret, secret_len, lseed, ls_len, a); /* A(1) */
+
+    size_t done = 0;
+    while (done < out_len) {
+        uint8_t buf[32 + 256];
+        memcpy(buf, a, 32);
+        memcpy(buf + 32, lseed, ls_len);
+        uint8_t hmac_out[32];
+        hmac_sha256(secret, secret_len, buf, 32 + ls_len, hmac_out);
+
+        size_t use = out_len - done;
+        if (use > 32) use = 32;
+        memcpy(out + done, hmac_out, use);
+        done += use;
+
+        hmac_sha256(secret, secret_len, a, 32, a); /* A(i+1) */
+    }
+}
 
 /* ================================================================
  * AES-128
@@ -1591,10 +1622,10 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
  * Certificate Chain Validation
  * ================================================================ */
 static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
-                              const char *hostname) {
+                              const char *hostname, int is_tls13) {
     (void)cert_msg_len;
     const uint8_t *p=cert_msg;
-    uint8_t ctx_len=*p++; p+=ctx_len;
+    if(is_tls13) { uint8_t ctx_len=*p++; p+=ctx_len; }
     uint32_t list_len=GET24(p); p+=3;
     const uint8_t *end=p+list_len;
 
@@ -1609,8 +1640,10 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         chain_len[chain_count]=cl;
         chain_count++;
         p+=cl;
-        if(p+2>end) break;
-        uint16_t el=GET16(p); p+=2+el;
+        if(is_tls13) {
+            if(p+2>end) break;
+            uint16_t el=GET16(p); p+=2+el;
+        }
     }
     if(chain_count==0){fprintf(stderr,"No certificates in chain\n");return -1;}
 
@@ -1720,9 +1753,10 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
     return hdr[0];
 }
 
-/* Build ClientHello for TLS 1.3 with secp384r1 */
+/* Build ClientHello for TLS 1.2/1.3 */
 static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
-                                  const uint8_t p384_pub[97], const char *host) {
+                                  const uint8_t p384_pub[97], const char *host,
+                                  uint8_t client_random[32]) {
     size_t p=0;
     /* Handshake header - fill length later */
     buf[p++]=0x01; /* ClientHello */
@@ -1732,15 +1766,19 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
     buf[p++]=0x03; buf[p++]=0x03;
 
     /* Random */
-    random_bytes(buf+p,32); p+=32;
+    random_bytes(buf+p,32);
+    memcpy(client_random,buf+p,32);
+    p+=32;
 
     /* Session ID (32 bytes for compat) */
     buf[p++]=32;
     random_bytes(buf+p,32); p+=32;
 
-    /* Cipher suites */
-    buf[p++]=0x00; buf[p++]=0x02; /* 2 bytes */
+    /* Cipher suites: TLS 1.3 + TLS 1.2 ECDHE-GCM */
+    buf[p++]=0x00; buf[p++]=0x06; /* 6 bytes = 3 suites */
     buf[p++]=0x13; buf[p++]=0x01; /* TLS_AES_128_GCM_SHA256 */
+    buf[p++]=0xC0; buf[p++]=0x2B; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
+    buf[p++]=0xC0; buf[p++]=0x2F; /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
 
     /* Compression */
     buf[p++]=0x01; buf[p++]=0x00;
@@ -1760,6 +1798,12 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
         memcpy(buf+p,host,hl);p+=hl;
     }
 
+    /* ec_point_formats (needed for TLS 1.2 ECDHE) */
+    buf[p++]=0x00;buf[p++]=0x0b; /* extension type 11 */
+    buf[p++]=0x00;buf[p++]=0x02; /* ext len */
+    buf[p++]=0x01;               /* list len */
+    buf[p++]=0x00;               /* uncompressed */
+
     /* supported_groups */
     buf[p++]=0x00;buf[p++]=0x0a;
     buf[p++]=0x00;buf[p++]=0x06; /* ext len */
@@ -1769,11 +1813,12 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
 
     /* signature_algorithms */
     buf[p++]=0x00;buf[p++]=0x0d;
-    buf[p++]=0x00;buf[p++]=0x08; /* ext len */
-    buf[p++]=0x00;buf[p++]=0x06; /* list len */
+    buf[p++]=0x00;buf[p++]=0x0a; /* ext len */
+    buf[p++]=0x00;buf[p++]=0x08; /* list len */
     buf[p++]=0x05;buf[p++]=0x03; /* ecdsa_secp384r1_sha384 */
     buf[p++]=0x04;buf[p++]=0x03; /* ecdsa_secp256r1_sha256 */
     buf[p++]=0x08;buf[p++]=0x04; /* rsa_pss_rsae_sha256 */
+    buf[p++]=0x04;buf[p++]=0x01; /* rsa_pkcs1_sha256 */
 
     /* key_share (both P-256 and P-384) */
     buf[p++]=0x00;buf[p++]=0x33;
@@ -1786,11 +1831,12 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
     PUT16(buf+p,97);p+=2;
     memcpy(buf+p,p384_pub,97);p+=97;
 
-    /* supported_versions */
+    /* supported_versions (TLS 1.3 preferred, TLS 1.2 fallback) */
     buf[p++]=0x00;buf[p++]=0x2b;
-    buf[p++]=0x00;buf[p++]=0x03; /* ext len */
-    buf[p++]=0x02;               /* list len */
+    buf[p++]=0x00;buf[p++]=0x05; /* ext len */
+    buf[p++]=0x04;               /* list len */
     buf[p++]=0x03;buf[p++]=0x04; /* TLS 1.3 */
+    buf[p++]=0x03;buf[p++]=0x03; /* TLS 1.2 */
 
     /* Fill in lengths */
     PUT16(buf+ext_len_pos,(uint16_t)(p-ext_len_pos-2));
@@ -1799,24 +1845,35 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
     return p;
 }
 
-/* Parse ServerHello, extract key_share public key.
-   server_pub must be >= 97 bytes. Returns selected group (0x0017 or 0x0018). */
+/* Parse ServerHello, extract server_random and determine negotiated version.
+   Returns negotiated version (0x0303 for TLS 1.2, 0x0304 for TLS 1.3).
+   For TLS 1.3: fills server_pub/pub_len from key_share.
+   For TLS 1.2: *pub_len is set to 0. */
 static uint16_t parse_server_hello(const uint8_t *msg, size_t len __attribute__((unused)),
-                                    uint8_t *server_pub, size_t *pub_len) {
+                                    uint8_t *server_pub, size_t *pub_len,
+                                    uint8_t server_random[32],
+                                    uint16_t *cipher_suite_out) {
     if(msg[0]!=0x02) die("not ServerHello");
     const uint8_t *b=msg+4;
     /* version */ b+=2;
-    /* random */ b+=32;
+    /* random - save it */
+    memcpy(server_random,b,32);
+    b+=32;
     /* session id */
     uint8_t sid_len=*b++; b+=sid_len;
     /* cipher suite */
     uint16_t cs=GET16(b); b+=2;
-    if(cs!=0x1301) { fprintf(stderr,"cipher suite 0x%04x\n",cs); die("unexpected cipher suite"); }
+    *cipher_suite_out=cs;
+    if(cs!=0x1301 && cs!=0xC02B && cs!=0xC02F) {
+        fprintf(stderr,"cipher suite 0x%04x\n",cs);
+        die("unexpected cipher suite");
+    }
     /* compression */ b++;
     /* extensions */
     uint16_t ext_total=GET16(b); b+=2;
     const uint8_t *ext_end=b+ext_total;
-    uint16_t selected_group=0;
+    uint16_t version=0x0303; /* default TLS 1.2 */
+    *pub_len=0;
     while(b<ext_end) {
         uint16_t etype=GET16(b); b+=2;
         uint16_t elen=GET16(b); b+=2;
@@ -1826,20 +1883,18 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len __attribute__(
             if(group==0x0017 && klen==65) {
                 memcpy(server_pub,b+4,65);
                 *pub_len=65;
-                selected_group=0x0017;
             } else if(group==0x0018 && klen==97) {
                 memcpy(server_pub,b+4,97);
                 *pub_len=97;
-                selected_group=0x0018;
             }
         } else if(etype==0x002b) { /* supported_versions */
             uint16_t ver=GET16(b);
-            if(ver!=0x0304) die("not TLS 1.3");
+            if(ver==0x0304) version=0x0304;
         }
         b+=elen;
     }
-    if(!selected_group) die("no supported key_share in ServerHello");
-    return selected_group;
+    if(version==0x0304 && *pub_len==0) die("TLS 1.3 but no key_share in ServerHello");
+    return version;
 }
 
 /* Decrypt a TLS 1.3 encrypted record.
@@ -1897,7 +1952,70 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
     free(inner); free(ct);
 }
 
-/* Main TLS 1.3 handshake + HTTP GET */
+/* ================================================================
+ * TLS 1.2 GCM Record Encrypt / Decrypt
+ * Nonce: write_iv(4) || explicit_nonce(8, = seq_num big-endian)
+ * AAD: seq_num(8) || content_type(1) || 0x0303(2) || plaintext_length(2)
+ * Record body: [explicit_nonce(8)][ciphertext][tag(16)]
+ * ================================================================ */
+static void tls12_encrypt_and_send(int fd, uint8_t content_type,
+                                     const uint8_t *data, size_t len,
+                                     const uint8_t write_key[16],
+                                     const uint8_t write_iv[4],
+                                     uint64_t seq) {
+    uint8_t nonce[12];
+    memcpy(nonce, write_iv, 4);
+    for(int i=7;i>=0;i--) nonce[4+(7-i)]=(seq>>(8*i))&0xFF;
+
+    uint8_t aad[13];
+    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
+    aad[8]=content_type;
+    aad[9]=0x03; aad[10]=0x03;
+    PUT16(aad+11,(uint16_t)len);
+
+    uint8_t *ct=malloc(len);
+    uint8_t tag[16];
+    aes_gcm_encrypt(write_key,nonce,aad,13,data,len,ct,tag);
+
+    size_t rec_len=8+len+16;
+    uint8_t *rec=malloc(rec_len);
+    memcpy(rec, nonce+4, 8);
+    memcpy(rec+8, ct, len);
+    memcpy(rec+8+len, tag, 16);
+
+    tls_send_record(fd, content_type, rec, rec_len);
+    free(ct);
+    free(rec);
+}
+
+static int tls12_decrypt_record(const uint8_t *rec, size_t rec_len,
+                                  uint8_t content_type,
+                                  const uint8_t read_key[16],
+                                  const uint8_t read_iv[4],
+                                  uint64_t seq,
+                                  uint8_t *pt, size_t *pt_len) {
+    if(rec_len < 8+16) return -1;
+
+    uint8_t nonce[12];
+    memcpy(nonce, read_iv, 4);
+    memcpy(nonce+4, rec, 8);
+
+    size_t ct_len = rec_len - 8 - 16;
+    const uint8_t *ct = rec + 8;
+    const uint8_t *tag = rec + 8 + ct_len;
+
+    uint8_t aad[13];
+    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
+    aad[8]=content_type;
+    aad[9]=0x03; aad[10]=0x03;
+    PUT16(aad+11,(uint16_t)ct_len);
+
+    if(aes_gcm_decrypt(read_key,nonce,aad,13,ct,ct_len,pt,tag)<0) return -1;
+    *pt_len=ct_len;
+    return 0;
+}
+
+/* Main TLS handshake + HTTP GET */
 static void do_https_get(const char *host, int port, const char *path) {
     load_trust_store("trust_store");
 
@@ -1913,7 +2031,8 @@ static void do_https_get(const char *host, int port, const char *path) {
 
     /* Build & send ClientHello */
     uint8_t ch[1024];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,host);
+    uint8_t client_random[32];
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,host,client_random);
     /* For the record layer, first ClientHello uses version 0x0301 */
     uint8_t ch_hdr[5]={0x16,0x03,0x01,0,0};
     PUT16(ch_hdr+3,(uint16_t)ch_len);
@@ -1933,9 +2052,253 @@ static void do_https_get(const char *host, int port, const char *path) {
     if(rtype!=0x16) die("expected handshake record");
     if(rec[0]!=0x02) die("expected ServerHello");
     uint8_t server_pub[97]; size_t server_pub_len=0;
-    uint16_t selected_group=parse_server_hello(rec,rec_len,server_pub,&server_pub_len);
+    uint8_t server_random[32];
+    uint16_t cipher_suite;
+    uint16_t version=parse_server_hello(rec,rec_len,server_pub,&server_pub_len,server_random,&cipher_suite);
     sha256_update(&transcript,rec,rec_len);
-    printf("Received ServerHello (group=0x%04x)\n",selected_group);
+
+    /* ================================================================
+     * TLS 1.2 Handshake Path
+     * ================================================================ */
+    if(version==0x0303) {
+        printf("Negotiated TLS 1.2 (cipher suite 0x%04x)\n",cipher_suite);
+
+        /* Read plaintext handshake messages */
+        uint8_t hs12_buf[65536]; size_t hs12_len=0;
+        int got_server_done=0;
+        uint8_t *cert12_msg=NULL; size_t cert12_msg_len=0;
+        uint8_t ske_pubkey[65];
+
+        while(!got_server_done) {
+            rtype=tls_read_record(fd,rec,&rec_len);
+            if(rtype!=0x16) die("expected handshake record in TLS 1.2");
+
+            memcpy(hs12_buf+hs12_len, rec, rec_len);
+            hs12_len+=rec_len;
+
+            size_t pos=0;
+            while(pos+4<=hs12_len) {
+                uint8_t mtype=hs12_buf[pos];
+                uint32_t mlen=GET24(hs12_buf+pos+1);
+                if(pos+4+mlen>hs12_len) break;
+                size_t msg_total=4+mlen;
+
+                sha256_update(&transcript, hs12_buf+pos, msg_total);
+
+                switch(mtype) {
+                    case 11: /* Certificate */
+                        printf("  Certificate (%u bytes)\n",(unsigned)mlen);
+                        cert12_msg=malloc(mlen);
+                        memcpy(cert12_msg, hs12_buf+pos+4, mlen);
+                        cert12_msg_len=mlen;
+                        break;
+                    case 12: { /* ServerKeyExchange */
+                        printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
+                        const uint8_t *ske=hs12_buf+pos+4;
+                        if(ske[0]!=0x03) die("expected named_curve type in SKE");
+                        uint16_t curve=GET16(ske+1);
+                        if(curve!=0x0017) die("expected secp256r1 in SKE");
+                        uint8_t pk_len=ske[3];
+                        if(pk_len!=65) die("expected uncompressed P-256 point");
+                        memcpy(ske_pubkey, ske+4, 65);
+
+                        size_t params_len=4+pk_len;
+                        const uint8_t *sig_ptr=ske+params_len;
+                        uint16_t sig_algo=GET16(sig_ptr); sig_ptr+=2;
+                        uint16_t sig_len_val=GET16(sig_ptr); sig_ptr+=2;
+
+                        /* Signed data: client_random || server_random || params */
+                        uint8_t signed_data[200];
+                        memcpy(signed_data, client_random, 32);
+                        memcpy(signed_data+32, server_random, 32);
+                        memcpy(signed_data+64, ske, params_len);
+                        size_t signed_len=64+params_len;
+
+                        /* Parse leaf cert for verification */
+                        if(!cert12_msg) die("Certificate must precede ServerKeyExchange");
+                        const uint8_t *cp=cert12_msg;
+                        uint32_t list_len12=GET24(cp); cp+=3;
+                        (void)list_len12;
+                        uint32_t first_cert_len=GET24(cp); cp+=3;
+                        x509_cert leaf;
+                        if(x509_parse(&leaf,cp,first_cert_len)!=0) die("Failed to parse leaf cert");
+
+                        int sig_ok=0;
+                        if(sig_algo==0x0403) { /* ecdsa_secp256r1_sha256 */
+                            uint8_t h[32]; sha256_hash(signed_data,signed_len,h);
+                            if(leaf.key_type==1 && leaf.pubkey_len==65)
+                                sig_ok=ecdsa_p256_verify(h,32,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                        } else if(sig_algo==0x0503) { /* ecdsa_secp384r1_sha384 */
+                            uint8_t h[48]; sha384_hash(signed_data,signed_len,h);
+                            if(leaf.key_type==1 && leaf.pubkey_len==97)
+                                sig_ok=ecdsa_p384_verify(h,48,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                        } else if(sig_algo==0x0401) { /* rsa_pkcs1_sha256 */
+                            uint8_t h[32]; sha256_hash(signed_data,signed_len,h);
+                            if(leaf.key_type==2)
+                                sig_ok=rsa_pkcs1_verify_sha256(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                        }
+                        if(!sig_ok) die("ServerKeyExchange signature verification failed");
+                        printf("    SKE signature verified (algo=0x%04x)\n",sig_algo);
+                        break;
+                    }
+                    case 14: /* ServerHelloDone */
+                        printf("  ServerHelloDone\n");
+                        got_server_done=1;
+                        break;
+                    default:
+                        printf("  TLS 1.2 handshake msg type %d (%u bytes)\n",mtype,(unsigned)mlen);
+                        break;
+                }
+                pos+=msg_total;
+            }
+            if(pos>0 && pos<hs12_len) {
+                memmove(hs12_buf, hs12_buf+pos, hs12_len-pos);
+                hs12_len-=pos;
+            } else if(pos==hs12_len) {
+                hs12_len=0;
+            }
+        }
+
+        /* Validate certificate chain */
+        if(cert12_msg) {
+            printf("  Validating certificate chain...\n");
+            if(verify_cert_chain(cert12_msg,cert12_msg_len,host,0)<0)
+                die("Certificate verification failed");
+        }
+
+        /* Send ClientKeyExchange */
+        {
+            uint8_t cke[70];
+            cke[0]=0x10; /* ClientKeyExchange */
+            cke[1]=0; cke[2]=0; cke[3]=66;
+            cke[4]=65;
+            memcpy(cke+5, p256_pub, 65);
+            tls_send_record(fd,0x16,cke,70);
+            sha256_update(&transcript, cke, 70);
+            printf("Sent ClientKeyExchange\n");
+        }
+
+        /* Compute ECDHE shared secret (P-256) */
+        uint8_t ss12[32];
+        ecdhe_p256_shared_secret(p256_priv, ske_pubkey, ss12);
+        printf("Computed ECDHE shared secret (P-256)\n");
+
+        /* TLS 1.2 key derivation */
+        uint8_t pms_seed[64];
+        memcpy(pms_seed, client_random, 32);
+        memcpy(pms_seed+32, server_random, 32);
+
+        uint8_t tls12_master[48];
+        tls12_prf(ss12, 32, "master secret", pms_seed, 64, tls12_master, 48);
+
+        uint8_t ke_seed[64];
+        memcpy(ke_seed, server_random, 32);
+        memcpy(ke_seed+32, client_random, 32);
+
+        uint8_t key_block[40];
+        tls12_prf(tls12_master, 48, "key expansion", ke_seed, 64, key_block, 40);
+
+        uint8_t c_wk[16], s_wk[16], c_wiv[4], s_wiv[4];
+        memcpy(c_wk, key_block, 16);
+        memcpy(s_wk, key_block+16, 16);
+        memcpy(c_wiv, key_block+32, 4);
+        memcpy(s_wiv, key_block+36, 4);
+        printf("Derived TLS 1.2 traffic keys\n");
+
+        /* Send ChangeCipherSpec */
+        { uint8_t ccs=1; tls_send_record(fd,0x14,&ccs,1); }
+        printf("Sent ChangeCipherSpec\n");
+
+        /* Send Finished (encrypted) */
+        {
+            uint8_t th12[32];
+            { sha256_ctx tc=transcript; sha256_final(&tc,th12); }
+
+            uint8_t verify_data[12];
+            tls12_prf(tls12_master, 48, "client finished", th12, 32, verify_data, 12);
+
+            uint8_t fin_msg[16];
+            fin_msg[0]=0x14;
+            fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=12;
+            memcpy(fin_msg+4, verify_data, 12);
+
+            tls12_encrypt_and_send(fd, 0x16, fin_msg, 16, c_wk, c_wiv, 0);
+            sha256_update(&transcript, fin_msg, 16);
+            printf("Sent Finished (encrypted)\n");
+        }
+
+        /* Receive ChangeCipherSpec */
+        rtype=tls_read_record(fd,rec,&rec_len);
+        if(rtype!=0x14) die("expected ChangeCipherSpec from server");
+        printf("Received ChangeCipherSpec\n");
+
+        /* Receive server Finished (encrypted) */
+        rtype=tls_read_record(fd,rec,&rec_len);
+        if(rtype!=0x16) die("expected Finished from server");
+        {
+            uint8_t pt12[256]; size_t pt12_len;
+            if(tls12_decrypt_record(rec, rec_len, 0x16, s_wk, s_wiv, 0, pt12, &pt12_len)<0)
+                die("Failed to decrypt server Finished");
+            if(pt12[0]!=0x14) die("expected Finished message type");
+
+            uint8_t th12_sf[32];
+            { sha256_ctx tc=transcript; sha256_final(&tc,th12_sf); }
+            uint8_t expected[12];
+            tls12_prf(tls12_master, 48, "server finished", th12_sf, 32, expected, 12);
+            if(!ct_memeq(expected, pt12+4, 12)) die("Server Finished verify failed!");
+            printf("Server Finished VERIFIED\n");
+        }
+
+        /* Send HTTP GET */
+        uint64_t c12_seq=1;
+        {
+            char req[512];
+            int rlen=snprintf(req,sizeof(req),
+                "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
+                path,host);
+            tls12_encrypt_and_send(fd,0x17,(uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++);
+            printf("Sent HTTP GET %s\n\n",path);
+        }
+
+        /* Receive HTTP response */
+        uint64_t s12_seq=1;
+        printf("=== HTTP Response ===\n");
+        for(;;) {
+            rtype=tls_read_record(fd,rec,&rec_len);
+            if(rtype<0) break;
+            if(rtype==0x17) {
+                uint8_t pt12[32768]; size_t pt12_len;
+                if(tls12_decrypt_record(rec,rec_len,0x17,s_wk,s_wiv,s12_seq++,pt12,&pt12_len)<0) {
+                    fprintf(stderr,"Decrypt failed at seq %llu\n",(unsigned long long)(s12_seq-1));
+                    break;
+                }
+                fwrite(pt12,1,pt12_len,stdout);
+            } else if(rtype==0x15) {
+                if(rec_len>=2 && rec[0]==1 && rec[1]==0) break;
+                break;
+            } else {
+                break;
+            }
+        }
+        printf("\n=== Done ===\n");
+
+        free(cert12_msg);
+        secure_zero(ss12,sizeof(ss12));
+        secure_zero(tls12_master,sizeof(tls12_master));
+        secure_zero(key_block,sizeof(key_block));
+        secure_zero(c_wk,sizeof(c_wk)); secure_zero(s_wk,sizeof(s_wk));
+        secure_zero(c_wiv,sizeof(c_wiv)); secure_zero(s_wiv,sizeof(s_wiv));
+        secure_zero(p384_priv,sizeof(p384_priv));
+        secure_zero(p256_priv,sizeof(p256_priv));
+        close(fd);
+        return;
+    }
+
+    /* ================================================================
+     * TLS 1.3 Handshake Path
+     * ================================================================ */
+    uint16_t selected_group = (server_pub_len==65) ? 0x0017 : 0x0018;
+    printf("Received ServerHello (TLS 1.3, group=0x%04x)\n",selected_group);
 
     /* Compute shared secret based on negotiated group */
     uint8_t shared[48]; size_t shared_len;
@@ -2020,7 +2383,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                     sha256_update(&transcript,hs_buf+pos,msg_total);
                     if(saved_cert_msg){
                         printf("  Validating certificate chain...\n");
-                        if(verify_cert_chain(saved_cert_msg,saved_cert_msg_len,host)<0)
+                        if(verify_cert_chain(saved_cert_msg,saved_cert_msg_len,host,1)<0)
                             die("Certificate verification failed");
                     }
                     break;
@@ -2160,8 +2523,8 @@ int main(int argc, char **argv) {
     /* check for :port */
     char *colon = strchr(host, ':');
     if (colon) { port = atoi(colon + 1); *colon = '\0'; }
-    printf("TLS 1.3 HTTPS Client — from scratch in C\n");
-    printf("Cipher: TLS_AES_128_GCM_SHA256, Key Exchange: ECDHE-secp384r1\n\n");
+    printf("TLS 1.2/1.3 HTTPS Client — from scratch in C\n");
+    printf("Ciphers: TLS_AES_128_GCM_SHA256, ECDHE-ECDSA/RSA-AES128-GCM-SHA256\n\n");
     do_https_get(host, port, path);
     return 0;
 }
