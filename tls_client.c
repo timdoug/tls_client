@@ -47,6 +47,19 @@ static int write_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
+/* Constant-time helpers */
+static void secure_zero(void *p, size_t len) {
+    volatile uint8_t *v = p;
+    while (len--) *v++ = 0;
+}
+
+static int ct_memeq(const void *a, const void *b, size_t len) {
+    const uint8_t *x = a, *y = b;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < len; i++) diff |= x[i] ^ y[i];
+    return diff == 0; /* 1 if equal, 0 if not */
+}
+
 /* ================================================================
  * SHA-256
  * ================================================================ */
@@ -232,7 +245,8 @@ static void aes128_encrypt(const uint8_t rk[176], const uint8_t in[16], uint8_t 
 static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
     uint8_t v[16],z[16]; memcpy(v,y,16); memset(z,0,16);
     for(int i=0;i<128;i++){
-        if(x[i/8]&(0x80>>(i%8))) for(int j=0;j<16;j++) z[j]^=v[j];
+        uint8_t mask = -((x[i/8]>>(7-(i%8)))&1); /* 0x00 or 0xFF */
+        for(int j=0;j<16;j++) z[j]^=v[j]&mask;
         uint8_t lsb=v[15]&1;
         for(int j=15;j>0;j--) v[j]=(v[j]>>1)|(v[j-1]<<7);
         v[0]>>=1; if(lsb) v[0]^=0xe1;
@@ -286,7 +300,7 @@ static int aes_gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12],
     uint8_t j0[16]; memcpy(j0,nonce,12); j0[12]=j0[13]=j0[14]=0; j0[15]=1;
     uint8_t ej0[16]; aes128_encrypt(rk,j0,ej0);
     for(int i=0;i<16;i++) tag[i]^=ej0[i];
-    if(memcmp(tag,exp_tag,16)!=0) return -1;
+    if(!ct_memeq(tag,exp_tag,16)) return -1;
     uint8_t ctr[16]; memcpy(ctr,nonce,12); ctr[12]=ctr[13]=ctr[14]=0; ctr[15]=2;
     for(size_t i=0;i<cl;i+=16){
         uint8_t ks[16]; aes128_encrypt(rk,ctr,ks); inc32(ctr);
@@ -325,12 +339,18 @@ static uint64_t fp384_sub_raw(fp384 *r, const fp384 *a, const fp384 *b) {
 }
 
 static void fp384_add(fp384 *r, const fp384 *a, const fp384 *b) {
-    uint64_t c=fp384_add_raw(r,a,b);
-    if(c||fp384_cmp(r,&P384_P)>=0) fp384_sub_raw(r,r,&P384_P);
+    uint64_t carry=fp384_add_raw(r,a,b);
+    fp384 t; uint64_t borrow=fp384_sub_raw(&t,r,&P384_P);
+    /* Use subtracted result if carry, or if no borrow (r >= P) */
+    uint64_t mask=-(uint64_t)(carry|(1-borrow));
+    for(int i=0;i<6;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
 static void fp384_sub(fp384 *r, const fp384 *a, const fp384 *b) {
-    if(fp384_sub_raw(r,a,b)) fp384_add_raw(r,r,&P384_P);
+    uint64_t borrow=fp384_sub_raw(r,a,b);
+    fp384 t; fp384_add_raw(&t,r,&P384_P);
+    uint64_t mask=-(uint64_t)borrow;
+    for(int i=0;i<6;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
 static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
@@ -392,9 +412,13 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
         for(int i=0;i<10;i++){borrow=(__int128)acc[i]-sh[i]+borrow;acc[i]=(uint64_t)borrow;borrow>>=64;}
       }
     }
-    /* Final: subtract p while result >= p */
+    /* Final: constant-time conditional subtraction of p (at most 4 times) */
     memcpy(r,acc,48);
-    while(fp384_cmp(r,&P384_P)>=0) fp384_sub_raw(r,r,&P384_P);
+    for(int pass=0;pass<4;pass++){
+        fp384 t; uint64_t borrow=fp384_sub_raw(&t,r,&P384_P);
+        uint64_t mask=-(uint64_t)(1-borrow); /* all 1s if no borrow (r>=P) */
+        for(int i=0;i<6;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    }
 }
 
 static void fp384_sqr(fp384 *r, const fp384 *a){fp384_mul(r,a,a);}
@@ -508,29 +532,40 @@ static void ec384_to_affine(fp384 *ax, fp384 *ay, const ec384 *p) {
     fp384_mul(ax,&p->x,&zi2); fp384_mul(ay,&p->y,&zi3);
 }
 
-/* Scalar multiplication: double-and-add, MSB first */
-static void ec384_scalar_mul(ec384 *r, const ec384 *p, const uint8_t scalar[48]) {
-    ec384_set_inf(r);
-    int started=0;
-    for(int i=0;i<384;i++){
-        int bit_idx=383-i;
-        int byte_idx=47-(bit_idx/8);
-        int bit_pos=bit_idx%8;
-        int bit=(scalar[byte_idx]>>bit_pos)&1;
-        if(started) ec384_double(r,r);
-        if(bit){
-            if(!started){*r=*p;started=1;}
-            else ec384_add(r,r,p);
-        }
+/* Constant-time conditional swap of two EC points */
+static void ec384_cswap(ec384 *a, ec384 *b, uint64_t bit) {
+    uint64_t mask = -(uint64_t)bit;
+    for(int i=0;i<6;i++){
+        uint64_t d;
+        d=mask&(a->x.v[i]^b->x.v[i]); a->x.v[i]^=d; b->x.v[i]^=d;
+        d=mask&(a->y.v[i]^b->y.v[i]); a->y.v[i]^=d; b->y.v[i]^=d;
+        d=mask&(a->z.v[i]^b->z.v[i]); a->z.v[i]^=d; b->z.v[i]^=d;
     }
-    if(!started) ec384_set_inf(r);
+}
+
+/* Montgomery ladder scalar multiplication (constant-time).
+ * Caller must ensure top bit of scalar is set so that R0/R1
+ * are never the point at infinity after the first iteration. */
+static void ec384_scalar_mul(ec384 *r, const ec384 *p, const uint8_t scalar[48]) {
+    ec384 R0, R1;
+    ec384_set_inf(&R0);
+    R1 = *p;
+    for(int i=383;i>=0;i--){
+        int byte_idx=47-(i/8);
+        int bit_pos=i%8;
+        uint64_t bit=(scalar[byte_idx]>>bit_pos)&1;
+        ec384_cswap(&R0,&R1,bit);
+        ec384_add(&R1,&R0,&R1);
+        ec384_double(&R0,&R0);
+        ec384_cswap(&R0,&R1,bit);
+    }
+    *r=R0;
 }
 
 /* ECDHE: generate keypair, compute shared secret */
 static void ecdhe_keygen(uint8_t priv[48], uint8_t pub[97]) {
     random_bytes(priv,48);
-    /* Ensure scalar < n (it almost certainly is for random 384-bit) */
-    priv[0] &= 0xFF; /* no-op, just for clarity */
+    priv[0] |= 0x80; /* Set top bit so Montgomery ladder never hits infinity */
     ec384 G; G.x=P384_GX; G.y=P384_GY; G.z=FP384_ONE;
     ec384 Q; ec384_scalar_mul(&Q,&G,priv);
     fp384 ax,ay; ec384_to_affine(&ax,&ay,&Q);
@@ -552,6 +587,7 @@ static void ecdhe_shared_secret(const uint8_t priv[48], const uint8_t peer_pub[9
     fp384 px,py;
     fp384_from_bytes(&px,peer_pub+1);
     fp384_from_bytes(&py,peer_pub+49);
+    if(!ec384_on_curve(&px,&py)) die("peer public key not on curve");
     ec384 P; P.x=px; P.y=py; P.z=FP384_ONE;
     ec384 S; ec384_scalar_mul(&S,&P,priv);
     fp384 sx,sy; ec384_to_affine(&sx,&sy,&S);
@@ -872,7 +908,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                     { sha256_ctx tc=transcript; sha256_final(&tc,th_before_fin); }
                     uint8_t expected[32];
                     hmac_sha256(fin_key,32,th_before_fin,32,expected);
-                    if(memcmp(expected,hs_buf+pos+4,32)!=0) die("Server Finished verify failed!");
+                    if(!ct_memeq(expected,hs_buf+pos+4,32)) die("Server Finished verify failed!");
                     printf("  Server Finished VERIFIED\n");
                     sha256_update(&transcript,hs_buf+pos,msg_total);
                     got_finished=1;
@@ -968,6 +1004,16 @@ static void do_https_get(const char *host, int port, const char *path) {
         }
     }
     printf("\n=== Done ===\n");
+    secure_zero(priv,sizeof(priv));
+    secure_zero(shared,sizeof(shared));
+    secure_zero(hs_secret,sizeof(hs_secret));
+    secure_zero(s_hs_traffic,sizeof(s_hs_traffic));
+    secure_zero(c_hs_traffic,sizeof(c_hs_traffic));
+    secure_zero(s_hs_key,sizeof(s_hs_key)); secure_zero(s_hs_iv,sizeof(s_hs_iv));
+    secure_zero(c_hs_key,sizeof(c_hs_key)); secure_zero(c_hs_iv,sizeof(c_hs_iv));
+    secure_zero(master_secret,sizeof(master_secret));
+    secure_zero(s_ap_key,sizeof(s_ap_key)); secure_zero(s_ap_iv,sizeof(s_ap_iv));
+    secure_zero(c_ap_key,sizeof(c_ap_key)); secure_zero(c_ap_iv,sizeof(c_ap_iv));
     close(fd);
 }
 
