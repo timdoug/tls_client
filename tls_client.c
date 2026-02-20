@@ -2456,7 +2456,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     }
 
     /* Process encrypted records until we get Finished */
-    int got_finished=0;
+    int got_finished=0, got_cert_verify=0;
     uint8_t *saved_cert_msg=NULL; size_t saved_cert_msg_len=0;
     while(!got_finished) {
         if(rtype!=0x17) die("expected encrypted record");
@@ -2546,11 +2546,13 @@ static void do_https_get(const char *host, int port, const char *path) {
                     }
                     if(!cv_ok) die("CertificateVerify signature verification failed");
                     printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",cv_algo);
+                    got_cert_verify=1;
 
                     sha256_update(&transcript,hs_buf+pos,msg_total);
                     break;
                 }
                 case 20: { /* Finished */
+                    if(!got_cert_verify) die("Server Finished without CertificateVerify");
                     printf("  Server Finished\n");
                     /* Verify server finished */
                     uint8_t fin_key[32];
