@@ -56,10 +56,11 @@ static void secure_zero(void *p, size_t len) {
 }
 
 static int ct_memeq(const void *a, const void *b, size_t len) {
-    const uint8_t *x = a, *y = b;
-    uint8_t diff = 0;
+    const volatile uint8_t *x = a, *y = b;
+    volatile uint8_t diff = 0;
     for (size_t i = 0; i < len; i++) diff |= x[i] ^ y[i];
-    return diff == 0; /* 1 if equal, 0 if not */
+    /* Constant-time: map 0 -> 1, nonzero -> 0 without branching */
+    return (int)(1 & ((uint32_t)(diff - 1) >> 8));
 }
 
 /* ================================================================
@@ -242,11 +243,22 @@ static const uint8_t aes_sbox[256] = {
 };
 static const uint8_t aes_rcon[10]={1,2,4,8,16,32,64,128,27,54};
 
+/* Constant-time S-box lookup: scans entire table to avoid cache timing leaks */
+static uint8_t ct_sbox(uint8_t idx) {
+    uint8_t result=0;
+    for(unsigned i=0;i<256;i++){
+        /* 0xFF when i==idx, 0x00 otherwise, no branches */
+        uint8_t mask=(uint8_t)(((uint32_t)((uint8_t)i^idx)-1)>>8);
+        result|=aes_sbox[i]&mask;
+    }
+    return result;
+}
+
 static void aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
     memcpy(rk,key,16);
     for (int i=0;i<10;i++) {
         uint8_t *p=rk+16*i, *n=rk+16*(i+1);
-        uint8_t t[4]={aes_sbox[p[13]],aes_sbox[p[14]],aes_sbox[p[15]],aes_sbox[p[12]]};
+        uint8_t t[4]={ct_sbox(p[13]),ct_sbox(p[14]),ct_sbox(p[15]),ct_sbox(p[12])};
         t[0]^=aes_rcon[i];
         for(int j=0;j<4;j++){n[j]=p[j]^t[j];n[4+j]=p[4+j]^n[j];n[8+j]=p[8+j]^n[4+j];n[12+j]=p[12+j]^n[8+j];}
     }
@@ -258,7 +270,7 @@ static void aes128_encrypt(const uint8_t rk[176], const uint8_t in[16], uint8_t 
     uint8_t s[16]; memcpy(s,in,16);
     for(int i=0;i<16;i++) s[i]^=rk[i];
     for (int r=1;r<=10;r++) {
-        for(int i=0;i<16;i++) s[i]=aes_sbox[s[i]];
+        for(int i=0;i<16;i++) s[i]=ct_sbox(s[i]);
         uint8_t t;
         t=s[1];s[1]=s[5];s[5]=s[9];s[9]=s[13];s[13]=t;
         t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
@@ -1064,6 +1076,12 @@ static void ec256_to_affine(bignum *ax, bignum *ay, const ec256 *p) {
     bn_modmul(ay,&p->y,&zi3,&p256_p);
 }
 
+/* Constant-time conditional swap of int values */
+static void ct_swap_int(int *a, int *b, uint64_t mask) {
+    int d=(int)(mask&(uint64_t)((unsigned)*a^(unsigned)*b));
+    *a^=d; *b^=d;
+}
+
 /* Montgomery ladder scalar multiplication (constant-time) */
 static void ec256_scalar_mul(ec256 *r, const ec256 *p, const uint8_t scalar[32]) {
     ec256 R0,R1;
@@ -1079,9 +1097,9 @@ static void ec256_scalar_mul(ec256 *r, const ec256 *p, const uint8_t scalar[32])
             d=mask&(R0.y.v[j]^R1.y.v[j]);R0.y.v[j]^=d;R1.y.v[j]^=d;
             d=mask&(R0.z.v[j]^R1.z.v[j]);R0.z.v[j]^=d;R1.z.v[j]^=d;
         }
-        { int t=R0.x.len; R0.x.len=bit?R1.x.len:R0.x.len; R1.x.len=bit?t:R1.x.len; }
-        { int t=R0.y.len; R0.y.len=bit?R1.y.len:R0.y.len; R1.y.len=bit?t:R1.y.len; }
-        { int t=R0.z.len; R0.z.len=bit?R1.z.len:R0.z.len; R1.z.len=bit?t:R1.z.len; }
+        ct_swap_int(&R0.x.len,&R1.x.len,mask);
+        ct_swap_int(&R0.y.len,&R1.y.len,mask);
+        ct_swap_int(&R0.z.len,&R1.z.len,mask);
         ec256_add(&R1,&R0,&R1);
         ec256_double(&R0,&R0);
         for(int j=0;j<BN_MAX_LIMBS;j++){
@@ -1090,9 +1108,9 @@ static void ec256_scalar_mul(ec256 *r, const ec256 *p, const uint8_t scalar[32])
             d=mask&(R0.y.v[j]^R1.y.v[j]);R0.y.v[j]^=d;R1.y.v[j]^=d;
             d=mask&(R0.z.v[j]^R1.z.v[j]);R0.z.v[j]^=d;R1.z.v[j]^=d;
         }
-        { int t=R0.x.len; R0.x.len=bit?R1.x.len:R0.x.len; R1.x.len=bit?t:R1.x.len; }
-        { int t=R0.y.len; R0.y.len=bit?R1.y.len:R0.y.len; R1.y.len=bit?t:R1.y.len; }
-        { int t=R0.z.len; R0.z.len=bit?R1.z.len:R0.z.len; R1.z.len=bit?t:R1.z.len; }
+        ct_swap_int(&R0.x.len,&R1.x.len,mask);
+        ct_swap_int(&R0.y.len,&R1.y.len,mask);
+        ct_swap_int(&R0.z.len,&R1.z.len,mask);
     }
     *r=R0;
 }
@@ -2080,7 +2098,9 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
                               const uint8_t key[16], const uint8_t iv[12],
                               uint64_t seq) {
     /* Build inner plaintext: data + content_type */
+    if(len>16384) die("TLS 1.3 record too large to encrypt");
     uint8_t *inner = malloc(len+1);
+    if(!inner) die("malloc failed");
     memcpy(inner,data,len);
     inner[len]=inner_type;
 
@@ -2089,6 +2109,7 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
 
     size_t ct_len=len+1;
     uint8_t *ct=malloc(ct_len+16);
+    if(!ct) die("malloc failed");
     uint8_t tag[16];
 
     uint8_t aad[5]={0x17,0x03,0x03,0,0};
@@ -2122,12 +2143,15 @@ static void tls12_encrypt_and_send(int fd, uint8_t content_type,
     aad[9]=0x03; aad[10]=0x03;
     PUT16(aad+11,(uint16_t)len);
 
+    if(len>16384) die("TLS 1.2 record too large to encrypt");
     uint8_t *ct=malloc(len);
+    if(!ct) die("malloc failed");
     uint8_t tag[16];
     aes_gcm_encrypt(write_key,nonce,aad,13,data,len,ct,tag);
 
     size_t rec_len=8+len+16;
     uint8_t *rec=malloc(rec_len);
+    if(!rec) die("malloc failed");
     memcpy(rec, nonce+4, 8);
     memcpy(rec+8, ct, len);
     memcpy(rec+8+len, tag, 16);
