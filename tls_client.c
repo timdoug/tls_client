@@ -6,7 +6,7 @@
  * Compile:  cc -O2 -o tls_client tls_client.c
  * Run:      ./tls_client
  *
- * NOTE: Certificate verification is NOT implemented — educational demo only.
+ * Certificate verification: SHA-384, ECDSA-P384, RSA PKCS#1 v1.5, X.509 chain.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +18,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <time.h>
+#include <dirent.h>
 
 typedef unsigned __int128 uint128_t;
 
@@ -594,6 +596,808 @@ static void ecdhe_shared_secret(const uint8_t priv[48], const uint8_t peer_pub[9
     fp384_to_bytes(secret,&sx);
 }
 /* ================================================================
+ * Base64 / PEM Decoder
+ * ================================================================ */
+static int b64val(uint8_t c) {
+    if (c>='A'&&c<='Z') return c-'A';
+    if (c>='a'&&c<='z') return c-'a'+26;
+    if (c>='0'&&c<='9') return c-'0'+52;
+    if (c=='+') return 62;
+    if (c=='/') return 63;
+    return -1;
+}
+
+static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
+    const char *begin = strstr(pem, "-----BEGIN ");
+    if (!begin) return 0;
+    begin = memchr(begin, '\n', pem_len-(begin-pem));
+    if (!begin) return 0;
+    begin++;
+    const char *end = strstr(begin, "-----END ");
+    if (!end) return 0;
+    size_t out = 0;
+    uint32_t acc = 0; int bits = 0;
+    for (const char *p = begin; p < end; p++) {
+        int v = b64val((uint8_t)*p);
+        if (v < 0) continue;
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; der[out++] = (acc >> bits) & 0xFF; }
+    }
+    return out;
+}
+
+/* ================================================================
+ * ASN.1/DER Parser Helpers
+ * ================================================================ */
+/* Read tag + length, return pointer to value. NULL on error. */
+static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
+                                    uint8_t *tag, size_t *len) {
+    if (p >= end) return NULL;
+    *tag = *p++;
+    if (p >= end) return NULL;
+    if (*p < 0x80) {
+        *len = *p++;
+    } else {
+        int nb = *p++ & 0x7F;
+        if (nb > 3 || p + nb > end) return NULL;
+        *len = 0;
+        for (int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
+    }
+    if (p + *len > end) return NULL;
+    return p;
+}
+
+/* Skip one TLV element, return pointer past it */
+static const uint8_t *der_skip(const uint8_t *p, const uint8_t *end) {
+    uint8_t tag; size_t len;
+    const uint8_t *val = der_read_tl(p, end, &tag, &len);
+    if (!val) return NULL;
+    return val + len;
+}
+
+static int oid_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+    return alen == blen && memcmp(a, b, alen) == 0;
+}
+
+/* Parse UTCTime (tag 0x17: YYMMDDHHMMSSZ) or GeneralizedTime (tag 0x18: YYYYMMDDHHMMSSZ) */
+static time_t der_parse_time(const uint8_t *p, const uint8_t *end) {
+    uint8_t tag; size_t len;
+    const uint8_t *val=der_read_tl(p,end,&tag,&len);
+    if(!val) return 0;
+    const char *s=(const char *)val;
+    struct tm t={0};
+    if(tag==0x17){ /* UTCTime */
+        int yy=(s[0]-'0')*10+(s[1]-'0');
+        t.tm_year=yy>=50?yy:yy+100;
+        s+=2;
+    } else if(tag==0x18){ /* GeneralizedTime */
+        t.tm_year=(s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0')-1900;
+        s+=4;
+    } else return 0;
+    t.tm_mon=(s[0]-'0')*10+(s[1]-'0')-1;
+    t.tm_mday=(s[2]-'0')*10+(s[3]-'0');
+    t.tm_hour=(s[4]-'0')*10+(s[5]-'0');
+    t.tm_min=(s[6]-'0')*10+(s[7]-'0');
+    t.tm_sec=(s[8]-'0')*10+(s[9]-'0');
+    return timegm(&t);
+}
+
+/* ================================================================
+ * SHA-384 (SHA-512 truncated, different IVs, 64-bit words, 80 rounds)
+ * ================================================================ */
+static const uint64_t sha512_k[80] = {
+    0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL,0x59f111f1b605d019ULL,0x923f82a4af194f9bULL,0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL,0x12835b0145706fbeULL,0x243185be4ee4b28cULL,0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL,0x80deb1fe3b1696b1ULL,0x9bdc06a725c71235ULL,0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL,0xefbe4786384f25e3ULL,0x0fc19dc68b8cd5b5ULL,0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL,0x4a7484aa6ea6e483ULL,0x5cb0a9dcbd41fbd4ULL,0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL,0xa831c66d2db43210ULL,0xb00327c898fb213fULL,0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL,0xd5a79147930aa725ULL,0x06ca6351e003826fULL,0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL,0x2e1b21385c26c926ULL,0x4d2c6dfc5ac42aedULL,0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL,0x766a0abb3c77b2a8ULL,0x81c2c92e47edaee6ULL,0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL,0xa81a664bbc423001ULL,0xc24b8b70d0f89791ULL,0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL,0xd69906245565a910ULL,0xf40e35855771202aULL,0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL,0x1e376c085141ab53ULL,0x2748774cdf8eeb99ULL,0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL,0x4ed8aa4ae3418acbULL,0x5b9cca4f7763e373ULL,0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL,0x78a5636f43172f60ULL,0x84c87814a1f0ab72ULL,0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL,0xa4506cebde82bde9ULL,0xbef9a3f7b2c67915ULL,0xc67178f2e372532bULL,
+    0xca273eceea26619cULL,0xd186b8c721c0c207ULL,0xeada7dd6cde0eb1eULL,0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL,0x0a637dc5a2c898a6ULL,0x113f9804bef90daeULL,0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL
+};
+
+typedef struct { uint64_t h[8]; uint8_t buf[128]; size_t buf_len; uint64_t total; } sha384_ctx;
+
+#define ROTR64(x,n) (((x)>>(n))|((x)<<(64-(n))))
+#define S512_CH(x,y,z) (((x)&(y))^((~(x))&(z)))
+#define S512_MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
+#define S512_EP0(x) (ROTR64(x,28)^ROTR64(x,34)^ROTR64(x,39))
+#define S512_EP1(x) (ROTR64(x,14)^ROTR64(x,18)^ROTR64(x,41))
+#define S512_SIG0(x) (ROTR64(x,1)^ROTR64(x,8)^((x)>>7))
+#define S512_SIG1(x) (ROTR64(x,19)^ROTR64(x,61)^((x)>>6))
+
+static void sha384_transform(sha384_ctx *ctx, const uint8_t blk[128]) {
+    uint64_t w[80],a,b,c,d,e,f,g,h;
+    for(int i=0;i<16;i++){w[i]=0;for(int j=0;j<8;j++)w[i]=(w[i]<<8)|blk[8*i+j];}
+    for(int i=16;i<80;i++) w[i]=S512_SIG1(w[i-2])+w[i-7]+S512_SIG0(w[i-15])+w[i-16];
+    a=ctx->h[0];b=ctx->h[1];c=ctx->h[2];d=ctx->h[3];
+    e=ctx->h[4];f=ctx->h[5];g=ctx->h[6];h=ctx->h[7];
+    for(int i=0;i<80;i++){
+        uint64_t t1=h+S512_EP1(e)+S512_CH(e,f,g)+sha512_k[i]+w[i];
+        uint64_t t2=S512_EP0(a)+S512_MAJ(a,b,c);
+        h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
+    }
+    ctx->h[0]+=a;ctx->h[1]+=b;ctx->h[2]+=c;ctx->h[3]+=d;
+    ctx->h[4]+=e;ctx->h[5]+=f;ctx->h[6]+=g;ctx->h[7]+=h;
+}
+
+static void sha384_init(sha384_ctx *ctx) {
+    ctx->h[0]=0xcbbb9d5dc1059ed8ULL;ctx->h[1]=0x629a292a367cd507ULL;
+    ctx->h[2]=0x9159015a3070dd17ULL;ctx->h[3]=0x152fecd8f70e5939ULL;
+    ctx->h[4]=0x67332667ffc00b31ULL;ctx->h[5]=0x8eb44a8768581511ULL;
+    ctx->h[6]=0xdb0c2e0d64f98fa7ULL;ctx->h[7]=0x47b5481dbefa4fa4ULL;
+    ctx->buf_len=0; ctx->total=0;
+}
+
+static void sha384_update(sha384_ctx *ctx, const uint8_t *data, size_t len) {
+    ctx->total+=len;
+    while(len>0){
+        size_t space=128-ctx->buf_len, chunk=len<space?len:space;
+        memcpy(ctx->buf+ctx->buf_len,data,chunk);
+        ctx->buf_len+=chunk; data+=chunk; len-=chunk;
+        if(ctx->buf_len==128){sha384_transform(ctx,ctx->buf);ctx->buf_len=0;}
+    }
+}
+
+static void sha384_final(sha384_ctx *ctx, uint8_t out[48]) {
+    uint64_t bits=ctx->total*8;
+    uint8_t pad=0x80;
+    sha384_update(ctx,&pad,1);
+    pad=0;
+    while(ctx->buf_len!=112) sha384_update(ctx,&pad,1);
+    uint8_t lb[16]={0};
+    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
+    sha384_update(ctx,lb,16);
+    for(int i=0;i<6;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
+}
+
+static void sha384_hash(const uint8_t *data, size_t len, uint8_t out[48]) {
+    sha384_ctx c; sha384_init(&c); sha384_update(&c,data,len); sha384_final(&c,out);
+}
+
+/* OID constants */
+/* ================================================================
+ * Big-Number Arithmetic (for RSA and ECDSA mod-n operations)
+ * ================================================================ */
+#define BN_MAX_LIMBS 130  /* must hold product of two RSA-4096 numbers (128 limbs) */
+
+typedef struct { uint64_t v[BN_MAX_LIMBS]; int len; } bignum;
+
+static void bn_zero(bignum *r) { memset(r,0,sizeof(*r)); }
+
+static void bn_from_bytes(bignum *r, const uint8_t *buf, size_t blen) {
+    bn_zero(r);
+    r->len=(int)((blen+7)/8);
+    if(r->len>BN_MAX_LIMBS) r->len=BN_MAX_LIMBS;
+    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
+        r->v[i/8]|=(uint64_t)buf[blen-1-i]<<(8*(i%8));
+}
+
+static void bn_to_bytes(const bignum *a, uint8_t *buf, size_t blen) {
+    memset(buf,0,blen);
+    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
+        buf[blen-1-i]=(a->v[i/8]>>(8*(i%8)))&0xFF;
+}
+
+static int bn_cmp(const bignum *a, const bignum *b) {
+    int ml=a->len>b->len?a->len:b->len;
+    for(int i=ml-1;i>=0;i--){
+        uint64_t av=i<a->len?a->v[i]:0, bv=i<b->len?b->v[i]:0;
+        if(av>bv)return 1; if(av<bv)return -1;
+    }
+    return 0;
+}
+
+static void bn_sub(bignum *r, const bignum *a, const bignum *b) {
+    int ml=a->len>b->len?a->len:b->len;
+    __int128 borrow=0;
+    for(int i=0;i<ml;i++){
+        borrow=(__int128)(i<a->len?a->v[i]:0)-(i<b->len?b->v[i]:0)+borrow;
+        r->v[i]=(uint64_t)borrow; borrow>>=64;
+    }
+    r->len=ml;
+    while(r->len>0&&r->v[r->len-1]==0) r->len--;
+}
+
+static void bn_mul(bignum *r, const bignum *a, const bignum *b) {
+    bignum t; bn_zero(&t);
+    t.len=a->len+b->len;
+    if(t.len>BN_MAX_LIMBS) t.len=BN_MAX_LIMBS;
+    for(int i=0;i<a->len;i++){
+        uint64_t carry=0;
+        for(int j=0;j<b->len&&i+j<BN_MAX_LIMBS;j++){
+            uint128_t p=(uint128_t)a->v[i]*b->v[j]+t.v[i+j]+carry;
+            t.v[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+        }
+        if(i+b->len<BN_MAX_LIMBS) t.v[i+b->len]=carry;
+    }
+    while(t.len>0&&t.v[t.len-1]==0) t.len--;
+    *r=t;
+}
+
+static int bn_bits(const bignum *a) {
+    if(a->len==0) return 0;
+    int bits=(a->len-1)*64;
+    uint64_t top=a->v[a->len-1];
+    while(top){bits++;top>>=1;}
+    return bits;
+}
+
+static void bn_shl1(bignum *a) {
+    uint64_t carry=0;
+    for(int i=0;i<a->len;i++){
+        uint64_t nc=a->v[i]>>63;
+        a->v[i]=(a->v[i]<<1)|carry;
+        carry=nc;
+    }
+    if(carry&&a->len<BN_MAX_LIMBS) a->v[a->len++]=carry;
+}
+
+static void bn_mod(bignum *r, const bignum *a, const bignum *m) {
+    bignum rem; bn_zero(&rem);
+    int abits=bn_bits(a);
+    for(int i=abits-1;i>=0;i--){
+        bn_shl1(&rem);
+        if((a->v[i/64]>>(i%64))&1){rem.v[0]|=1;if(rem.len==0)rem.len=1;}
+        if(bn_cmp(&rem,m)>=0) bn_sub(&rem,&rem,m);
+    }
+    *r=rem;
+}
+
+static void bn_modmul(bignum *r, const bignum *a, const bignum *b, const bignum *m) {
+    bignum t; bn_mul(&t,a,b); bn_mod(r,&t,m);
+}
+
+static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bignum *m) {
+    bignum result; bn_zero(&result); result.v[0]=1; result.len=1;
+    bignum b; bn_mod(&b,base,m);
+    int exp_bits=bn_bits(exp);
+    for(int i=0;i<exp_bits;i++){
+        if((exp->v[i/64]>>(i%64))&1) bn_modmul(&result,&result,&b,m);
+        if(i<exp_bits-1) bn_modmul(&b,&b,&b,m);
+    }
+    *r=result;
+}
+
+/* OID constants */
+static const uint8_t OID_ECDSA_SHA384[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
+static const uint8_t OID_SHA256_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
+static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
+static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
+static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
+
+/* P-384 curve order n (big-endian) */
+static const uint8_t P384_ORDER[48] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xC7,0x63,0x4D,0x81,0xF4,0x37,0x2D,0xDF,
+    0x58,0x1A,0x0D,0xB2,0x48,0xB0,0xA7,0x7A,
+    0xEC,0xEC,0x19,0x6A,0xCC,0xC5,0x29,0x73
+};
+
+/* ================================================================
+ * ECDSA-P384 Signature Verification
+ * ================================================================ */
+/* Variable-time scalar mul (safe for public verification inputs) */
+static void ec384_scalar_mul_vartime(ec384 *r, const ec384 *p, const uint8_t scalar[48]) {
+    ec384_set_inf(r);
+    int started=0;
+    for(int i=0;i<384;i++){
+        int byte_idx=i/8, bit_pos=7-(i%8);
+        int bit=(scalar[byte_idx]>>bit_pos)&1;
+        if(started){
+            ec384_double(r,r);
+            if(bit) ec384_add(r,r,p);
+        } else if(bit){
+            *r=*p; started=1;
+        }
+    }
+}
+
+static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
+                              const uint8_t *sig_der, size_t sig_len,
+                              const uint8_t *pubkey, size_t pk_len) {
+    if(pk_len!=97||pubkey[0]!=0x04) return 0;
+
+    /* Parse DER signature → (r, s) */
+    const uint8_t *p=sig_der, *end=sig_der+sig_len;
+    uint8_t tag; size_t len;
+    p=der_read_tl(p,end,&tag,&len);
+    if(!p||tag!=0x30) return 0;
+    end=p+len;
+
+    const uint8_t *rval=der_read_tl(p,end,&tag,&len);
+    if(!rval||tag!=0x02) return 0;
+    const uint8_t *rp=rval; size_t rlen=len;
+    if(rlen>0&&rp[0]==0){rp++;rlen--;}
+    p=rval+len;
+
+    const uint8_t *sval=der_read_tl(p,end,&tag,&len);
+    if(!sval||tag!=0x02) return 0;
+    const uint8_t *sp=sval; size_t slen=len;
+    if(slen>0&&sp[0]==0){sp++;slen--;}
+
+    bignum r_bn, s_bn, n, hash_bn, w, u1, u2;
+    bn_from_bytes(&r_bn,rp,rlen);
+    bn_from_bytes(&s_bn,sp,slen);
+    bn_from_bytes(&n,P384_ORDER,48);
+    bn_from_bytes(&hash_bn,hash,hash_len>48?48:hash_len);
+
+    /* w = s^(-1) mod n via Fermat: s^(n-2) mod n */
+    bignum nm2;
+    bn_from_bytes(&nm2,P384_ORDER,48);
+    bignum two; bn_zero(&two); two.v[0]=2; two.len=1;
+    bn_sub(&nm2,&nm2,&two);
+    bn_modexp(&w,&s_bn,&nm2,&n);
+
+    /* u1 = hash * w mod n, u2 = r * w mod n */
+    bn_modmul(&u1,&hash_bn,&w,&n);
+    bn_modmul(&u2,&r_bn,&w,&n);
+
+    uint8_t u1_bytes[48], u2_bytes[48];
+    bn_to_bytes(&u1,u1_bytes,48);
+    bn_to_bytes(&u2,u2_bytes,48);
+
+    /* R = u1*G + u2*Q */
+    ec384 G; G.x=P384_GX; G.y=P384_GY; G.z=FP384_ONE;
+    ec384 Q;
+    fp384 qx,qy;
+    fp384_from_bytes(&qx,pubkey+1);
+    fp384_from_bytes(&qy,pubkey+49);
+    Q.x=qx; Q.y=qy; Q.z=FP384_ONE;
+
+    ec384 R1,R2,R;
+    ec384_scalar_mul_vartime(&R1,&G,u1_bytes);
+    ec384_scalar_mul_vartime(&R2,&Q,u2_bytes);
+    ec384_add(&R,&R1,&R2);
+    if(ec384_is_inf(&R)) return 0;
+
+    fp384 rx,ry;
+    ec384_to_affine(&rx,&ry,&R);
+    uint8_t rx_bytes[48];
+    fp384_to_bytes(rx_bytes,&rx);
+    bignum rx_bn;
+    bn_from_bytes(&rx_bn,rx_bytes,48);
+    bn_mod(&rx_bn,&rx_bn,&n);
+    return bn_cmp(&rx_bn,&r_bn)==0;
+}
+
+/* ================================================================
+ * RSA PKCS#1 v1.5 Signature Verification
+ * ================================================================ */
+static int rsa_pkcs1_verify_sha256(const uint8_t hash[32],
+                                    const uint8_t *sig, size_t sig_len,
+                                    const uint8_t *modulus, size_t mod_len,
+                                    const uint8_t *exponent, size_t exp_len) {
+    bignum s_bn, n_bn, e_bn, m_bn;
+    bn_from_bytes(&s_bn,sig,sig_len);
+    bn_from_bytes(&n_bn,modulus,mod_len);
+    bn_from_bytes(&e_bn,exponent,exp_len);
+
+    bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
+
+    uint8_t m[512];
+    if(mod_len>sizeof(m)) return 0;
+    bn_to_bytes(&m_bn,m,mod_len);
+
+    /* Verify PKCS#1 v1.5: 00 01 [FF..FF] 00 [DigestInfo] */
+    if(m[0]!=0x00||m[1]!=0x01) return 0;
+    size_t i=2;
+    while(i<mod_len&&m[i]==0xFF) i++;
+    if(i<10||i>=mod_len||m[i]!=0x00) return 0;
+    i++;
+
+    /* DigestInfo for SHA-256 */
+    static const uint8_t di[]={
+        0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
+        0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20
+    };
+    if(i+sizeof(di)+32!=mod_len) return 0;
+    if(memcmp(m+i,di,sizeof(di))!=0) return 0;
+    i+=sizeof(di);
+    if(memcmp(m+i,hash,32)!=0) return 0;
+    return 1;
+}
+
+/* ================================================================
+ * X.509 Certificate Parser
+ * ================================================================ */
+typedef struct {
+    const uint8_t *tbs; size_t tbs_len;           /* raw TBS for hashing */
+    const uint8_t *sig_alg; size_t sig_alg_len;   /* signature algorithm OID */
+    const uint8_t *sig; size_t sig_len;            /* signature bytes */
+    const uint8_t *issuer; size_t issuer_len;      /* raw DER of issuer Name */
+    const uint8_t *subject; size_t subject_len;    /* raw DER of subject Name */
+    int key_type;                                   /* 1=EC, 2=RSA */
+    const uint8_t *pubkey; size_t pubkey_len;      /* EC: 04||x||y */
+    const uint8_t *rsa_n; size_t rsa_n_len;        /* RSA modulus */
+    const uint8_t *rsa_e; size_t rsa_e_len;        /* RSA exponent */
+    const uint8_t *san; size_t san_len;            /* SAN extension value */
+    time_t not_before, not_after;                  /* validity period */
+} x509_cert;
+
+static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
+    memset(cert,0,sizeof(*cert));
+    const uint8_t *p=der, *end=der+der_len;
+    uint8_t tag; size_t len;
+
+    /* Certificate SEQUENCE */
+    p=der_read_tl(p,end,&tag,&len);
+    if(!p||tag!=0x30) return -1;
+    const uint8_t *cert_end=p+len;
+
+    /* TBSCertificate — save raw bytes including tag+length */
+    const uint8_t *tbs_start=p;
+    const uint8_t *tbs_val=der_read_tl(p,cert_end,&tag,&len);
+    if(!tbs_val||tag!=0x30) return -1;
+    cert->tbs=tbs_start;
+    cert->tbs_len=(tbs_val+len)-tbs_start;
+    const uint8_t *tbs_end=tbs_val+len;
+    const uint8_t *tp=tbs_val;
+
+    /* [0] version */
+    if(tp<tbs_end&&*tp==0xA0){
+        tp=der_read_tl(tp,tbs_end,&tag,&len);
+        if(!tp) return -1;
+        tp+=len;
+    }
+    /* serialNumber */
+    tp=der_skip(tp,tbs_end); if(!tp) return -1;
+    /* signature AlgorithmIdentifier */
+    tp=der_skip(tp,tbs_end); if(!tp) return -1;
+
+    /* issuer Name */
+    const uint8_t *issuer_start=tp;
+    tp=der_skip(tp,tbs_end); if(!tp) return -1;
+    cert->issuer=issuer_start;
+    cert->issuer_len=tp-issuer_start;
+
+    /* validity */
+    {
+        const uint8_t *vld=der_read_tl(tp,tbs_end,&tag,&len);
+        if(!vld||tag!=0x30) return -1;
+        const uint8_t *vld_end=vld+len;
+        cert->not_before=der_parse_time(vld,vld_end);
+        const uint8_t *after_nb=der_skip(vld,vld_end);
+        cert->not_after=der_parse_time(after_nb,vld_end);
+        tp=vld_end;
+    }
+
+    /* subject Name */
+    const uint8_t *subj_start=tp;
+    tp=der_skip(tp,tbs_end); if(!tp) return -1;
+    cert->subject=subj_start;
+    cert->subject_len=tp-subj_start;
+
+    /* SubjectPublicKeyInfo */
+    const uint8_t *spki_val=der_read_tl(tp,tbs_end,&tag,&len);
+    if(!spki_val||tag!=0x30) return -1;
+    const uint8_t *spki_end=spki_val+len;
+    tp=spki_end;
+
+    /* AlgorithmIdentifier inside SPKI */
+    const uint8_t *alg_val=der_read_tl(spki_val,spki_end,&tag,&len);
+    if(!alg_val||tag!=0x30) return -1;
+    const uint8_t *alg_end=alg_val+len;
+
+    const uint8_t *pk_oid=der_read_tl(alg_val,alg_end,&tag,&len);
+    if(!pk_oid||tag!=0x06) return -1;
+    int is_ec=oid_eq(pk_oid,len,OID_EC_PUBKEY,sizeof(OID_EC_PUBKEY));
+    int is_rsa=oid_eq(pk_oid,len,OID_RSA_ENC,sizeof(OID_RSA_ENC));
+
+    /* BIT STRING with public key follows AlgorithmIdentifier */
+    const uint8_t *bs_val=der_read_tl(alg_end,spki_end,&tag,&len);
+    if(!bs_val||tag!=0x03||len<2) return -1;
+
+    if(is_ec){
+        cert->key_type=1;
+        cert->pubkey=bs_val+1; /* skip unused-bits byte */
+        cert->pubkey_len=len-1;
+    } else if(is_rsa){
+        cert->key_type=2;
+        const uint8_t *rsa_p=bs_val+1, *rsa_end2=bs_val+len;
+        const uint8_t *rsa_seq=der_read_tl(rsa_p,rsa_end2,&tag,&len);
+        if(!rsa_seq||tag!=0x30) return -1;
+        const uint8_t *rsa_seq_end=rsa_seq+len;
+        /* INTEGER n */
+        const uint8_t *nv=der_read_tl(rsa_seq,rsa_seq_end,&tag,&len);
+        if(!nv||tag!=0x02) return -1;
+        cert->rsa_n=nv; cert->rsa_n_len=len;
+        if(cert->rsa_n_len>0&&cert->rsa_n[0]==0){cert->rsa_n++;cert->rsa_n_len--;}
+        /* INTEGER e */
+        const uint8_t *ev=der_read_tl(nv+len,rsa_seq_end,&tag,&len);
+        if(!ev||tag!=0x02) return -1;
+        cert->rsa_e=ev; cert->rsa_e_len=len;
+        if(cert->rsa_e_len>0&&cert->rsa_e[0]==0){cert->rsa_e++;cert->rsa_e_len--;}
+    }
+
+    /* Extensions [3] */
+    if(tp<tbs_end&&*tp==0xA3){
+        const uint8_t *ext_outer=der_read_tl(tp,tbs_end,&tag,&len);
+        if(ext_outer){
+            const uint8_t *exts_val=der_read_tl(ext_outer,ext_outer+len,&tag,&len);
+            if(exts_val&&tag==0x30){
+                const uint8_t *ep=exts_val, *exts_end=exts_val+len;
+                while(ep<exts_end){
+                    const uint8_t *ext_seq=der_read_tl(ep,exts_end,&tag,&len);
+                    if(!ext_seq||tag!=0x30) break;
+                    const uint8_t *ext_end2=ext_seq+len;
+                    ep=ext_end2;
+                    const uint8_t *eoid=der_read_tl(ext_seq,ext_end2,&tag,&len);
+                    if(!eoid||tag!=0x06) continue;
+                    if(oid_eq(eoid,len,OID_SAN,sizeof(OID_SAN))){
+                        const uint8_t *rest=eoid+len;
+                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+                        if(oct&&tag==0x04){cert->san=oct;cert->san_len=len;}
+                    }
+                }
+            }
+        }
+    }
+
+    /* signatureAlgorithm (after TBS) */
+    p=cert->tbs+cert->tbs_len;
+    const uint8_t *sa_seq=der_read_tl(p,cert_end,&tag,&len);
+    if(!sa_seq||tag!=0x30) return -1;
+    const uint8_t *sa_end=sa_seq+len;
+    const uint8_t *sa_oid=der_read_tl(sa_seq,sa_end,&tag,&len);
+    if(!sa_oid||tag!=0x06) return -1;
+    cert->sig_alg=sa_oid; cert->sig_alg_len=len;
+
+    /* signatureValue BIT STRING */
+    p=sa_end;
+    const uint8_t *sv=der_read_tl(p,cert_end,&tag,&len);
+    if(!sv||tag!=0x03||len<2) return -1;
+    cert->sig=sv+1; cert->sig_len=len-1;
+    return 0;
+}
+
+/* ================================================================
+ * Hostname Verification (SAN + CN fallback)
+ * ================================================================ */
+static int verify_hostname(const x509_cert *cert, const char *hostname) {
+    size_t hn_len=strlen(hostname);
+    uint8_t tag; size_t len;
+
+    if(cert->san&&cert->san_len>0){
+        const uint8_t *p=cert->san, *end=cert->san+cert->san_len;
+        p=der_read_tl(p,end,&tag,&len);
+        if(p&&tag==0x30){
+            end=p+len;
+            while(p<end){
+                const uint8_t *val=der_read_tl(p,end,&tag,&len);
+                if(!val) break;
+                if(tag==0x82){ /* dNSName */
+                    if(len==hn_len&&memcmp(val,hostname,len)==0) return 1;
+                    if(len>2&&val[0]=='*'&&val[1]=='.'){
+                        const char *dot=strchr(hostname,'.');
+                        if(dot&&strlen(dot+1)==len-2&&memcmp(val+2,dot+1,len-2)==0)
+                            return 1;
+                    }
+                }
+                p=val+len;
+            }
+        }
+        return 0;
+    }
+    /* CN fallback */
+    static const uint8_t OID_CN[]={0x55,0x04,0x03};
+    const uint8_t *p=cert->subject, *end=cert->subject+cert->subject_len;
+    p=der_read_tl(p,end,&tag,&len);
+    if(!p||tag!=0x30) return 0;
+    end=p+len;
+    while(p<end){
+        const uint8_t *set_val=der_read_tl(p,end,&tag,&len);
+        if(!set_val||tag!=0x31) break;
+        p=set_val+len;
+        const uint8_t *seq_val=der_read_tl(set_val,set_val+len,&tag,&len);
+        if(!seq_val||tag!=0x30) continue;
+        const uint8_t *seq_end=seq_val+len;
+        const uint8_t *ov=der_read_tl(seq_val,seq_end,&tag,&len);
+        if(!ov||tag!=0x06) continue;
+        if(oid_eq(ov,len,OID_CN,sizeof(OID_CN))){
+            const uint8_t *cv=der_read_tl(ov+len,seq_end,&tag,&len);
+            if(cv&&len==hn_len&&memcmp(cv,hostname,len)==0) return 1;
+        }
+    }
+    return 0;
+}
+
+/* ================================================================
+ * Trust Store Loader
+ * ================================================================ */
+#define MAX_TRUST_CERTS 200
+
+typedef struct {
+    uint8_t subject[512]; size_t subject_len;
+    int key_type;
+    uint8_t pubkey[128]; size_t pubkey_len;   /* EC point */
+    uint8_t rsa_n[520]; size_t rsa_n_len;     /* RSA modulus */
+    uint8_t rsa_e[16]; size_t rsa_e_len;      /* RSA exponent */
+} trust_cert;
+
+static trust_cert trust_store[MAX_TRUST_CERTS];
+static int trust_store_count=0;
+
+static void load_trust_store(const char *dir) {
+    DIR *d=opendir(dir);
+    if(!d){fprintf(stderr,"Warning: cannot open %s\n",dir);return;}
+    struct dirent *ent;
+    uint8_t der_buf[4096];
+    char pem_buf[8192];
+    while((ent=readdir(d))!=NULL&&trust_store_count<MAX_TRUST_CERTS){
+        size_t nl=strlen(ent->d_name);
+        if(nl<4||strcmp(ent->d_name+nl-4,".crt")!=0) continue;
+        char path[512];
+        snprintf(path,sizeof(path),"%s/%s",dir,ent->d_name);
+        FILE *f=fopen(path,"r");
+        if(!f) continue;
+        size_t pem_len=fread(pem_buf,1,sizeof(pem_buf)-1,f);
+        fclose(f);
+        pem_buf[pem_len]=0;
+        size_t der_len=pem_to_der(pem_buf,pem_len,der_buf);
+        if(der_len==0||der_len>sizeof(der_buf)) continue;
+        x509_cert cert;
+        if(x509_parse(&cert,der_buf,der_len)!=0) continue;
+        trust_cert *tc=&trust_store[trust_store_count];
+        memset(tc,0,sizeof(*tc));
+        if(cert.subject_len>sizeof(tc->subject)) continue;
+        memcpy(tc->subject,cert.subject,cert.subject_len);
+        tc->subject_len=cert.subject_len;
+        tc->key_type=cert.key_type;
+        if(cert.key_type==1&&cert.pubkey_len<=sizeof(tc->pubkey)){
+            memcpy(tc->pubkey,cert.pubkey,cert.pubkey_len);
+            tc->pubkey_len=cert.pubkey_len;
+        } else if(cert.key_type==2){
+            if(cert.rsa_n_len<=sizeof(tc->rsa_n)){
+                memcpy(tc->rsa_n,cert.rsa_n,cert.rsa_n_len);
+                tc->rsa_n_len=cert.rsa_n_len;
+            }
+            if(cert.rsa_e_len<=sizeof(tc->rsa_e)){
+                memcpy(tc->rsa_e,cert.rsa_e,cert.rsa_e_len);
+                tc->rsa_e_len=cert.rsa_e_len;
+            }
+        }
+        trust_store_count++;
+    }
+    closedir(d);
+    printf("Loaded %d trust store certificates\n",trust_store_count);
+}
+
+/* Unified signature verification dispatch */
+static int verify_signature(const uint8_t *tbs, size_t tbs_len,
+                             const uint8_t *sig_alg, size_t sig_alg_len,
+                             const uint8_t *sig, size_t sig_len,
+                             int key_type,
+                             const uint8_t *pubkey, size_t pubkey_len,
+                             const uint8_t *rsa_n, size_t rsa_n_len,
+                             const uint8_t *rsa_e, size_t rsa_e_len) {
+    if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA384,sizeof(OID_ECDSA_SHA384))){
+        if(key_type!=1) return 0;
+        uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
+        return ecdsa_p384_verify(h,48,sig,sig_len,pubkey,pubkey_len);
+    }
+    if(oid_eq(sig_alg,sig_alg_len,OID_SHA256_RSA,sizeof(OID_SHA256_RSA))){
+        if(key_type!=2) return 0;
+        uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
+        return rsa_pkcs1_verify_sha256(h,sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+    }
+    return 0;
+}
+
+/* ================================================================
+ * Certificate Chain Validation
+ * ================================================================ */
+static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
+                              const char *hostname) {
+    (void)cert_msg_len;
+    const uint8_t *p=cert_msg;
+    uint8_t ctx_len=*p++; p+=ctx_len;
+    uint32_t list_len=GET24(p); p+=3;
+    const uint8_t *end=p+list_len;
+
+    #define MAX_CHAIN 4
+    const uint8_t *chain_der[MAX_CHAIN];
+    size_t chain_len[MAX_CHAIN];
+    int chain_count=0;
+
+    while(p<end&&chain_count<MAX_CHAIN){
+        uint32_t cl=GET24(p); p+=3;
+        chain_der[chain_count]=p;
+        chain_len[chain_count]=cl;
+        chain_count++;
+        p+=cl;
+        if(p+2>end) break;
+        uint16_t el=GET16(p); p+=2+el;
+    }
+    if(chain_count==0){fprintf(stderr,"No certificates in chain\n");return -1;}
+
+    x509_cert certs[MAX_CHAIN];
+    for(int i=0;i<chain_count;i++){
+        if(x509_parse(&certs[i],chain_der[i],chain_len[i])!=0){
+            fprintf(stderr,"Failed to parse certificate %d\n",i);
+            return -1;
+        }
+    }
+
+    /* Verify leaf hostname */
+    if(!verify_hostname(&certs[0],hostname)){
+        fprintf(stderr,"Hostname verification failed for %s\n",hostname);
+        return -1;
+    }
+    printf("    Hostname verified: %s\n",hostname);
+
+    /* Check validity period for all chain certs */
+    time_t now=time(NULL);
+    for(int i=0;i<chain_count;i++){
+        if(now<certs[i].not_before){
+            fprintf(stderr,"Certificate %d is not yet valid\n",i);
+            return -1;
+        }
+        if(now>certs[i].not_after){
+            fprintf(stderr,"Certificate %d has expired\n",i);
+            return -1;
+        }
+    }
+    printf("    Validity periods OK\n");
+
+    /* Verify intermediate chain signatures */
+    for(int i=0;i<chain_count-1;i++){
+        if(certs[i].issuer_len!=certs[i+1].subject_len||
+           memcmp(certs[i].issuer,certs[i+1].subject,certs[i].issuer_len)!=0){
+            fprintf(stderr,"Chain broken at cert %d\n",i);
+            return -1;
+        }
+        printf("    Verifying cert %d signature...\n",i);
+        if(!verify_signature(certs[i].tbs,certs[i].tbs_len,
+                              certs[i].sig_alg,certs[i].sig_alg_len,
+                              certs[i].sig,certs[i].sig_len,
+                              certs[i+1].key_type,
+                              certs[i+1].pubkey,certs[i+1].pubkey_len,
+                              certs[i+1].rsa_n,certs[i+1].rsa_n_len,
+                              certs[i+1].rsa_e,certs[i+1].rsa_e_len)){
+            fprintf(stderr,"Signature verification failed for cert %d\n",i);
+            return -1;
+        }
+        printf("    Certificate %d signature verified\n",i);
+    }
+
+    /* Find root in trust store */
+    int last=chain_count-1;
+    for(int i=0;i<trust_store_count;i++){
+        if(certs[last].issuer_len!=trust_store[i].subject_len) continue;
+        if(memcmp(certs[last].issuer,trust_store[i].subject,certs[last].issuer_len)!=0) continue;
+        printf("    Verifying cert %d (root) signature...\n",last);
+        if(verify_signature(certs[last].tbs,certs[last].tbs_len,
+                             certs[last].sig_alg,certs[last].sig_alg_len,
+                             certs[last].sig,certs[last].sig_len,
+                             trust_store[i].key_type,
+                             trust_store[i].pubkey,trust_store[i].pubkey_len,
+                             trust_store[i].rsa_n,trust_store[i].rsa_n_len,
+                             trust_store[i].rsa_e,trust_store[i].rsa_e_len)){
+            printf("    Certificate %d root signature verified\n",last);
+            printf("    Certificate chain verified successfully!\n");
+            return 0;
+        }
+    }
+    fprintf(stderr,"No matching root CA found in trust store\n");
+    return -1;
+}
+
+/* ================================================================
  * TLS 1.3 (RFC 8446)
  * ================================================================ */
 
@@ -794,6 +1598,8 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
 
 /* Main TLS 1.3 handshake + HTTP GET */
 static void do_https_get(const char *host, int port, const char *path) {
+    load_trust_store("trust_store");
+
     int fd=tcp_connect(host,port);
     printf("Connected to %s:%d\n",host,port);
 
@@ -867,6 +1673,7 @@ static void do_https_get(const char *host, int port, const char *path) {
 
     /* Process encrypted records until we get Finished */
     int got_finished=0;
+    uint8_t *saved_cert_msg=NULL; size_t saved_cert_msg_len=0;
     while(!got_finished) {
         if(rtype!=0x17) die("expected encrypted record");
         uint8_t pt[32768]; size_t pt_len;
@@ -893,11 +1700,18 @@ static void do_https_get(const char *host, int port, const char *path) {
                 case 11: /* Certificate */
                     printf("  Certificate (%u bytes)\n",(unsigned)mlen);
                     sha256_update(&transcript,hs_buf+pos,msg_total);
+                    saved_cert_msg=malloc(mlen);
+                    memcpy(saved_cert_msg,hs_buf+pos+4,mlen);
+                    saved_cert_msg_len=mlen;
                     break;
                 case 15: /* CertificateVerify */
                     printf("  CertificateVerify (%u bytes)\n",(unsigned)mlen);
                     sha256_update(&transcript,hs_buf+pos,msg_total);
-                    /* NOTE: Not verifying the certificate signature */
+                    if(saved_cert_msg){
+                        printf("  Validating certificate chain...\n");
+                        if(verify_cert_chain(saved_cert_msg,saved_cert_msg_len,host)<0)
+                            die("Certificate verification failed");
+                    }
                     break;
                 case 20: { /* Finished */
                     printf("  Server Finished\n");
@@ -1004,6 +1818,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         }
     }
     printf("\n=== Done ===\n");
+    free(saved_cert_msg);
     secure_zero(priv,sizeof(priv));
     secure_zero(shared,sizeof(shared));
     secure_zero(hs_secret,sizeof(hs_secret));
