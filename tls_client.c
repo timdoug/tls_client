@@ -2488,15 +2488,68 @@ static void do_https_get(const char *host, int port, const char *path) {
                     memcpy(saved_cert_msg,hs_buf+pos+4,mlen);
                     saved_cert_msg_len=mlen;
                     break;
-                case 15: /* CertificateVerify */
+                case 15: { /* CertificateVerify */
                     printf("  CertificateVerify (%u bytes)\n",(unsigned)mlen);
-                    sha256_update(&transcript,hs_buf+pos,msg_total);
+
+                    /* Validate cert chain first */
                     if(saved_cert_msg){
                         printf("  Validating certificate chain...\n");
                         if(verify_cert_chain(saved_cert_msg,saved_cert_msg_len,host,1)<0)
                             die("Certificate verification failed");
                     }
+
+                    /* Verify CertificateVerify signature (RFC 8446 §4.4.3) */
+                    if(mlen<4) die("CertificateVerify too short");
+                    const uint8_t *cv=hs_buf+pos+4;
+                    uint16_t cv_algo=GET16(cv);
+                    uint16_t cv_sig_len=GET16(cv+2);
+                    if(4+cv_sig_len>mlen) die("CertificateVerify sig length mismatch");
+                    const uint8_t *cv_sig=cv+4;
+
+                    /* Transcript hash up to (but not including) CertificateVerify */
+                    uint8_t th_cv[32];
+                    { sha256_ctx tc=transcript; sha256_final(&tc,th_cv); }
+
+                    /* Content to verify: 64 spaces || context string || 0x00 || transcript hash */
+                    uint8_t cv_content[130]; /* 64 + 33 + 1 + 32 = 130 */
+                    memset(cv_content,0x20,64);
+                    memcpy(cv_content+64,"TLS 1.3, server CertificateVerify",33);
+                    cv_content[97]=0x00;
+                    memcpy(cv_content+98,th_cv,32);
+
+                    /* Parse leaf cert public key */
+                    if(!saved_cert_msg) die("No certificate for CertificateVerify");
+                    const uint8_t *cp2=saved_cert_msg;
+                    uint8_t ctx_len2=*cp2++; cp2+=ctx_len2;
+                    cp2+=3; /* skip list length */
+                    uint32_t leaf_len=GET24(cp2); cp2+=3;
+                    x509_cert leaf;
+                    if(x509_parse(&leaf,cp2,leaf_len)!=0) die("Failed to parse leaf cert for CV");
+
+                    int cv_ok=0;
+                    if(cv_algo==0x0403){ /* ecdsa_secp256r1_sha256 */
+                        uint8_t h[32]; sha256_hash(cv_content,130,h);
+                        if(leaf.key_type==1 && leaf.pubkey_len==65)
+                            cv_ok=ecdsa_p256_verify(h,32,cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
+                    } else if(cv_algo==0x0503){ /* ecdsa_secp384r1_sha384 */
+                        uint8_t h[48]; sha384_hash(cv_content,130,h);
+                        if(leaf.key_type==1 && leaf.pubkey_len==97)
+                            cv_ok=ecdsa_p384_verify(h,48,cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
+                    } else if(cv_algo==0x0804){ /* rsa_pss_rsae_sha256 */
+                        uint8_t h[32]; sha256_hash(cv_content,130,h);
+                        if(leaf.key_type==2)
+                            cv_ok=rsa_pss_verify_sha256(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                    } else if(cv_algo==0x0401){ /* rsa_pkcs1_sha256 */
+                        uint8_t h[32]; sha256_hash(cv_content,130,h);
+                        if(leaf.key_type==2)
+                            cv_ok=rsa_pkcs1_verify_sha256(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                    }
+                    if(!cv_ok) die("CertificateVerify signature verification failed");
+                    printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",cv_algo);
+
+                    sha256_update(&transcript,hs_buf+pos,msg_total);
                     break;
+                }
                 case 20: { /* Finished */
                     printf("  Server Finished\n");
                     /* Verify server finished */
