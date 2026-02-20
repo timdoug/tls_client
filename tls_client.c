@@ -1113,6 +1113,7 @@ static void ecdhe_p256_shared_secret(const uint8_t priv[32], const uint8_t peer_
 static const uint8_t OID_ECDSA_SHA384[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
 static const uint8_t OID_ECDSA_SHA256[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
 static const uint8_t OID_SHA256_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
+static const uint8_t OID_SHA384_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0C};
 static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
 static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
 static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
@@ -1323,6 +1324,39 @@ static int rsa_pkcs1_verify_sha256(const uint8_t hash[32],
     if(memcmp(m+i,di,sizeof(di))!=0) return 0;
     i+=sizeof(di);
     if(memcmp(m+i,hash,32)!=0) return 0;
+    return 1;
+}
+
+static int rsa_pkcs1_verify_sha384(const uint8_t hash[48],
+                                    const uint8_t *sig, size_t sig_len,
+                                    const uint8_t *modulus, size_t mod_len,
+                                    const uint8_t *exponent, size_t exp_len) {
+    bignum s_bn, n_bn, e_bn, m_bn;
+    bn_from_bytes(&s_bn,sig,sig_len);
+    bn_from_bytes(&n_bn,modulus,mod_len);
+    bn_from_bytes(&e_bn,exponent,exp_len);
+    bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
+
+    uint8_t m[512];
+    if(mod_len>sizeof(m)) return 0;
+    bn_to_bytes(&m_bn,m,mod_len);
+
+    /* Verify PKCS#1 v1.5: 00 01 [FF..FF] 00 [DigestInfo] */
+    if(m[0]!=0x00||m[1]!=0x01) return 0;
+    size_t i=2;
+    while(i<mod_len&&m[i]==0xFF) i++;
+    if(i<10||i>=mod_len||m[i]!=0x00) return 0;
+    i++;
+
+    /* DigestInfo for SHA-384 */
+    static const uint8_t di[]={
+        0x30,0x41,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
+        0x65,0x03,0x04,0x02,0x02,0x05,0x00,0x04,0x30
+    };
+    if(i+sizeof(di)+48!=mod_len) return 0;
+    if(memcmp(m+i,di,sizeof(di))!=0) return 0;
+    i+=sizeof(di);
+    if(memcmp(m+i,hash,48)!=0) return 0;
     return 1;
 }
 
@@ -1678,6 +1712,11 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
         if(key_type!=2) return 0;
         uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
         return rsa_pkcs1_verify_sha256(h,sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+    }
+    if(oid_eq(sig_alg,sig_alg_len,OID_SHA384_RSA,sizeof(OID_SHA384_RSA))){
+        if(key_type!=2) return 0;
+        uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
+        return rsa_pkcs1_verify_sha384(h,sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
     }
     return 0;
 }
