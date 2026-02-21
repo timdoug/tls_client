@@ -1826,8 +1826,8 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     printf("    Validity periods OK\n");
 
     /* Walk chain from leaf upward: at each cert, try trust store first,
-     * then verify against next cert in chain. Handles cross-signed chains
-     * where extra certs after a trust anchor break the linear chain. */
+     * then find issuer among remaining chain certs. Handles out-of-order
+     * chains and cross-signed certs. */
     for(int i=0;i<chain_count;i++){
         /* Try trust store for this cert */
         for(int j=0;j<trust_store_count;j++){
@@ -1846,26 +1846,35 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                 return 0;
             }
         }
-        /* Verify this cert is signed by next cert in chain */
-        if(i<chain_count-1){
-            if(certs[i].issuer_len!=certs[i+1].subject_len||
-               memcmp(certs[i].issuer,certs[i+1].subject,certs[i].issuer_len)!=0){
-                fprintf(stderr,"Chain broken at cert %d and no trust store match\n",i);
-                return -1;
+        /* Find issuer among remaining chain certs (handles out-of-order chains) */
+        int found=-1;
+        for(int j=i+1;j<chain_count;j++){
+            if(certs[i].issuer_len==certs[j].subject_len&&
+               memcmp(certs[i].issuer,certs[j].subject,certs[i].issuer_len)==0){
+                found=j;
+                break;
             }
-            printf("    Verifying cert %d signature...\n",i);
-            if(!verify_signature(certs[i].tbs,certs[i].tbs_len,
-                                  certs[i].sig_alg,certs[i].sig_alg_len,
-                                  certs[i].sig,certs[i].sig_len,
-                                  certs[i+1].key_type,
-                                  certs[i+1].pubkey,certs[i+1].pubkey_len,
-                                  certs[i+1].rsa_n,certs[i+1].rsa_n_len,
-                                  certs[i+1].rsa_e,certs[i+1].rsa_e_len)){
-                fprintf(stderr,"Signature verification failed for cert %d\n",i);
-                return -1;
-            }
-            printf("    Certificate %d signature verified\n",i);
         }
+        if(found<0){
+            fprintf(stderr,"No issuer found for cert %d\n",i);
+            return -1;
+        }
+        /* Swap found cert to position i+1 if needed */
+        if(found!=i+1){
+            x509_cert tmp=certs[i+1]; certs[i+1]=certs[found]; certs[found]=tmp;
+        }
+        printf("    Verifying cert %d signature...\n",i);
+        if(!verify_signature(certs[i].tbs,certs[i].tbs_len,
+                              certs[i].sig_alg,certs[i].sig_alg_len,
+                              certs[i].sig,certs[i].sig_len,
+                              certs[i+1].key_type,
+                              certs[i+1].pubkey,certs[i+1].pubkey_len,
+                              certs[i+1].rsa_n,certs[i+1].rsa_n_len,
+                              certs[i+1].rsa_e,certs[i+1].rsa_e_len)){
+            fprintf(stderr,"Signature verification failed for cert %d\n",i);
+            return -1;
+        }
+        printf("    Certificate %d signature verified\n",i);
     }
     fprintf(stderr,"No matching root CA found in trust store\n");
     return -1;
@@ -2232,7 +2241,9 @@ static void do_https_get(const char *host, int port, const char *path) {
     uint8_t server_random[32];
     uint16_t cipher_suite;
     uint16_t version=parse_server_hello(rec,rec_len,server_pub,&server_pub_len,server_random,&cipher_suite);
-    sha256_update(&transcript,rec,rec_len);
+    uint32_t sh_msg_len=4+GET24(rec+1);
+    sha256_update(&transcript,rec,sh_msg_len);
+    size_t sh_leftover=rec_len>sh_msg_len ? rec_len-sh_msg_len : 0;
 
     /* ================================================================
      * TLS 1.2 Handshake Path
@@ -2244,7 +2255,14 @@ static void do_https_get(const char *host, int port, const char *path) {
         uint8_t hs12_buf[65536]; size_t hs12_len=0;
         int got_server_done=0;
         uint8_t *cert12_msg=NULL; size_t cert12_msg_len=0;
-        uint8_t ske_pubkey[65];
+        uint8_t ske_pubkey[97];
+        uint16_t ske_curve=0;
+
+        /* Carry leftover handshake data from ServerHello record */
+        if(sh_leftover>0 && sh_leftover<=sizeof(hs12_buf)) {
+            memcpy(hs12_buf, rec+sh_msg_len, sh_leftover);
+            hs12_len=sh_leftover;
+        }
 
         while(!got_server_done) {
             rtype=tls_read_record(fd,rec,&rec_len);
@@ -2273,14 +2291,18 @@ static void do_https_get(const char *host, int port, const char *path) {
                         break;
                     case 12: { /* ServerKeyExchange */
                         printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
-                        if(mlen<4+65+4) die("ServerKeyExchange too short");
+                        if(mlen<8) die("ServerKeyExchange too short");
                         const uint8_t *ske=hs12_buf+pos+4;
                         if(ske[0]!=0x03) die("expected named_curve type in SKE");
-                        uint16_t curve=GET16(ske+1);
-                        if(curve!=0x0017) die("expected secp256r1 in SKE");
+                        ske_curve=GET16(ske+1);
                         uint8_t pk_len=ske[3];
-                        if(pk_len!=65) die("expected uncompressed P-256 point");
-                        memcpy(ske_pubkey, ske+4, 65);
+                        if(ske_curve==0x0017) {
+                            if(pk_len!=65) die("expected uncompressed P-256 point");
+                        } else if(ske_curve==0x0018) {
+                            if(pk_len!=97) die("expected uncompressed P-384 point");
+                        } else die("unsupported curve in SKE");
+                        if(4+pk_len>mlen) die("SKE pubkey truncated");
+                        memcpy(ske_pubkey, ske+4, pk_len);
 
                         size_t params_len=4+pk_len;
                         if(params_len+4>mlen) die("SKE signature header truncated");
@@ -2360,23 +2382,28 @@ static void do_https_get(const char *host, int port, const char *path) {
         }
 
         /* Send ClientKeyExchange */
-        {
+        uint8_t ss12[48]; size_t ss12_len;
+        if(ske_curve==0x0017) {
             uint8_t cke[70];
-            cke[0]=0x10; /* ClientKeyExchange */
-            cke[1]=0; cke[2]=0; cke[3]=66;
-            cke[4]=65;
+            cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=66; cke[4]=65;
             memcpy(cke+5, p256_pub, 65);
             tls_send_record(fd,0x16,cke,70);
             sha256_update(&transcript, cke, 70);
-            printf("Sent ClientKeyExchange\n");
+            ecdhe_p256_shared_secret(p256_priv, ske_pubkey, ss12);
+            ss12_len=32;
+            printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (P-256)\n");
+        } else {
+            uint8_t cke[102];
+            cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=98; cke[4]=97;
+            memcpy(cke+5, p384_pub, 97);
+            tls_send_record(fd,0x16,cke,102);
+            sha256_update(&transcript, cke, 102);
+            ecdhe_shared_secret(p384_priv, ske_pubkey, ss12);
+            ss12_len=48;
+            printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (P-384)\n");
         }
-
-        /* Compute ECDHE shared secret (P-256) */
-        uint8_t ss12[32];
-        ecdhe_p256_shared_secret(p256_priv, ske_pubkey, ss12);
         secure_zero(p256_priv,sizeof(p256_priv));
         secure_zero(p384_priv,sizeof(p384_priv));
-        printf("Computed ECDHE shared secret (P-256)\n");
 
         /* TLS 1.2 key derivation */
         uint8_t pms_seed[64];
@@ -2384,7 +2411,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         memcpy(pms_seed+32, server_random, 32);
 
         uint8_t tls12_master[48];
-        tls12_prf(ss12, 32, "master secret", pms_seed, 64, tls12_master, 48);
+        tls12_prf(ss12, ss12_len, "master secret", pms_seed, 64, tls12_master, 48);
 
         uint8_t ke_seed[64];
         memcpy(ke_seed, server_random, 32);
@@ -2494,6 +2521,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* ================================================================
      * TLS 1.3 Handshake Path
      * ================================================================ */
+    (void)sh_leftover; /* only used in TLS 1.2 path */
     uint16_t selected_group = (server_pub_len==65) ? 0x0017 : 0x0018;
     printf("Received ServerHello (TLS 1.3, group=0x%04x)\n",selected_group);
 
