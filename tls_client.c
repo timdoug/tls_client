@@ -1456,6 +1456,66 @@ static int rsa_pss_verify_sha256(const uint8_t hash[32],
     return ct_memeq(hp,h,32);
 }
 
+static int rsa_pss_verify_sha384(const uint8_t hash[48],
+                                  const uint8_t *sig, size_t sig_len,
+                                  const uint8_t *modulus, size_t mod_len,
+                                  const uint8_t *exponent, size_t exp_len) {
+    bignum s_bn, n_bn, e_bn, m_bn;
+    bn_from_bytes(&s_bn,sig,sig_len);
+    bn_from_bytes(&n_bn,modulus,mod_len);
+    bn_from_bytes(&e_bn,exponent,exp_len);
+    bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
+
+    uint8_t em[512];
+    if(mod_len>sizeof(em)) return 0;
+    bn_to_bytes(&m_bn,em,mod_len);
+
+    size_t em_len=mod_len;
+    if(em[em_len-1]!=0xBC) return 0;
+
+    size_t h_len=48; /* SHA-384 */
+    size_t salt_len=48;
+    size_t db_len=em_len-h_len-1;
+    const uint8_t *masked_db=em;
+    const uint8_t *h=em+db_len;
+
+    /* MGF1-SHA384 */
+    uint8_t db_mask[512];
+    size_t done=0;
+    uint32_t counter=0;
+    while(done<db_len){
+        uint8_t cb[52];
+        memcpy(cb,h,48);
+        cb[48]=(counter>>24)&0xFF;
+        cb[49]=(counter>>16)&0xFF;
+        cb[50]=(counter>>8)&0xFF;
+        cb[51]=counter&0xFF;
+        uint8_t md[48]; sha384_hash(cb,52,md);
+        size_t use=db_len-done; if(use>48) use=48;
+        memcpy(db_mask+done,md,use);
+        done+=use; counter++;
+    }
+
+    uint8_t db[512];
+    for(size_t i=0;i<db_len;i++) db[i]=masked_db[i]^db_mask[i];
+    db[0]&=0x7F;
+
+    size_t pad_len=db_len-salt_len-1;
+    uint8_t ok=0;
+    for(size_t i=0;i<pad_len;i++) ok|=db[i];
+    ok|=db[pad_len]^0x01;
+    if(ok) return 0;
+    const uint8_t *salt=db+pad_len+1;
+
+    uint8_t mp[8+48+48];
+    memset(mp,0,8);
+    memcpy(mp+8,hash,48);
+    memcpy(mp+56,salt,salt_len);
+
+    uint8_t hp[48]; sha384_hash(mp,104,hp);
+    return ct_memeq(hp,h,48);
+}
+
 /* ================================================================
  * X.509 Certificate Parser
  * ================================================================ */
@@ -1974,11 +2034,13 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
 
     /* signature_algorithms */
     buf[p++]=0x00;buf[p++]=0x0d;
-    buf[p++]=0x00;buf[p++]=0x0a; /* ext len */
-    buf[p++]=0x00;buf[p++]=0x08; /* list len */
+    buf[p++]=0x00;buf[p++]=0x0e; /* ext len */
+    buf[p++]=0x00;buf[p++]=0x0c; /* list len */
     buf[p++]=0x05;buf[p++]=0x03; /* ecdsa_secp384r1_sha384 */
     buf[p++]=0x04;buf[p++]=0x03; /* ecdsa_secp256r1_sha256 */
+    buf[p++]=0x08;buf[p++]=0x05; /* rsa_pss_rsae_sha384 */
     buf[p++]=0x08;buf[p++]=0x04; /* rsa_pss_rsae_sha256 */
+    buf[p++]=0x05;buf[p++]=0x01; /* rsa_pkcs1_sha384 */
     buf[p++]=0x04;buf[p++]=0x01; /* rsa_pkcs1_sha256 */
 
     /* key_share (both P-256 and P-384) */
@@ -2351,6 +2413,14 @@ static void do_https_get(const char *host, int port, const char *path) {
                             uint8_t h[32]; sha256_hash(signed_data,signed_len,h);
                             if(leaf.key_type==2)
                                 sig_ok=rsa_pss_verify_sha256(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                        } else if(sig_algo==0x0805) { /* rsa_pss_rsae_sha384 */
+                            uint8_t h[48]; sha384_hash(signed_data,signed_len,h);
+                            if(leaf.key_type==2)
+                                sig_ok=rsa_pss_verify_sha384(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                        } else if(sig_algo==0x0501) { /* rsa_pkcs1_sha384 */
+                            uint8_t h[48]; sha384_hash(signed_data,signed_len,h);
+                            if(leaf.key_type==2)
+                                sig_ok=rsa_pkcs1_verify_sha384(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                         }
                         if(!sig_ok) die("ServerKeyExchange signature verification failed");
                         printf("    SKE signature verified (algo=0x%04x)\n",sig_algo);
@@ -2659,6 +2729,10 @@ static void do_https_get(const char *host, int port, const char *path) {
                         uint8_t h[32]; sha256_hash(cv_content,130,h);
                         if(leaf.key_type==2)
                             cv_ok=rsa_pss_verify_sha256(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                    } else if(cv_algo==0x0805){ /* rsa_pss_rsae_sha384 */
+                        uint8_t h[48]; sha384_hash(cv_content,130,h);
+                        if(leaf.key_type==2)
+                            cv_ok=rsa_pss_verify_sha384(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     } else if(cv_algo==0x0401){ /* rsa_pkcs1_sha256 */
                         uint8_t h[32]; sha256_hash(cv_content,130,h);
                         if(leaf.key_type==2)
