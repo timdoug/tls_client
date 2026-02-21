@@ -596,9 +596,9 @@ static int ec384_is_inf(const ec384 *p){return fp384_cmp(&p->z,&FP384_ZERO)==0;}
 
 static void ec384_set_inf(ec384 *p){p->x=FP384_ONE;p->y=FP384_ONE;p->z=FP384_ZERO;}
 
-/* Point doubling in Jacobian coords with a=-3 */
+/* Point doubling in Jacobian coords with a=-3.
+ * No infinity branch: when z=0, z3=2*y*z=0 naturally. */
 static void ec384_double(ec384 *r, const ec384 *p) {
-    if(ec384_is_inf(p)){ec384_set_inf(r);return;}
     fp384 z2,z4,m,s,x3,y3,z3,t1,t2,y2;
     fp384_sqr(&z2,&p->z);
     fp384_sqr(&z4,&z2);
@@ -627,20 +627,16 @@ static void ec384_double(ec384 *r, const ec384 *p) {
     r->x=x3; r->y=y3; r->z=z3;
 }
 
-/* Point addition (Jacobian) */
+/* Point addition (Jacobian). No branches — designed for Montgomery ladder
+ * where R0/R1 are never both infinity or equal after first iteration.
+ * When h=0 or z=0, the formula naturally produces z3=0. */
 static void ec384_add(ec384 *r, const ec384 *p, const ec384 *q) {
-    if(ec384_is_inf(p)){*r=*q;return;}
-    if(ec384_is_inf(q)){*r=*p;return;}
     fp384 z1s,z2s,u1,u2,z1c,z2c,s1,s2,h,rr,h2,h3,u1h2;
     fp384_sqr(&z1s,&p->z); fp384_sqr(&z2s,&q->z);
     fp384_mul(&u1,&p->x,&z2s); fp384_mul(&u2,&q->x,&z1s);
     fp384_mul(&z1c,&z1s,&p->z); fp384_mul(&z2c,&z2s,&q->z);
     fp384_mul(&s1,&p->y,&z2c); fp384_mul(&s2,&q->y,&z1c);
     fp384_sub(&h,&u2,&u1); fp384_sub(&rr,&s2,&s1);
-    if(fp384_cmp(&h,&FP384_ZERO)==0){
-        if(fp384_cmp(&rr,&FP384_ZERO)==0){ec384_double(r,p);return;}
-        ec384_set_inf(r);return;
-    }
     fp384_sqr(&h2,&h); fp384_mul(&h3,&h2,&h); fp384_mul(&u1h2,&u1,&h2);
     fp384 x3,y3,z3,t;
     fp384_sqr(&x3,&rr); fp384_sub(&x3,&x3,&h3);
@@ -672,13 +668,14 @@ static void ec384_cswap(ec384 *a, ec384 *b, uint64_t bit) {
 }
 
 /* Montgomery ladder scalar multiplication (constant-time).
- * Caller must ensure top bit of scalar is set so that R0/R1
- * are never the point at infinity after the first iteration. */
+ * Caller must ensure top bit of scalar is set.
+ * Initializes R0=P, R1=2P and iterates from bit 382 down,
+ * so add/double never see infinity inputs. */
 static void ec384_scalar_mul(ec384 *r, const ec384 *p, const uint8_t scalar[48]) {
     ec384 R0, R1;
-    ec384_set_inf(&R0);
-    R1 = *p;
-    for(int i=383;i>=0;i--){
+    R0 = *p;
+    ec384_double(&R1, p);
+    for(int i=382;i>=0;i--){
         int byte_idx=47-(i/8);
         int bit_pos=i%8;
         uint64_t bit=(scalar[byte_idx]>>bit_pos)&1;
@@ -1083,217 +1080,287 @@ static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bi
     *r=result;
 }
 
-static void bn_add(bignum *r, const bignum *a, const bignum *b) {
-    int ml=a->len>b->len?a->len:b->len;
+/* ================================================================
+ * P-256 Field Arithmetic (mod p, p = 2^256 - 2^224 + 2^192 + 2^96 - 1)
+ * Constant-time fixed-width 4x64-bit limbs, modeled on fp384.
+ * ================================================================ */
+typedef struct { uint64_t v[4]; } fp256;
+
+static const fp256 P256_P = {{
+    0xFFFFFFFFFFFFFFFF, 0x00000000FFFFFFFF,
+    0x0000000000000000, 0xFFFFFFFF00000001
+}};
+static const fp256 FP256_ZERO = {{0,0,0,0}};
+static const fp256 FP256_ONE  = {{1,0,0,0}};
+static const fp256 P256_B = {{
+    0x3BCE3C3E27D2604B, 0x651D06B0CC53B0F6,
+    0xB3EBBD55769886BC, 0x5AC635D8AA3A93E7
+}};
+static const fp256 P256_GX = {{
+    0xF4A13945D898C296, 0x77037D812DEB33A0,
+    0xF8BCE6E563A440F2, 0x6B17D1F2E12C4247
+}};
+static const fp256 P256_GY = {{
+    0xCBB6406837BF51F5, 0x2BCE33576B315ECE,
+    0x8EE7EB4A7C0F9E16, 0x4FE342E2FE1A7F9B
+}};
+
+static int fp256_cmp(const fp256 *a, const fp256 *b) {
+    for(int i=3;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
+}
+
+static int fp256_is_zero(const fp256 *a) {
+    return (a->v[0]|a->v[1]|a->v[2]|a->v[3])==0;
+}
+
+static uint64_t fp256_add_raw(fp256 *r, const fp256 *a, const fp256 *b) {
     uint128_t c=0;
-    for(int i=0;i<ml;i++){
-        c+=(uint128_t)(i<a->len?a->v[i]:0)+(i<b->len?b->v[i]:0);
-        r->v[i]=(uint64_t)c; c>>=64;
+    for(int i=0;i<4;i++){c+=(uint128_t)a->v[i]+b->v[i];r->v[i]=(uint64_t)c;c>>=64;}
+    return (uint64_t)c;
+}
+
+static uint64_t fp256_sub_raw(fp256 *r, const fp256 *a, const fp256 *b) {
+    __int128 borrow=0;
+    for(int i=0;i<4;i++){borrow=(__int128)a->v[i]-b->v[i]+borrow;r->v[i]=(uint64_t)borrow;borrow>>=64;}
+    return (borrow<0)?1:0;
+}
+
+static void fp256_add(fp256 *r, const fp256 *a, const fp256 *b) {
+    uint64_t carry=fp256_add_raw(r,a,b);
+    fp256 t; uint64_t borrow=fp256_sub_raw(&t,r,&P256_P);
+    uint64_t mask=-(uint64_t)(carry|(1-borrow));
+    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+}
+
+static void fp256_sub(fp256 *r, const fp256 *a, const fp256 *b) {
+    uint64_t borrow=fp256_sub_raw(r,a,b);
+    fp256 t; fp256_add_raw(&t,r,&P256_P);
+    uint64_t mask=-(uint64_t)borrow;
+    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+}
+
+static void fp256_mul(fp256 *r, const fp256 *a, const fp256 *b) {
+    /* Schoolbook 4x4 -> 8 limbs */
+    uint64_t w[8]; memset(w,0,sizeof(w));
+    for(int i=0;i<4;i++){
+        uint64_t carry=0;
+        for(int j=0;j<4;j++){
+            uint128_t p=(uint128_t)a->v[i]*b->v[j]+w[i+j]+carry;
+            w[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+        }
+        w[i+4]=carry;
     }
-    r->len=ml;
-    if(c&&r->len<BN_MAX_LIMBS) r->v[r->len++]=(uint64_t)c;
-    while(r->len>0&&r->v[r->len-1]==0) r->len--;
+    /* NIST FIPS 186-4 D.2.3 fast reduction for P-256.
+     * Extract 16 x 32-bit words from 512-bit product, then form
+     * intermediate 256-bit values and accumulate.
+     * Each si = (A7,A6,...,A0) big-endian 32-bit words.
+     * Limb mapping: v[k] = (A_{2k+1} << 32) | A_{2k} */
+    uint32_t c[16];
+    for(int i=0;i<8;i++){c[2*i]=(uint32_t)w[i];c[2*i+1]=(uint32_t)(w[i]>>32);}
+    #define W(hi,lo) ((uint64_t)(lo)|((uint64_t)(hi)<<32))
+    /* s1 = (c7,c6,c5,c4,c3,c2,c1,c0) */
+    fp256 s1={{w[0],w[1],w[2],w[3]}};
+    /* s2 = (c15,c14,c13,c12,c11,0,0,0) */
+    fp256 s2={{0, W(c[11],0), W(c[13],c[12]), W(c[15],c[14])}};
+    /* s3 = (0,c15,c14,c13,c12,0,0,0) */
+    fp256 s3={{0, W(c[12],0), W(c[14],c[13]), W(0,c[15])}};
+    /* s4 = (c15,c14,0,0,0,c10,c9,c8) */
+    fp256 s4={{W(c[9],c[8]), W(0,c[10]), 0, W(c[15],c[14])}};
+    /* s5 = (c8,c13,c15,c14,c13,c11,c10,c9) */
+    fp256 s5={{W(c[10],c[9]), W(c[13],c[11]), W(c[15],c[14]), W(c[8],c[13])}};
+    /* s6 = (c10,c8,0,0,0,c13,c12,c11) */
+    fp256 s6={{W(c[12],c[11]), W(0,c[13]), 0, W(c[10],c[8])}};
+    /* s7 = (c11,c9,0,0,c15,c14,c13,c12) */
+    fp256 s7={{W(c[13],c[12]), W(c[15],c[14]), 0, W(c[11],c[9])}};
+    /* s8 = (c12,0,c10,c9,c8,c15,c14,c13) */
+    fp256 s8={{W(c[14],c[13]), W(c[8],c[15]), W(c[10],c[9]), W(c[12],0)}};
+    /* s9 = (c13,0,c11,c10,c9,0,c15,c14) */
+    fp256 s9={{W(c[15],c[14]), W(c[9],0), W(c[11],c[10]), W(c[13],0)}};
+    #undef W
+    /* Accumulate: T = s1 + 2*s2 + 2*s3 + s4 + s5 - s6 - s7 - s8 - s9 */
+    fp256 T;
+    T=s1;
+    fp256_add(&T,&T,&s2); fp256_add(&T,&T,&s2);
+    fp256_add(&T,&T,&s3); fp256_add(&T,&T,&s3);
+    fp256_add(&T,&T,&s4);
+    fp256_add(&T,&T,&s5);
+    fp256_sub(&T,&T,&s6);
+    fp256_sub(&T,&T,&s7);
+    fp256_sub(&T,&T,&s8);
+    fp256_sub(&T,&T,&s9);
+    *r=T;
 }
 
-static void bn_modadd(bignum *r, const bignum *a, const bignum *b, const bignum *m) {
-    bn_add(r,a,b);
-    if(bn_cmp(r,m)>=0) bn_sub(r,r,m);
+static void fp256_sqr(fp256 *r, const fp256 *a){fp256_mul(r,a,a);}
+
+static void fp256_inv(fp256 *r, const fp256 *a) {
+    /* Fermat's little theorem: a^(p-2) mod p */
+    static const fp256 pm2={{
+        0xFFFFFFFFFFFFFFFD, 0x00000000FFFFFFFF,
+        0x0000000000000000, 0xFFFFFFFF00000001
+    }};
+    fp256 result=FP256_ONE, base=*a;
+    for(int i=0;i<256;i++){
+        if((pm2.v[i/64]>>(i%64))&1) fp256_mul(&result,&result,&base);
+        fp256_sqr(&base,&base);
+    }
+    *r=result;
 }
 
-static void bn_modsub(bignum *r, const bignum *a, const bignum *b, const bignum *m) {
-    if(bn_cmp(a,b)>=0){ bn_sub(r,a,b); }
-    else { bignum t; bn_sub(&t,b,a); bn_sub(r,m,&t); }
+static void fp256_from_bytes(fp256 *r, const uint8_t b[32]) {
+    for(int i=0;i<4;i++){r->v[i]=0;for(int j=0;j<8;j++)r->v[i]|=(uint64_t)b[31-(i*8+j)]<<(8*j);}
 }
-
-static void bn_modinv(bignum *r, const bignum *a, const bignum *m) {
-    bignum exp=*m, two; bn_zero(&two); two.v[0]=2; two.len=1;
-    bn_sub(&exp,&exp,&two);
-    bn_modexp(r,a,&exp,m);
+static void fp256_to_bytes(uint8_t b[32], const fp256 *a) {
+    for(int i=0;i<4;i++)for(int j=0;j<8;j++)b[31-(i*8+j)]=(a->v[i]>>(8*j))&0xFF;
 }
 
 /* ================================================================
- * P-256 (secp256r1) via bignum arithmetic
+ * P-256 Elliptic Curve  (y^2 = x^3 - 3x + b)
+ * Constant-time fixed-width, no branches on point coordinates.
  * ================================================================ */
-static const uint8_t P256_P[32]={
-    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
-};
-static const uint8_t P256_GX[32]={
-    0x6B,0x17,0xD1,0xF2,0xE1,0x2C,0x42,0x47,0xF8,0xBC,0xE6,0xE5,0x63,0xA4,0x40,0xF2,
-    0x77,0x03,0x7D,0x81,0x2D,0xEB,0x33,0xA0,0xF4,0xA1,0x39,0x45,0xD8,0x98,0xC2,0x96
-};
-static const uint8_t P256_GY[32]={
-    0x4F,0xE3,0x42,0xE2,0xFE,0x1A,0x7F,0x9B,0x8E,0xE7,0xEB,0x4A,0x7C,0x0F,0x9E,0x16,
-    0x2B,0xCE,0x33,0x57,0x6B,0x31,0x5E,0xCE,0xCB,0xB6,0x40,0x68,0x37,0xBF,0x51,0xF5
-};
-static const uint8_t P256_B[32]={
-    0x5A,0xC6,0x35,0xD8,0xAA,0x3A,0x93,0xE7,0xB3,0xEB,0xBD,0x55,0x76,0x98,0x86,0xBC,
-    0x65,0x1D,0x06,0xB0,0xCC,0x53,0xB0,0xF6,0x3B,0xCE,0x3C,0x3E,0x27,0xD2,0x60,0x4B
-};
+typedef struct { fp256 x,y,z; } ec256;
 
-static bignum p256_p, p256_b, p256_gx, p256_gy;
-static int p256_inited=0;
+static int ec256_is_inf(const ec256 *p){return fp256_is_zero(&p->z);}
+static void ec256_set_inf(ec256 *p){p->x=FP256_ONE;p->y=FP256_ONE;p->z=FP256_ZERO;}
 
-static void p256_init(void) {
-    if(p256_inited) return;
-    bn_from_bytes(&p256_p,P256_P,32);
-    bn_from_bytes(&p256_b,P256_B,32);
-    bn_from_bytes(&p256_gx,P256_GX,32);
-    bn_from_bytes(&p256_gy,P256_GY,32);
-    p256_inited=1;
+static int ec256_on_curve(const fp256 *x, const fp256 *y) {
+    fp256 y2, x3, t, three={{3,0,0,0}};
+    fp256_sqr(&y2, y);
+    fp256_sqr(&t, x); fp256_mul(&x3, &t, x);
+    fp256_mul(&t, x, &three);
+    fp256_sub(&x3, &x3, &t);
+    fp256_add(&x3, &x3, &P256_B);
+    return fp256_cmp(&y2, &x3) == 0;
 }
 
-typedef struct { bignum x,y,z; } ec256;
-
-static int ec256_is_inf(const ec256 *p){return p->z.len==0;}
-static void ec256_set_inf(ec256 *p){
-    bn_zero(&p->x);p->x.v[0]=1;p->x.len=1;
-    bn_zero(&p->y);p->y.v[0]=1;p->y.len=1;
-    bn_zero(&p->z);
-}
-
-static int ec256_on_curve(const bignum *x, const bignum *y) {
-    bignum y2,x2,x3,t,three;
-    bn_modmul(&y2,y,y,&p256_p);
-    bn_modmul(&x2,x,x,&p256_p);
-    bn_modmul(&x3,&x2,x,&p256_p);
-    bn_zero(&three);three.v[0]=3;three.len=1;
-    bn_modmul(&t,x,&three,&p256_p);
-    bn_modsub(&x3,&x3,&t,&p256_p);
-    bn_modadd(&x3,&x3,&p256_b,&p256_p);
-    return bn_cmp(&y2,&x3)==0;
-}
-
-/* Jacobian point doubling, a=-3 */
+/* Point doubling in Jacobian coords with a=-3.
+ * No infinity branch: when z=0, z3=2*y*z=0 naturally. */
 static void ec256_double(ec256 *r, const ec256 *pt) {
-    if(ec256_is_inf(pt)){ec256_set_inf(r);return;}
-    bignum z2,m,y2,s,x3,y3,z3,t1,t2,y4,s2;
-    bn_modmul(&z2,&pt->z,&pt->z,&p256_p);
+    fp256 z2,m,y2,s,x3,y3,z3,t1,t2,y4,s2;
+    fp256_sqr(&z2,&pt->z);
     /* m = 3*(x-z2)*(x+z2) */
-    bn_modsub(&t1,&pt->x,&z2,&p256_p);
-    bn_modadd(&t2,&pt->x,&z2,&p256_p);
-    bn_modmul(&m,&t1,&t2,&p256_p);
-    bn_modadd(&t1,&m,&m,&p256_p); bn_modadd(&m,&t1,&m,&p256_p);
+    fp256_sub(&t1,&pt->x,&z2);
+    fp256_add(&t2,&pt->x,&z2);
+    fp256_mul(&m,&t1,&t2);
+    fp256 m3; fp256_add(&m3,&m,&m); fp256_add(&m3,&m3,&m);
     /* s = 4*x*y^2 */
-    bn_modmul(&y2,&pt->y,&pt->y,&p256_p);
-    bn_modmul(&s,&pt->x,&y2,&p256_p);
-    bn_modadd(&s,&s,&s,&p256_p); bn_modadd(&s,&s,&s,&p256_p);
-    /* x3 = m^2 - 2s */
-    bn_modmul(&x3,&m,&m,&p256_p);
-    bn_modadd(&s2,&s,&s,&p256_p);
-    bn_modsub(&x3,&x3,&s2,&p256_p);
-    /* y3 = m*(s-x3) - 8*y^4 */
-    bn_modsub(&t1,&s,&x3,&p256_p);
-    bn_modmul(&y3,&m,&t1,&p256_p);
-    bn_modmul(&y4,&y2,&y2,&p256_p);
-    bn_modadd(&y4,&y4,&y4,&p256_p);bn_modadd(&y4,&y4,&y4,&p256_p);bn_modadd(&y4,&y4,&y4,&p256_p);
-    bn_modsub(&y3,&y3,&y4,&p256_p);
+    fp256_sqr(&y2,&pt->y);
+    fp256_mul(&s,&pt->x,&y2);
+    fp256_add(&s,&s,&s); fp256_add(&s,&s,&s);
+    /* x3 = m3^2 - 2s */
+    fp256_sqr(&x3,&m3);
+    fp256_add(&s2,&s,&s);
+    fp256_sub(&x3,&x3,&s2);
+    /* y3 = m3*(s-x3) - 8*y^4 */
+    fp256_sub(&t1,&s,&x3);
+    fp256_mul(&y3,&m3,&t1);
+    fp256_sqr(&y4,&y2);
+    fp256_add(&y4,&y4,&y4); fp256_add(&y4,&y4,&y4); fp256_add(&y4,&y4,&y4);
+    fp256_sub(&y3,&y3,&y4);
     /* z3 = 2*y*z */
-    bn_modmul(&z3,&pt->y,&pt->z,&p256_p);
-    bn_modadd(&z3,&z3,&z3,&p256_p);
-    r->x=x3;r->y=y3;r->z=z3;
+    fp256_mul(&z3,&pt->y,&pt->z);
+    fp256_add(&z3,&z3,&z3);
+    r->x=x3; r->y=y3; r->z=z3;
 }
 
-/* Jacobian point addition */
+/* Point addition (Jacobian). No branches — designed for Montgomery ladder
+ * where R0/R1 are never both infinity or equal after first iteration.
+ * When h=0 or z=0, the formula naturally produces z3=0. */
 static void ec256_add(ec256 *r, const ec256 *p, const ec256 *q) {
-    if(ec256_is_inf(p)){*r=*q;return;}
-    if(ec256_is_inf(q)){*r=*p;return;}
-    bignum z1s,z2s,u1,u2,z1c,z2c,s1,s2,h,rr,h2,h3,u1h2,x3,y3,z3,t,u1h2_2,s1h3;
-    bn_modmul(&z1s,&p->z,&p->z,&p256_p); bn_modmul(&z2s,&q->z,&q->z,&p256_p);
-    bn_modmul(&u1,&p->x,&z2s,&p256_p); bn_modmul(&u2,&q->x,&z1s,&p256_p);
-    bn_modmul(&z1c,&z1s,&p->z,&p256_p); bn_modmul(&z2c,&z2s,&q->z,&p256_p);
-    bn_modmul(&s1,&p->y,&z2c,&p256_p); bn_modmul(&s2,&q->y,&z1c,&p256_p);
-    bn_modsub(&h,&u2,&u1,&p256_p); bn_modsub(&rr,&s2,&s1,&p256_p);
-    if(h.len==0){
-        if(rr.len==0){ec256_double(r,p);return;}
-        ec256_set_inf(r);return;
-    }
-    bn_modmul(&h2,&h,&h,&p256_p); bn_modmul(&h3,&h2,&h,&p256_p);
-    bn_modmul(&u1h2,&u1,&h2,&p256_p);
-    bn_modmul(&x3,&rr,&rr,&p256_p); bn_modsub(&x3,&x3,&h3,&p256_p);
-    bn_modadd(&u1h2_2,&u1h2,&u1h2,&p256_p);
-    bn_modsub(&x3,&x3,&u1h2_2,&p256_p);
-    bn_modsub(&t,&u1h2,&x3,&p256_p); bn_modmul(&y3,&rr,&t,&p256_p);
-    bn_modmul(&s1h3,&s1,&h3,&p256_p); bn_modsub(&y3,&y3,&s1h3,&p256_p);
-    bn_modmul(&z3,&p->z,&q->z,&p256_p); bn_modmul(&z3,&z3,&h,&p256_p);
+    fp256 z1s,z2s,u1,u2,z1c,z2c,s1,s2,h,rr,h2,h3,u1h2;
+    fp256_sqr(&z1s,&p->z); fp256_sqr(&z2s,&q->z);
+    fp256_mul(&u1,&p->x,&z2s); fp256_mul(&u2,&q->x,&z1s);
+    fp256_mul(&z1c,&z1s,&p->z); fp256_mul(&z2c,&z2s,&q->z);
+    fp256_mul(&s1,&p->y,&z2c); fp256_mul(&s2,&q->y,&z1c);
+    fp256_sub(&h,&u2,&u1); fp256_sub(&rr,&s2,&s1);
+    fp256_sqr(&h2,&h); fp256_mul(&h3,&h2,&h); fp256_mul(&u1h2,&u1,&h2);
+    fp256 x3,y3,z3,t;
+    fp256_sqr(&x3,&rr); fp256_sub(&x3,&x3,&h3);
+    fp256 u1h2_2; fp256_add(&u1h2_2,&u1h2,&u1h2);
+    fp256_sub(&x3,&x3,&u1h2_2);
+    fp256_sub(&t,&u1h2,&x3); fp256_mul(&y3,&rr,&t);
+    fp256 s1h3; fp256_mul(&s1h3,&s1,&h3); fp256_sub(&y3,&y3,&s1h3);
+    fp256_mul(&z3,&p->z,&q->z); fp256_mul(&z3,&z3,&h);
     r->x=x3;r->y=y3;r->z=z3;
 }
 
-static void ec256_to_affine(bignum *ax, bignum *ay, const ec256 *p) {
-    bignum zi,zi2,zi3;
-    bn_modinv(&zi,&p->z,&p256_p);
-    bn_modmul(&zi2,&zi,&zi,&p256_p);
-    bn_modmul(&zi3,&zi2,&zi,&p256_p);
-    bn_modmul(ax,&p->x,&zi2,&p256_p);
-    bn_modmul(ay,&p->y,&zi3,&p256_p);
+static void ec256_to_affine(fp256 *ax, fp256 *ay, const ec256 *p) {
+    fp256 zi,zi2,zi3;
+    fp256_inv(&zi,&p->z);
+    fp256_sqr(&zi2,&zi); fp256_mul(&zi3,&zi2,&zi);
+    fp256_mul(ax,&p->x,&zi2); fp256_mul(ay,&p->y,&zi3);
 }
 
-/* Constant-time conditional swap of int values */
-static void ct_swap_int(int *a, int *b, uint64_t mask) {
-    int d=(int)(mask&(uint64_t)((unsigned)*a^(unsigned)*b));
-    *a^=d; *b^=d;
+static void ec256_cswap(ec256 *a, ec256 *b, uint64_t bit) {
+    uint64_t mask = -(uint64_t)bit;
+    for(int i=0;i<4;i++){
+        uint64_t d;
+        d=mask&(a->x.v[i]^b->x.v[i]); a->x.v[i]^=d; b->x.v[i]^=d;
+        d=mask&(a->y.v[i]^b->y.v[i]); a->y.v[i]^=d; b->y.v[i]^=d;
+        d=mask&(a->z.v[i]^b->z.v[i]); a->z.v[i]^=d; b->z.v[i]^=d;
+    }
 }
 
-/* Montgomery ladder scalar multiplication (constant-time) */
+/* Montgomery ladder scalar multiplication (constant-time).
+ * Caller must ensure top bit of scalar is set.
+ * Initializes R0=P, R1=2P and iterates from bit 254 down,
+ * so add/double never see infinity inputs. */
 static void ec256_scalar_mul(ec256 *r, const ec256 *p, const uint8_t scalar[32]) {
-    ec256 R0,R1;
-    ec256_set_inf(&R0); R1=*p;
-    for(int i=255;i>=0;i--){
-        int byte_idx=31-(i/8), bit_pos=i%8;
+    ec256 R0, R1;
+    R0 = *p;
+    ec256_double(&R1, p);
+    for(int i=254;i>=0;i--){
+        int byte_idx=31-(i/8);
+        int bit_pos=i%8;
         uint64_t bit=(scalar[byte_idx]>>bit_pos)&1;
-        /* constant-time conditional swap */
-        uint64_t mask=-(uint64_t)bit;
-        for(int j=0;j<BN_MAX_LIMBS;j++){
-            uint64_t d;
-            d=mask&(R0.x.v[j]^R1.x.v[j]);R0.x.v[j]^=d;R1.x.v[j]^=d;
-            d=mask&(R0.y.v[j]^R1.y.v[j]);R0.y.v[j]^=d;R1.y.v[j]^=d;
-            d=mask&(R0.z.v[j]^R1.z.v[j]);R0.z.v[j]^=d;R1.z.v[j]^=d;
-        }
-        ct_swap_int(&R0.x.len,&R1.x.len,mask);
-        ct_swap_int(&R0.y.len,&R1.y.len,mask);
-        ct_swap_int(&R0.z.len,&R1.z.len,mask);
+        ec256_cswap(&R0,&R1,bit);
         ec256_add(&R1,&R0,&R1);
         ec256_double(&R0,&R0);
-        for(int j=0;j<BN_MAX_LIMBS;j++){
-            uint64_t d;
-            d=mask&(R0.x.v[j]^R1.x.v[j]);R0.x.v[j]^=d;R1.x.v[j]^=d;
-            d=mask&(R0.y.v[j]^R1.y.v[j]);R0.y.v[j]^=d;R1.y.v[j]^=d;
-            d=mask&(R0.z.v[j]^R1.z.v[j]);R0.z.v[j]^=d;R1.z.v[j]^=d;
-        }
-        ct_swap_int(&R0.x.len,&R1.x.len,mask);
-        ct_swap_int(&R0.y.len,&R1.y.len,mask);
-        ct_swap_int(&R0.z.len,&R1.z.len,mask);
+        ec256_cswap(&R0,&R1,bit);
     }
     *r=R0;
 }
 
+/* Variable-time scalar multiplication for ECDSA verification (public data).
+ * Uses double-and-add; handles arbitrary scalars including those with top bit 0. */
+static void ec256_scalar_mul_vartime(ec256 *r, const ec256 *p, const uint8_t scalar[32]) {
+    ec256_set_inf(r);
+    int started=0;
+    for(int i=0;i<256;i++){
+        int byte_idx=i/8, bit_pos=7-(i%8);
+        int bit=(scalar[byte_idx]>>bit_pos)&1;
+        if(started){
+            ec256_double(r,r);
+            if(bit) ec256_add(r,r,p);
+        } else if(bit){
+            *r=*p; started=1;
+        }
+    }
+}
+
 /* ECDHE P-256 keygen */
 static void ecdhe_p256_keygen(uint8_t priv[32], uint8_t pub[65]) {
-    p256_init();
     random_bytes(priv,32);
     priv[0]|=0x80;
-    ec256 G; G.x=p256_gx; G.y=p256_gy;
-    bn_zero(&G.z); G.z.v[0]=1; G.z.len=1;
+    ec256 G; G.x=P256_GX; G.y=P256_GY; G.z=FP256_ONE;
     ec256 Q; ec256_scalar_mul(&Q,&G,priv);
-    bignum ax,ay; ec256_to_affine(&ax,&ay,&Q);
+    fp256 ax,ay; ec256_to_affine(&ax,&ay,&Q);
     pub[0]=0x04;
-    bn_to_bytes(&ax,pub+1,32);
-    bn_to_bytes(&ay,pub+33,32);
+    fp256_to_bytes(pub+1,&ax);
+    fp256_to_bytes(pub+33,&ay);
     if(!ec256_on_curve(&ax,&ay)) fprintf(stderr,"BUG: P-256 point NOT on curve!\n");
     else printf("  P-256 point verified on curve\n");
 }
 
 static void ecdhe_p256_shared_secret(const uint8_t priv[32], const uint8_t peer_pub[65], uint8_t secret[32]) {
-    p256_init();
-    bignum px,py;
-    bn_from_bytes(&px,peer_pub+1,32);
-    bn_from_bytes(&py,peer_pub+33,32);
+    fp256 px,py;
+    fp256_from_bytes(&px,peer_pub+1);
+    fp256_from_bytes(&py,peer_pub+33);
     if(!ec256_on_curve(&px,&py)) die("P-256 peer key not on curve");
-    ec256 P; P.x=px; P.y=py;
-    bn_zero(&P.z); P.z.v[0]=1; P.z.len=1;
+    ec256 P; P.x=px; P.y=py; P.z=FP256_ONE;
     ec256 S; ec256_scalar_mul(&S,&P,priv);
-    bignum sx,sy; ec256_to_affine(&sx,&sy,&S);
-    bn_to_bytes(&sx,secret,32);
+    fp256 sx,sy; ec256_to_affine(&sx,&sy,&S);
+    fp256_to_bytes(secret,&sx);
 }
 
 /* OID constants */
@@ -1414,7 +1481,6 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
                               const uint8_t *sig_der, size_t sig_len,
                               const uint8_t *pubkey, size_t pk_len) {
     if(pk_len!=65||pubkey[0]!=0x04) return 0;
-    p256_init();
 
     /* Parse DER signature → (r, s) */
     const uint8_t *p=sig_der, *end=sig_der+sig_len;
@@ -1434,6 +1500,7 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
     const uint8_t *sp=sval; size_t slen=len;
     if(slen>0&&sp[0]==0){sp++;slen--;}
 
+    /* Bignum arithmetic on group order n (public data, variable-time OK) */
     bignum r_bn, s_bn, n, hash_bn, w, u1, u2;
     bn_from_bytes(&r_bn,rp,rlen);
     bn_from_bytes(&s_bn,sp,slen);
@@ -1455,25 +1522,30 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
     bn_to_bytes(&u1,u1_bytes,32);
     bn_to_bytes(&u2,u2_bytes,32);
 
-    /* R = u1*G + u2*Q */
+    /* R = u1*G + u2*Q using fp256-based EC */
     ec256 G;
-    G.x=p256_gx; G.y=p256_gy;
-    bn_zero(&G.z); G.z.v[0]=1; G.z.len=1;
+    G.x=P256_GX; G.y=P256_GY; G.z=FP256_ONE;
 
-    bignum qx,qy;
-    bn_from_bytes(&qx,pubkey+1,32);
-    bn_from_bytes(&qy,pubkey+33,32);
-    ec256 Q; Q.x=qx; Q.y=qy;
-    bn_zero(&Q.z); Q.z.v[0]=1; Q.z.len=1;
+    fp256 qx,qy;
+    fp256_from_bytes(&qx,pubkey+1);
+    fp256_from_bytes(&qy,pubkey+33);
+    ec256 Q; Q.x=qx; Q.y=qy; Q.z=FP256_ONE;
 
-    /* Use variable-time scalar muls (verification is public) */
-    ec256 R1; ec256_scalar_mul(&R1,&G,u1_bytes);
-    ec256 R2; ec256_scalar_mul(&R2,&Q,u2_bytes);
-    ec256 R; ec256_add(&R,&R1,&R2);
+    ec256 R1; ec256_scalar_mul_vartime(&R1,&G,u1_bytes);
+    ec256 R2; ec256_scalar_mul_vartime(&R2,&Q,u2_bytes);
+    ec256 R;
+    if(ec256_is_inf(&R1)) R=R2;
+    else if(ec256_is_inf(&R2)) R=R1;
+    else ec256_add(&R,&R1,&R2);
     if(ec256_is_inf(&R)) return 0;
 
-    bignum rx,ry;
-    ec256_to_affine(&rx,&ry,&R);
+    fp256 rx_fp,ry_fp;
+    ec256_to_affine(&rx_fp,&ry_fp,&R);
+    /* Convert fp256 result to bignum for mod-n comparison */
+    uint8_t rx_bytes[32];
+    fp256_to_bytes(rx_bytes,&rx_fp);
+    bignum rx;
+    bn_from_bytes(&rx,rx_bytes,32);
     bn_mod(&rx,&rx,&n);
     return bn_cmp(&rx,&r_bn)==0;
 }
