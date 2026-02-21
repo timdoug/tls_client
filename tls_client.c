@@ -1,6 +1,6 @@
 /*
  * tls_client.c — TLS 1.2/1.3 HTTPS client from scratch in C.
- * Implements: SHA-256, HMAC, HKDF, AES-128-GCM, ECDHE-P256/P384, TLS 1.2/1.3
+ * Implements: SHA-256, SHA-384, HMAC, HKDF, AES-128/256-GCM, ECDHE-P256/P384, TLS 1.2/1.3
  * No external crypto libraries.
  *
  * Compile:  cc -O2 -o tls_client tls_client.c
@@ -960,6 +960,45 @@ static void tls12_prf_sha384(const uint8_t *secret, size_t secret_len,
 
         hmac_sha384(secret, secret_len, a, 48, a);
     }
+}
+
+/* HKDF-SHA384 variants for TLS_AES_256_GCM_SHA384 (0x1302) */
+static void hkdf_extract_384(const uint8_t *salt, size_t slen, const uint8_t *ikm, size_t ilen, uint8_t out[48]) {
+    if (slen == 0) { uint8_t z[48]={0}; hmac_sha384(z,48,ikm,ilen,out); }
+    else hmac_sha384(salt,slen,ikm,ilen,out);
+}
+
+static void hkdf_expand_384(const uint8_t prk[48], const uint8_t *info, size_t ilen, uint8_t *out, size_t olen) {
+    uint8_t t[48]; size_t tl=0, done=0; uint8_t ctr=1;
+    while (done < olen) {
+        sha384_ctx c; sha384_init(&c);
+        uint8_t ik[128]={0}, ok[128]={0}; memcpy(ik,prk,48);
+        for(int i=0;i<128;i++){ik[i]^=0x36;ok[i]=((i<48)?prk[i]:0)^0x5c;}
+        sha384_update(&c,ik,128);
+        if (tl>0) sha384_update(&c,t,tl);
+        sha384_update(&c,info,ilen);
+        sha384_update(&c,&ctr,1);
+        uint8_t inner[48]; sha384_final(&c,inner);
+        sha384_ctx c2; sha384_init(&c2); sha384_update(&c2,ok,128); sha384_update(&c2,inner,48);
+        sha384_final(&c2,t); tl=48;
+        size_t use = olen-done; if(use>48) use=48;
+        memcpy(out+done,t,use); done+=use; ctr++;
+    }
+}
+
+static void hkdf_expand_label_384(const uint8_t secret[48], const char *label,
+                                    const uint8_t *ctx, size_t clen, uint8_t *out, size_t olen) {
+    uint8_t info[256]; size_t p=0;
+    size_t label_len=strlen(label);
+    if(2+1+6+label_len+1+clen>sizeof(info)) die("hkdf_expand_label_384: info overflow");
+    info[p++]=(olen>>8)&0xFF; info[p++]=olen&0xFF;
+    size_t ll=6+label_len;
+    info[p++]=ll&0xFF;
+    memcpy(info+p,"tls13 ",6); p+=6;
+    memcpy(info+p,label,label_len); p+=label_len;
+    info[p++]=clen&0xFF;
+    if(clen>0){memcpy(info+p,ctx,clen);p+=clen;}
+    hkdf_expand_384(secret,info,p,out,olen);
 }
 
 /* OID constants */
@@ -2215,11 +2254,15 @@ static int tcp_connect(const char *host, int port) {
     return fd;
 }
 
-/* Send a TLS record */
+/* Send a TLS record (header + body in a single write to avoid TCP fragmentation
+   issues with middleboxes that can't reassemble split TLS record headers) */
 static void tls_send_record(int fd, uint8_t type, const uint8_t *data, size_t len) {
-    uint8_t hdr[5]; hdr[0]=type; hdr[1]=0x03; hdr[2]=0x03; PUT16(hdr+3,(uint16_t)len);
-    write_all(fd,hdr,5);
-    write_all(fd,data,len);
+    uint8_t *buf = malloc(5+len);
+    if(!buf) die("malloc failed");
+    buf[0]=type; buf[1]=0x03; buf[2]=0x03; PUT16(buf+3,(uint16_t)len);
+    memcpy(buf+5,data,len);
+    write_all(fd,buf,5+len);
+    free(buf);
 }
 
 /* Read a TLS record. Returns content type. */
@@ -2255,8 +2298,9 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
     random_bytes(buf+p,32); p+=32;
 
     /* Cipher suites: TLS 1.3 + TLS 1.2 ECDHE-GCM */
-    buf[p++]=0x00; buf[p++]=0x0A; /* 10 bytes = 5 suites */
+    buf[p++]=0x00; buf[p++]=0x0C; /* 12 bytes = 6 suites */
     buf[p++]=0x13; buf[p++]=0x01; /* TLS_AES_128_GCM_SHA256 */
+    buf[p++]=0x13; buf[p++]=0x02; /* TLS_AES_256_GCM_SHA384 */
     buf[p++]=0xC0; buf[p++]=0x2B; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2F; /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2C; /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
@@ -2322,6 +2366,13 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
     buf[p++]=0x03;buf[p++]=0x04; /* TLS 1.3 */
     buf[p++]=0x03;buf[p++]=0x03; /* TLS 1.2 */
 
+    /* ALPN (application_layer_protocol_negotiation) — offer http/1.1 */
+    buf[p++]=0x00;buf[p++]=0x10; /* extension type 16 */
+    buf[p++]=0x00;buf[p++]=0x0b; /* ext len = 11 */
+    buf[p++]=0x00;buf[p++]=0x09; /* protocol list len = 9 */
+    buf[p++]=0x08;               /* protocol name len = 8 */
+    memcpy(buf+p,"http/1.1",8);p+=8;
+
     /* Fill in lengths */
     PUT16(buf+ext_len_pos,(uint16_t)(p-ext_len_pos-2));
     uint32_t body_len=p-4;
@@ -2360,7 +2411,7 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     if(b+2>sh_end) die("ServerHello truncated at cipher suite");
     uint16_t cs=GET16(b); b+=2;
     *cipher_suite_out=cs;
-    if(cs!=0x1301 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030) {
+    if(cs!=0x1301 && cs!=0x1302 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030) {
         fprintf(stderr,"cipher suite 0x%04x\n",cs);
         die("unexpected cipher suite");
     }
@@ -2403,8 +2454,9 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
 /* Decrypt a TLS 1.3 encrypted record.
    Returns inner content type, plaintext in pt, pt_len set. */
 static int decrypt_record(const uint8_t *rec, size_t rec_len,
-                           const uint8_t key[16], const uint8_t iv[12],
-                           uint64_t seq, uint8_t *pt, size_t *pt_len) {
+                           const uint8_t *key, const uint8_t iv[12],
+                           uint64_t seq, uint8_t *pt, size_t *pt_len,
+                           int is_aes256) {
     if(rec_len<17) die("encrypted record too short");
     size_t ct_len=rec_len-16;
     const uint8_t *tag=rec+ct_len;
@@ -2417,7 +2469,12 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
     uint8_t aad[5]={0x17,0x03,0x03,0,0};
     PUT16(aad+3,(uint16_t)rec_len);
 
-    if(aes_gcm_decrypt(key,nonce,aad,5,rec,ct_len,pt,tag)<0) die("AEAD decrypt failed");
+    int r;
+    if(is_aes256)
+        r=aes256_gcm_decrypt(key,nonce,aad,5,rec,ct_len,pt,tag);
+    else
+        r=aes_gcm_decrypt(key,nonce,aad,5,rec,ct_len,pt,tag);
+    if(r<0) die("AEAD decrypt failed");
 
     /* Find inner content type (last non-zero byte) */
     size_t i=ct_len;
@@ -2431,8 +2488,8 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
 /* Encrypt and send a TLS 1.3 record */
 static void encrypt_and_send(int fd, uint8_t inner_type,
                               const uint8_t *data, size_t len,
-                              const uint8_t key[16], const uint8_t iv[12],
-                              uint64_t seq) {
+                              const uint8_t *key, const uint8_t iv[12],
+                              uint64_t seq, int is_aes256) {
     /* Build inner plaintext: data + content_type */
     if(len>16384) die("TLS 1.3 record too large to encrypt");
     uint8_t *inner = malloc(len+1);
@@ -2451,7 +2508,10 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
     uint8_t aad[5]={0x17,0x03,0x03,0,0};
     PUT16(aad+3,(uint16_t)(ct_len+16));
 
-    aes_gcm_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
+    if(is_aes256)
+        aes256_gcm_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
+    else
+        aes_gcm_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
     memcpy(ct+ct_len,tag,16);
 
     tls_send_record(fd,0x17,ct,ct_len+16);
@@ -2550,11 +2610,15 @@ static void do_https_get(const char *host, int port, const char *path) {
     uint8_t ch[1024];
     uint8_t client_random[32];
     size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,host,client_random);
-    /* For the record layer, first ClientHello uses version 0x0301 */
-    uint8_t ch_hdr[5]={0x16,0x03,0x01,0,0};
-    PUT16(ch_hdr+3,(uint16_t)ch_len);
-    write_all(fd,ch_hdr,5);
-    write_all(fd,ch,ch_len);
+    /* For the record layer, first ClientHello uses version 0x0301.
+       Send header+body in one write to avoid middlebox issues with TCP fragmentation. */
+    {
+        uint8_t ch_rec[5+1024];
+        ch_rec[0]=0x16; ch_rec[1]=0x03; ch_rec[2]=0x01;
+        PUT16(ch_rec+3,(uint16_t)ch_len);
+        memcpy(ch_rec+5,ch,ch_len);
+        write_all(fd,ch_rec,5+ch_len);
+    }
 
     /* Start transcript */
     sha256_ctx transcript;
@@ -2900,7 +2964,9 @@ static void do_https_get(const char *host, int port, const char *path) {
      * ================================================================ */
     (void)sh_leftover; /* only used in TLS 1.2 path */
     uint16_t selected_group = (server_pub_len==65) ? 0x0017 : 0x0018;
-    printf("Received ServerHello (TLS 1.3, group=0x%04x)\n",selected_group);
+    int is_aes256 = (cipher_suite == 0x1302);
+    size_t hash_len = is_aes256 ? 48 : 32;
+    printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",cipher_suite,selected_group);
 
     /* Compute shared secret based on negotiated group */
     uint8_t shared[48]; size_t shared_len;
@@ -2919,25 +2985,54 @@ static void do_https_get(const char *host, int port, const char *path) {
     printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Derive handshake keys */
-    uint8_t early_secret[32];
-    { uint8_t z[32]={0}; hkdf_extract(z,32,z,32,early_secret); }
-    uint8_t derived1[32];
-    { uint8_t empty_hash[32]; sha256_hash(NULL,0,empty_hash);
-      hkdf_expand_label(early_secret,"derived",empty_hash,32,derived1,32); }
-    uint8_t hs_secret[32];
-    hkdf_extract(derived1,32,shared,shared_len,hs_secret);
+    uint8_t early_secret[48];
+    if(is_aes256) {
+        uint8_t z[48]={0}; hkdf_extract_384(z,48,z,48,early_secret);
+    } else {
+        uint8_t z[32]={0}; hkdf_extract(z,32,z,32,early_secret);
+    }
+    uint8_t derived1[48];
+    if(is_aes256) {
+        uint8_t empty_hash[48]; sha384_hash(NULL,0,empty_hash);
+        hkdf_expand_label_384(early_secret,"derived",empty_hash,48,derived1,48);
+    } else {
+        uint8_t empty_hash[32]; sha256_hash(NULL,0,empty_hash);
+        hkdf_expand_label(early_secret,"derived",empty_hash,32,derived1,32);
+    }
+    uint8_t hs_secret[48];
+    if(is_aes256)
+        hkdf_extract_384(derived1,48,shared,shared_len,hs_secret);
+    else
+        hkdf_extract(derived1,32,shared,shared_len,hs_secret);
 
-    uint8_t th1[32]; { sha256_ctx tc=transcript; sha256_final(&tc,th1); }
+    uint8_t th1[48];
+    if(is_aes256) {
+        sha384_ctx tc=transcript384; sha384_final(&tc,th1);
+    } else {
+        sha256_ctx tc=transcript; sha256_final(&tc,th1);
+    }
 
-    uint8_t s_hs_traffic[32], c_hs_traffic[32];
-    hkdf_expand_label(hs_secret,"s hs traffic",th1,32,s_hs_traffic,32);
-    hkdf_expand_label(hs_secret,"c hs traffic",th1,32,c_hs_traffic,32);
+    uint8_t s_hs_traffic[48], c_hs_traffic[48];
+    if(is_aes256) {
+        hkdf_expand_label_384(hs_secret,"s hs traffic",th1,48,s_hs_traffic,48);
+        hkdf_expand_label_384(hs_secret,"c hs traffic",th1,48,c_hs_traffic,48);
+    } else {
+        hkdf_expand_label(hs_secret,"s hs traffic",th1,32,s_hs_traffic,32);
+        hkdf_expand_label(hs_secret,"c hs traffic",th1,32,c_hs_traffic,32);
+    }
 
-    uint8_t s_hs_key[16], s_hs_iv[12], c_hs_key[16], c_hs_iv[12];
-    hkdf_expand_label(s_hs_traffic,"key",NULL,0,s_hs_key,16);
-    hkdf_expand_label(s_hs_traffic,"iv",NULL,0,s_hs_iv,12);
-    hkdf_expand_label(c_hs_traffic,"key",NULL,0,c_hs_key,16);
-    hkdf_expand_label(c_hs_traffic,"iv",NULL,0,c_hs_iv,12);
+    uint8_t s_hs_key[32], s_hs_iv[12], c_hs_key[32], c_hs_iv[12];
+    if(is_aes256) {
+        hkdf_expand_label_384(s_hs_traffic,"key",NULL,0,s_hs_key,32);
+        hkdf_expand_label_384(s_hs_traffic,"iv",NULL,0,s_hs_iv,12);
+        hkdf_expand_label_384(c_hs_traffic,"key",NULL,0,c_hs_key,32);
+        hkdf_expand_label_384(c_hs_traffic,"iv",NULL,0,c_hs_iv,12);
+    } else {
+        hkdf_expand_label(s_hs_traffic,"key",NULL,0,s_hs_key,16);
+        hkdf_expand_label(s_hs_traffic,"iv",NULL,0,s_hs_iv,12);
+        hkdf_expand_label(c_hs_traffic,"key",NULL,0,c_hs_key,16);
+        hkdf_expand_label(c_hs_traffic,"iv",NULL,0,c_hs_iv,12);
+    }
     printf("Derived handshake traffic keys\n");
 
     /* Read encrypted handshake messages */
@@ -2956,7 +3051,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     while(!got_finished) {
         if(rtype!=0x17) die("expected encrypted record");
         uint8_t pt[32768]; size_t pt_len;
-        int inner=decrypt_record(rec,rec_len,s_hs_key,s_hs_iv,s_hs_seq++,pt,&pt_len);
+        int inner=decrypt_record(rec,rec_len,s_hs_key,s_hs_iv,s_hs_seq++,pt,&pt_len,is_aes256);
         if(inner!=0x16) die("expected handshake inside encrypted record");
 
         /* Append to handshake buffer */
@@ -2975,11 +3070,13 @@ static void do_https_get(const char *host, int port, const char *path) {
             switch(mtype) {
                 case 8: /* EncryptedExtensions */
                     printf("  EncryptedExtensions (%u bytes)\n",(unsigned)mlen);
-                    sha256_update(&transcript,hs_buf+pos,msg_total);
+                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&transcript,hs_buf+pos,msg_total);
                     break;
                 case 11: /* Certificate */
                     printf("  Certificate (%u bytes)\n",(unsigned)mlen);
-                    sha256_update(&transcript,hs_buf+pos,msg_total);
+                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&transcript,hs_buf+pos,msg_total);
                     saved_cert_msg=malloc(mlen);
                     if(!saved_cert_msg) die("malloc failed");
                     memcpy(saved_cert_msg,hs_buf+pos+4,mlen);
@@ -3004,15 +3101,20 @@ static void do_https_get(const char *host, int port, const char *path) {
                     const uint8_t *cv_sig=cv+4;
 
                     /* Transcript hash up to (but not including) CertificateVerify */
-                    uint8_t th_cv[32];
-                    { sha256_ctx tc=transcript; sha256_final(&tc,th_cv); }
+                    uint8_t th_cv[48];
+                    if(is_aes256) {
+                        sha384_ctx tc=transcript384; sha384_final(&tc,th_cv);
+                    } else {
+                        sha256_ctx tc=transcript; sha256_final(&tc,th_cv);
+                    }
 
                     /* Content to verify: 64 spaces || context string || 0x00 || transcript hash */
-                    uint8_t cv_content[130]; /* 64 + 33 + 1 + 32 = 130 */
+                    size_t cv_content_len = 64 + 33 + 1 + hash_len;
+                    uint8_t cv_content[146]; /* max: 64 + 33 + 1 + 48 = 146 */
                     memset(cv_content,0x20,64);
                     memcpy(cv_content+64,"TLS 1.3, server CertificateVerify",33);
                     cv_content[97]=0x00;
-                    memcpy(cv_content+98,th_cv,32);
+                    memcpy(cv_content+98,th_cv,hash_len);
 
                     /* Parse leaf cert public key */
                     if(!saved_cert_msg) die("No certificate for CertificateVerify");
@@ -3025,23 +3127,23 @@ static void do_https_get(const char *host, int port, const char *path) {
 
                     int cv_ok=0;
                     if(cv_algo==0x0403){ /* ecdsa_secp256r1_sha256 */
-                        uint8_t h[32]; sha256_hash(cv_content,130,h);
+                        uint8_t h[32]; sha256_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==1 && leaf.pubkey_len==65)
                             cv_ok=ecdsa_p256_verify(h,32,cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
                     } else if(cv_algo==0x0503){ /* ecdsa_secp384r1_sha384 */
-                        uint8_t h[48]; sha384_hash(cv_content,130,h);
+                        uint8_t h[48]; sha384_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==1 && leaf.pubkey_len==97)
                             cv_ok=ecdsa_p384_verify(h,48,cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
                     } else if(cv_algo==0x0804){ /* rsa_pss_rsae_sha256 */
-                        uint8_t h[32]; sha256_hash(cv_content,130,h);
+                        uint8_t h[32]; sha256_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
                             cv_ok=rsa_pss_verify_sha256(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     } else if(cv_algo==0x0805){ /* rsa_pss_rsae_sha384 */
-                        uint8_t h[48]; sha384_hash(cv_content,130,h);
+                        uint8_t h[48]; sha384_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
                             cv_ok=rsa_pss_verify_sha384(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     } else if(cv_algo==0x0401){ /* rsa_pkcs1_sha256 */
-                        uint8_t h[32]; sha256_hash(cv_content,130,h);
+                        uint8_t h[32]; sha256_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
                             cv_ok=rsa_pkcs1_verify_sha256(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     }
@@ -3049,28 +3151,41 @@ static void do_https_get(const char *host, int port, const char *path) {
                     printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",cv_algo);
                     got_cert_verify=1;
 
-                    sha256_update(&transcript,hs_buf+pos,msg_total);
+                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&transcript,hs_buf+pos,msg_total);
                     break;
                 }
                 case 20: { /* Finished */
                     if(!got_cert_verify) die("Server Finished without CertificateVerify");
                     printf("  Server Finished\n");
                     /* Verify server finished */
-                    uint8_t fin_key[32];
-                    hkdf_expand_label(s_hs_traffic,"finished",NULL,0,fin_key,32);
-                    uint8_t th_before_fin[32];
-                    { sha256_ctx tc=transcript; sha256_final(&tc,th_before_fin); }
-                    uint8_t expected[32];
-                    hmac_sha256(fin_key,32,th_before_fin,32,expected);
-                    if(!ct_memeq(expected,hs_buf+pos+4,32)) die("Server Finished verify failed!");
+                    uint8_t fin_key[48];
+                    if(is_aes256)
+                        hkdf_expand_label_384(s_hs_traffic,"finished",NULL,0,fin_key,48);
+                    else
+                        hkdf_expand_label(s_hs_traffic,"finished",NULL,0,fin_key,32);
+                    uint8_t th_before_fin[48];
+                    if(is_aes256) {
+                        sha384_ctx tc=transcript384; sha384_final(&tc,th_before_fin);
+                    } else {
+                        sha256_ctx tc=transcript; sha256_final(&tc,th_before_fin);
+                    }
+                    uint8_t expected[48];
+                    if(is_aes256)
+                        hmac_sha384(fin_key,48,th_before_fin,48,expected);
+                    else
+                        hmac_sha256(fin_key,32,th_before_fin,32,expected);
+                    if(!ct_memeq(expected,hs_buf+pos+4,hash_len)) die("Server Finished verify failed!");
                     printf("  Server Finished VERIFIED\n");
-                    sha256_update(&transcript,hs_buf+pos,msg_total);
+                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&transcript,hs_buf+pos,msg_total);
                     got_finished=1;
                     break;
                 }
                 default:
                     printf("  Unknown handshake msg type %d\n",mtype);
-                    sha256_update(&transcript,hs_buf+pos,msg_total);
+                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&transcript,hs_buf+pos,msg_total);
                     break;
             }
             pos+=msg_total;
@@ -3088,23 +3203,49 @@ static void do_https_get(const char *host, int port, const char *path) {
     }
 
     /* Derive application keys */
-    uint8_t th_sf[32]; { sha256_ctx tc=transcript; sha256_final(&tc,th_sf); }
+    uint8_t th_sf[48];
+    if(is_aes256) {
+        sha384_ctx tc=transcript384; sha384_final(&tc,th_sf);
+    } else {
+        sha256_ctx tc=transcript; sha256_final(&tc,th_sf);
+    }
 
-    uint8_t derived2[32];
-    { uint8_t empty_hash[32]; sha256_hash(NULL,0,empty_hash);
-      hkdf_expand_label(hs_secret,"derived",empty_hash,32,derived2,32); }
-    uint8_t master_secret[32];
-    { uint8_t z[32]={0}; hkdf_extract(derived2,32,z,32,master_secret); }
+    uint8_t derived2[48];
+    if(is_aes256) {
+        uint8_t empty_hash[48]; sha384_hash(NULL,0,empty_hash);
+        hkdf_expand_label_384(hs_secret,"derived",empty_hash,48,derived2,48);
+    } else {
+        uint8_t empty_hash[32]; sha256_hash(NULL,0,empty_hash);
+        hkdf_expand_label(hs_secret,"derived",empty_hash,32,derived2,32);
+    }
+    uint8_t master_secret[48];
+    if(is_aes256) {
+        uint8_t z[48]={0}; hkdf_extract_384(derived2,48,z,48,master_secret);
+    } else {
+        uint8_t z[32]={0}; hkdf_extract(derived2,32,z,32,master_secret);
+    }
 
-    uint8_t s_ap_traffic[32], c_ap_traffic[32];
-    hkdf_expand_label(master_secret,"s ap traffic",th_sf,32,s_ap_traffic,32);
-    hkdf_expand_label(master_secret,"c ap traffic",th_sf,32,c_ap_traffic,32);
+    uint8_t s_ap_traffic[48], c_ap_traffic[48];
+    if(is_aes256) {
+        hkdf_expand_label_384(master_secret,"s ap traffic",th_sf,48,s_ap_traffic,48);
+        hkdf_expand_label_384(master_secret,"c ap traffic",th_sf,48,c_ap_traffic,48);
+    } else {
+        hkdf_expand_label(master_secret,"s ap traffic",th_sf,32,s_ap_traffic,32);
+        hkdf_expand_label(master_secret,"c ap traffic",th_sf,32,c_ap_traffic,32);
+    }
 
-    uint8_t s_ap_key[16], s_ap_iv[12], c_ap_key[16], c_ap_iv[12];
-    hkdf_expand_label(s_ap_traffic,"key",NULL,0,s_ap_key,16);
-    hkdf_expand_label(s_ap_traffic,"iv",NULL,0,s_ap_iv,12);
-    hkdf_expand_label(c_ap_traffic,"key",NULL,0,c_ap_key,16);
-    hkdf_expand_label(c_ap_traffic,"iv",NULL,0,c_ap_iv,12);
+    uint8_t s_ap_key[32], s_ap_iv[12], c_ap_key[32], c_ap_iv[12];
+    if(is_aes256) {
+        hkdf_expand_label_384(s_ap_traffic,"key",NULL,0,s_ap_key,32);
+        hkdf_expand_label_384(s_ap_traffic,"iv",NULL,0,s_ap_iv,12);
+        hkdf_expand_label_384(c_ap_traffic,"key",NULL,0,c_ap_key,32);
+        hkdf_expand_label_384(c_ap_traffic,"iv",NULL,0,c_ap_iv,12);
+    } else {
+        hkdf_expand_label(s_ap_traffic,"key",NULL,0,s_ap_key,16);
+        hkdf_expand_label(s_ap_traffic,"iv",NULL,0,s_ap_iv,12);
+        hkdf_expand_label(c_ap_traffic,"key",NULL,0,c_ap_key,16);
+        hkdf_expand_label(c_ap_traffic,"iv",NULL,0,c_ap_iv,12);
+    }
     printf("Derived application traffic keys\n");
 
     /* Send client ChangeCipherSpec (compat) */
@@ -3112,14 +3253,20 @@ static void do_https_get(const char *host, int port, const char *path) {
 
     /* Send client Finished */
     {
-        uint8_t fin_key[32];
-        hkdf_expand_label(c_hs_traffic,"finished",NULL,0,fin_key,32);
-        uint8_t verify[32];
-        hmac_sha256(fin_key,32,th_sf,32,verify);
-        uint8_t fin_msg[36]; fin_msg[0]=0x14;
-        fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=32;
-        memcpy(fin_msg+4,verify,32);
-        encrypt_and_send(fd,0x16,fin_msg,36,c_hs_key,c_hs_iv,0);
+        uint8_t fin_key[48];
+        if(is_aes256)
+            hkdf_expand_label_384(c_hs_traffic,"finished",NULL,0,fin_key,48);
+        else
+            hkdf_expand_label(c_hs_traffic,"finished",NULL,0,fin_key,32);
+        uint8_t verify[48];
+        if(is_aes256)
+            hmac_sha384(fin_key,48,th_sf,48,verify);
+        else
+            hmac_sha256(fin_key,32,th_sf,32,verify);
+        uint8_t fin_msg[52]; fin_msg[0]=0x14;
+        fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=(uint8_t)hash_len;
+        memcpy(fin_msg+4,verify,hash_len);
+        encrypt_and_send(fd,0x16,fin_msg,4+hash_len,c_hs_key,c_hs_iv,0,is_aes256);
     }
     printf("Sent client Finished\n");
 
@@ -3129,7 +3276,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
-        encrypt_and_send(fd,0x17,(uint8_t*)req,rlen,c_ap_key,c_ap_iv,0);
+        encrypt_and_send(fd,0x17,(uint8_t*)req,rlen,c_ap_key,c_ap_iv,0,is_aes256);
         printf("Sent HTTP GET %s\n\n",path);
     }
 
@@ -3141,7 +3288,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         if(rtype<0) break;
         if(rtype==0x17) {
             uint8_t pt[32768]; size_t pt_len;
-            int inner=decrypt_record(rec,rec_len,s_ap_key,s_ap_iv,s_ap_seq++,pt,&pt_len);
+            int inner=decrypt_record(rec,rec_len,s_ap_key,s_ap_iv,s_ap_seq++,pt,&pt_len,is_aes256);
             if(inner==0x17) { /* application data */
                 fwrite(pt,1,pt_len,stdout);
             } else if(inner==0x15) { /* alert */
