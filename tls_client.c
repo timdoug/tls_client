@@ -1966,6 +1966,28 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
 /* ================================================================
  * Hostname Verification (SAN + CN fallback)
  * ================================================================ */
+static int dns_name_eq(const uint8_t *a, size_t alen, const char *b, size_t blen) {
+    if(alen!=blen) return 0;
+    for(size_t i=0;i<alen;i++){
+        uint8_t ca=a[i], cb=(uint8_t)b[i];
+        if(ca>='A'&&ca<='Z') ca+=32;
+        if(cb>='A'&&cb<='Z') cb+=32;
+        if(ca!=cb) return 0;
+    }
+    return 1;
+}
+
+static int wildcard_match(const uint8_t *pat, size_t plen, const char *hostname) {
+    /* pattern must be *.something.tld (at least 2 dots in pattern) */
+    if(plen<4||pat[0]!='*'||pat[1]!='.') return 0;
+    int dots=0;
+    for(size_t i=0;i<plen;i++) if(pat[i]=='.') dots++;
+    if(dots<2) return 0;
+    const char *dot=strchr(hostname,'.');
+    if(!dot) return 0;
+    return dns_name_eq(pat+2,plen-2,dot+1,strlen(dot+1));
+}
+
 static int verify_hostname(const x509_cert *cert, const char *hostname) {
     size_t hn_len=strlen(hostname);
     uint8_t tag; size_t len;
@@ -1979,12 +2001,8 @@ static int verify_hostname(const x509_cert *cert, const char *hostname) {
                 const uint8_t *val=der_read_tl(p,end,&tag,&len);
                 if(!val) break;
                 if(tag==0x82){ /* dNSName */
-                    if(len==hn_len&&memcmp(val,hostname,len)==0) return 1;
-                    if(len>2&&val[0]=='*'&&val[1]=='.'){
-                        const char *dot=strchr(hostname,'.');
-                        if(dot&&strlen(dot+1)==len-2&&memcmp(val+2,dot+1,len-2)==0)
-                            return 1;
-                    }
+                    if(dns_name_eq(val,len,hostname,hn_len)) return 1;
+                    if(wildcard_match(val,len,hostname)) return 1;
                 }
                 p=val+len;
             }
@@ -2008,7 +2026,7 @@ static int verify_hostname(const x509_cert *cert, const char *hostname) {
         if(!ov||tag!=0x06) continue;
         if(oid_eq(ov,len,OID_CN,sizeof(OID_CN))){
             const uint8_t *cv=der_read_tl(ov+len,seq_end,&tag,&len);
-            if(cv&&len==hn_len&&memcmp(cv,hostname,len)==0) return 1;
+            if(cv&&dns_name_eq(cv,len,hostname,hn_len)) return 1;
         }
     }
     return 0;
