@@ -319,37 +319,16 @@ static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
 
 static uint8_t xt(uint8_t x){return (x<<1)^((x>>7)*0x1b);}
 
-static void aes128_encrypt(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16]) {
+static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16]; memcpy(s,in,16);
     for(int i=0;i<16;i++) s[i]^=rk[i];
-    for (int r=1;r<=10;r++) {
+    for (int r=1;r<=nr;r++) {
         for(int i=0;i<16;i++) s[i]=ct_sbox(s[i]);
         uint8_t t;
         t=s[1];s[1]=s[5];s[5]=s[9];s[9]=s[13];s[13]=t;
         t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
         t=s[15];s[15]=s[11];s[11]=s[7];s[7]=s[3];s[3]=t;
-        if(r<10) {
-            for(int c=0;c<4;c++){
-                uint8_t *col=s+4*c, a0=col[0],a1=col[1],a2=col[2],a3=col[3];
-                col[0]=xt(a0)^xt(a1)^a1^a2^a3; col[1]=a0^xt(a1)^xt(a2)^a2^a3;
-                col[2]=a0^a1^xt(a2)^xt(a3)^a3; col[3]=xt(a0)^a0^a1^a2^xt(a3);
-            }
-        }
-        for(int i=0;i<16;i++) s[i]^=rk[16*r+i];
-    }
-    memcpy(out,s,16);
-}
-
-static void aes256_encrypt(const uint8_t rk[240], const uint8_t in[16], uint8_t out[16]) {
-    uint8_t s[16]; memcpy(s,in,16);
-    for(int i=0;i<16;i++) s[i]^=rk[i];
-    for (int r=1;r<=14;r++) {
-        for(int i=0;i<16;i++) s[i]=ct_sbox(s[i]);
-        uint8_t t;
-        t=s[1];s[1]=s[5];s[5]=s[9];s[9]=s[13];s[13]=t;
-        t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
-        t=s[15];s[15]=s[11];s[11]=s[7];s[7]=s[3];s[3]=t;
-        if(r<14) {
+        if(r<nr) {
             for(int c=0;c<4;c++){
                 uint8_t *col=s+4*c, a0=col[0],a1=col[1],a2=col[2],a3=col[3];
                 col[0]=xt(a0)^xt(a1)^a1^a2^a3; col[1]=a0^xt(a1)^xt(a2)^a2^a3;
@@ -393,79 +372,43 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t al,
 
 static void inc32(uint8_t ctr[16]){for(int i=15;i>=12;i--)if(++ctr[i])break;}
 
-static void aes_gcm_encrypt(const uint8_t key[16], const uint8_t nonce[12],
-                              const uint8_t *aad, size_t al,
-                              const uint8_t *pt, size_t pl,
-                              uint8_t *ct_out, uint8_t tag[16]) {
-    uint8_t rk[176]; aes128_expand(key,rk);
-    uint8_t hh[16]={0}; aes128_encrypt(rk,hh,hh);
+static void aes_gcm_encrypt_impl(const uint8_t *key, size_t key_len, const uint8_t nonce[12],
+                                   const uint8_t *aad, size_t al,
+                                   const uint8_t *pt, size_t pl,
+                                   uint8_t *ct_out, uint8_t tag[16]) {
+    uint8_t rk[240]; int nr;
+    if(key_len==AES256_KEY_LEN){aes256_expand(key,rk);nr=14;}
+    else{aes128_expand(key,rk);nr=10;}
+    uint8_t hh[16]={0}; aes_encrypt(rk,nr,hh,hh);
     uint8_t ctr[16]; memcpy(ctr,nonce,12); ctr[12]=ctr[13]=ctr[14]=0; ctr[15]=2;
     for(size_t i=0;i<pl;i+=16){
-        uint8_t ks[16]; aes128_encrypt(rk,ctr,ks); inc32(ctr);
+        uint8_t ks[16]; aes_encrypt(rk,nr,ctr,ks); inc32(ctr);
         size_t n=pl-i; if(n>16)n=16;
         for(size_t j=0;j<n;j++) ct_out[i+j]=pt[i+j]^ks[j];
     }
     ghash(hh,aad,al,ct_out,pl,tag);
     uint8_t j0[16]; memcpy(j0,nonce,12); j0[12]=j0[13]=j0[14]=0; j0[15]=1;
-    uint8_t ej0[16]; aes128_encrypt(rk,j0,ej0);
+    uint8_t ej0[16]; aes_encrypt(rk,nr,j0,ej0);
     for(int i=0;i<16;i++) tag[i]^=ej0[i];
 }
 
-static int aes_gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12],
-                            const uint8_t *aad, size_t al,
-                            const uint8_t *ct, size_t cl,
-                            uint8_t *pt, const uint8_t exp_tag[16]) {
-    uint8_t rk[176]; aes128_expand(key,rk);
-    uint8_t hh[16]={0}; aes128_encrypt(rk,hh,hh);
+static int aes_gcm_decrypt_impl(const uint8_t *key, size_t key_len, const uint8_t nonce[12],
+                                  const uint8_t *aad, size_t al,
+                                  const uint8_t *ct, size_t cl,
+                                  uint8_t *pt, const uint8_t exp_tag[16]) {
+    uint8_t rk[240]; int nr;
+    if(key_len==AES256_KEY_LEN){aes256_expand(key,rk);nr=14;}
+    else{aes128_expand(key,rk);nr=10;}
+    uint8_t hh[16]={0}; aes_encrypt(rk,nr,hh,hh);
     uint8_t tag[16];
     ghash(hh,aad,al,ct,cl,tag);
     uint8_t j0[16]; memcpy(j0,nonce,12); j0[12]=j0[13]=j0[14]=0; j0[15]=1;
-    uint8_t ej0[16]; aes128_encrypt(rk,j0,ej0);
+    uint8_t ej0[16]; aes_encrypt(rk,nr,j0,ej0);
     for(int i=0;i<16;i++) tag[i]^=ej0[i];
     if(!ct_memeq(tag,exp_tag,16)) return -1;
     uint8_t ctr[16]; memcpy(ctr,nonce,12); ctr[12]=ctr[13]=ctr[14]=0; ctr[15]=2;
     for(size_t i=0;i<cl;i+=16){
-        uint8_t ks[16]; aes128_encrypt(rk,ctr,ks); inc32(ctr);
-        size_t n=cl-i; if(n>16)n=16;
-        for(size_t j=0;j<n;j++) pt[i+j]=ct[i+j]^ks[j];
-    }
-    return 0;
-}
-
-/* AES-256-GCM */
-static void aes256_gcm_encrypt(const uint8_t key[32], const uint8_t nonce[12],
-                                const uint8_t *aad, size_t al,
-                                const uint8_t *pt, size_t pl,
-                                uint8_t *ct_out, uint8_t tag[16]) {
-    uint8_t rk[240]; aes256_expand(key,rk);
-    uint8_t hh[16]={0}; aes256_encrypt(rk,hh,hh);
-    uint8_t ctr[16]; memcpy(ctr,nonce,12); ctr[12]=ctr[13]=ctr[14]=0; ctr[15]=2;
-    for(size_t i=0;i<pl;i+=16){
-        uint8_t ks[16]; aes256_encrypt(rk,ctr,ks); inc32(ctr);
-        size_t n=pl-i; if(n>16)n=16;
-        for(size_t j=0;j<n;j++) ct_out[i+j]=pt[i+j]^ks[j];
-    }
-    ghash(hh,aad,al,ct_out,pl,tag);
-    uint8_t j0[16]; memcpy(j0,nonce,12); j0[12]=j0[13]=j0[14]=0; j0[15]=1;
-    uint8_t ej0[16]; aes256_encrypt(rk,j0,ej0);
-    for(int i=0;i<16;i++) tag[i]^=ej0[i];
-}
-
-static int aes256_gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
-                               const uint8_t *aad, size_t al,
-                               const uint8_t *ct, size_t cl,
-                               uint8_t *pt, const uint8_t exp_tag[16]) {
-    uint8_t rk[240]; aes256_expand(key,rk);
-    uint8_t hh[16]={0}; aes256_encrypt(rk,hh,hh);
-    uint8_t tag[16];
-    ghash(hh,aad,al,ct,cl,tag);
-    uint8_t j0[16]; memcpy(j0,nonce,12); j0[12]=j0[13]=j0[14]=0; j0[15]=1;
-    uint8_t ej0[16]; aes256_encrypt(rk,j0,ej0);
-    for(int i=0;i<16;i++) tag[i]^=ej0[i];
-    if(!ct_memeq(tag,exp_tag,16)) return -1;
-    uint8_t ctr[16]; memcpy(ctr,nonce,12); ctr[12]=ctr[13]=ctr[14]=0; ctr[15]=2;
-    for(size_t i=0;i<cl;i+=16){
-        uint8_t ks[16]; aes256_encrypt(rk,ctr,ks); inc32(ctr);
+        uint8_t ks[16]; aes_encrypt(rk,nr,ctr,ks); inc32(ctr);
         size_t n=cl-i; if(n>16)n=16;
         for(size_t j=0;j<n;j++) pt[i+j]=ct[i+j]^ks[j];
     }
@@ -2693,11 +2636,8 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
     uint8_t aad[5]={TLS_RT_APPDATA,(TLS_VERSION_12>>8),(TLS_VERSION_12&0xFF),0,0};
     PUT16(aad+3,(uint16_t)rec_len);
 
-    int r;
-    if(is_aes256)
-        r=aes256_gcm_decrypt(key,nonce,aad,5,rec,ct_len,pt,tag);
-    else
-        r=aes_gcm_decrypt(key,nonce,aad,5,rec,ct_len,pt,tag);
+    size_t kl=is_aes256?AES256_KEY_LEN:AES128_KEY_LEN;
+    int r=aes_gcm_decrypt_impl(key,kl,nonce,aad,5,rec,ct_len,pt,tag);
     if(r<0) die("AEAD decrypt failed");
 
     /* Find inner content type (last non-zero byte) */
@@ -2734,10 +2674,7 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
     uint8_t aad[5]={TLS_RT_APPDATA,(TLS_VERSION_12>>8),(TLS_VERSION_12&0xFF),0,0};
     PUT16(aad+3,(uint16_t)(ct_len+AES_GCM_TAG_LEN));
 
-    if(is_aes256)
-        aes256_gcm_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
-    else
-        aes_gcm_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
+    aes_gcm_encrypt_impl(key,is_aes256?AES256_KEY_LEN:AES128_KEY_LEN,nonce,aad,5,inner,ct_len,ct,tag);
     memcpy(ct+ct_len,tag,AES_GCM_TAG_LEN);
 
     tls_send_record(fd,TLS_RT_APPDATA,ct,ct_len+AES_GCM_TAG_LEN);
@@ -2770,10 +2707,7 @@ static void tls12_encrypt_and_send(int fd, uint8_t content_type,
     uint8_t *ct=malloc(len);
     if(!ct) die("malloc failed");
     uint8_t tag[AES_GCM_TAG_LEN];
-    if(key_len==AES256_KEY_LEN)
-        aes256_gcm_encrypt(write_key,nonce,aad,13,data,len,ct,tag);
-    else
-        aes_gcm_encrypt(write_key,nonce,aad,13,data,len,ct,tag);
+    aes_gcm_encrypt_impl(write_key,key_len,nonce,aad,13,data,len,ct,tag);
 
     size_t rec_len=8+len+AES_GCM_TAG_LEN;
     uint8_t *rec=malloc(rec_len);
@@ -2810,11 +2744,7 @@ static int tls12_decrypt_record(const uint8_t *rec, size_t rec_len,
     aad[9]=(TLS_VERSION_12>>8); aad[10]=(TLS_VERSION_12&0xFF);
     PUT16(aad+11,(uint16_t)ct_len);
 
-    int r;
-    if(key_len==AES256_KEY_LEN)
-        r=aes256_gcm_decrypt(read_key,nonce,aad,13,ct,ct_len,pt,tag);
-    else
-        r=aes_gcm_decrypt(read_key,nonce,aad,13,ct,ct_len,pt,tag);
+    int r=aes_gcm_decrypt_impl(read_key,key_len,nonce,aad,13,ct,ct_len,pt,tag);
     if(r<0) return -1;
     *pt_len=ct_len;
     return 0;
