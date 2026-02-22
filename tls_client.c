@@ -1,6 +1,7 @@
 /*
  * tls_client.c — TLS 1.2/1.3 HTTPS client from scratch in C.
- * Implements: SHA-256, SHA-384, HMAC, HKDF, AES-128/256-GCM, ECDHE-P256/P384, TLS 1.2/1.3
+ * Implements: SHA-256, SHA-384, HMAC, HKDF, AES-128/256-GCM, ChaCha20-Poly1305,
+ *             ECDHE-P256/P384, X25519, TLS 1.2/1.3
  * No external crypto libraries.
  *
  * Compile:  cc -O2 -o tls_client tls_client.c
@@ -53,8 +54,13 @@ typedef unsigned __int128 uint128_t;
 #define P384_SCALAR_LEN   48
 
 /* Named groups */
+#define TLS_GROUP_X25519    0x001D
 #define TLS_GROUP_SECP256R1 0x0017
 #define TLS_GROUP_SECP384R1 0x0018
+
+/* X25519 / ChaCha20-Poly1305 sizes */
+#define X25519_KEY_LEN            32
+#define CHACHA20_POLY1305_TAG_LEN 16
 
 /* Buffer sizes */
 #define CH_BUF_SIZE   1024
@@ -1470,6 +1476,379 @@ static void ecdhe_p256_shared_secret(const uint8_t priv[P256_SCALAR_LEN], const 
     fp256_to_bytes(secret,&sx);
 }
 
+/* ================================================================
+ * Curve25519 / X25519 Key Exchange
+ * Field: GF(2^255 - 19), 4×64-bit limbs (little-endian)
+ * ================================================================ */
+typedef struct { uint64_t v[4]; } fp25519;
+
+static const fp25519 FP25519_ZERO = {{0,0,0,0}};
+
+/* p = 2^255 - 19 */
+static const fp25519 FP25519_P = {{
+    0xFFFFFFFFFFFFFFED, 0xFFFFFFFFFFFFFFFF,
+    0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF
+}};
+
+static uint64_t fp25519_add_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    uint128_t c=0;
+    for(int i=0;i<4;i++){c+=(uint128_t)a->v[i]+b->v[i];r->v[i]=(uint64_t)c;c>>=64;}
+    return (uint64_t)c;
+}
+
+static uint64_t fp25519_sub_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    __int128 borrow=0;
+    for(int i=0;i<4;i++){borrow=(__int128)a->v[i]-b->v[i]+borrow;r->v[i]=(uint64_t)borrow;borrow>>=64;}
+    return (borrow<0)?1:0;
+}
+
+static void fp25519_add(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    uint64_t carry=fp25519_add_raw(r,a,b);
+    fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
+    uint64_t mask=-(uint64_t)(carry|(1-borrow));
+    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+}
+
+static void fp25519_sub(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    uint64_t borrow=fp25519_sub_raw(r,a,b);
+    fp25519 t; fp25519_add_raw(&t,r,&FP25519_P);
+    uint64_t mask=-(uint64_t)borrow;
+    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+}
+
+static void fp25519_mul(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    /* Schoolbook 4×4 → 8 limbs, reduce via 2^256 ≡ 38 (mod p) */
+    uint64_t w[8]; memset(w,0,sizeof(w));
+    for(int i=0;i<4;i++){
+        uint64_t carry=0;
+        for(int j=0;j<4;j++){
+            uint128_t p=(uint128_t)a->v[i]*b->v[j]+w[i+j]+carry;
+            w[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+        }
+        w[i+4]=carry;
+    }
+    /* Reduce: result = w[0..3] + w[4..7] * 38 */
+    uint128_t c=0;
+    for(int i=0;i<4;i++){
+        c+=(uint128_t)w[i]+(uint128_t)w[i+4]*38;
+        w[i]=(uint64_t)c; c>>=64;
+    }
+    /* Carry could be up to ~38, fold once more */
+    c*=38;
+    c+=(uint128_t)w[0]; w[0]=(uint64_t)c; c>>=64;
+    for(int i=1;i<4&&c;i++){c+=(uint128_t)w[i]; w[i]=(uint64_t)c; c>>=64;}
+    fp25519 res={{w[0],w[1],w[2],w[3]}};
+    /* Conditional subtraction of p */
+    fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,&res,&FP25519_P);
+    uint64_t mask=-(uint64_t)(1-borrow);
+    for(int i=0;i<4;i++) res.v[i]=(res.v[i]&~mask)|(t.v[i]&mask);
+    *r=res;
+}
+
+static void fp25519_sqr(fp25519 *r, const fp25519 *a){fp25519_mul(r,a,a);}
+
+static void fp25519_inv(fp25519 *r, const fp25519 *a) {
+    /* Fermat: a^(p-2) mod p, p-2 = 2^255 - 21 */
+    static const fp25519 pm2={{
+        0xFFFFFFFFFFFFFFEB, 0xFFFFFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF
+    }};
+    fp25519 result={{1,0,0,0}}, base=*a;
+    for(int i=0;i<255;i++){
+        if((pm2.v[i/64]>>(i%64))&1) fp25519_mul(&result,&result,&base);
+        fp25519_sqr(&base,&base);
+    }
+    *r=result;
+}
+
+static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
+    /* Multiply by a24 = (486662-2)/4 = 121665 per RFC 7748 */
+    uint128_t c=0;
+    for(int i=0;i<4;i++){
+        c+=(uint128_t)a->v[i]*121665; r->v[i]=(uint64_t)c; c>>=64;
+    }
+    /* Reduce carry: carry * 38 */
+    uint64_t hi=(uint64_t)c;
+    c=(uint128_t)r->v[0]+hi*38; r->v[0]=(uint64_t)c; c>>=64;
+    for(int i=1;i<4&&c;i++){c+=(uint128_t)r->v[i]; r->v[i]=(uint64_t)c; c>>=64;}
+    /* Conditional subtraction */
+    fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
+    uint64_t mask=-(uint64_t)(1-borrow);
+    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+}
+
+static void fp25519_cswap(fp25519 *a, fp25519 *b, uint64_t bit) {
+    uint64_t mask=-(uint64_t)bit;
+    for(int i=0;i<4;i++){
+        uint64_t d=mask&(a->v[i]^b->v[i]);
+        a->v[i]^=d; b->v[i]^=d;
+    }
+}
+
+/* Load 32 bytes little-endian into fp25519 */
+static void fp25519_from_le(fp25519 *r, const uint8_t b[32]) {
+    for(int i=0;i<4;i++){r->v[i]=0;for(int j=0;j<8;j++)r->v[i]|=(uint64_t)b[i*8+j]<<(8*j);}
+}
+
+/* Store fp25519 as 32 bytes little-endian. Fully reduces first. */
+static void fp25519_to_le(uint8_t b[32], const fp25519 *a) {
+    fp25519 t=*a;
+    /* Ensure fully reduced: subtract p if >= p (up to 2 times) */
+    for(int pass=0;pass<2;pass++){
+        fp25519 s; uint64_t borrow=fp25519_sub_raw(&s,&t,&FP25519_P);
+        uint64_t mask=-(uint64_t)(1-borrow);
+        for(int i=0;i<4;i++) t.v[i]=(t.v[i]&~mask)|(s.v[i]&mask);
+    }
+    for(int i=0;i<4;i++)for(int j=0;j<8;j++)b[i*8+j]=(t.v[i]>>(8*j))&0xFF;
+}
+
+/* X25519 Montgomery ladder (RFC 7748 §5) — x-coordinate only */
+static void x25519_scalar_mult(const uint8_t scalar[32], const uint8_t u_in[32], uint8_t u_out[32]) {
+    fp25519 u; fp25519_from_le(&u,u_in);
+    /* Clamp scalar */
+    uint8_t s[32]; memcpy(s,scalar,32);
+    s[0]&=248; s[31]&=127; s[31]|=64;
+    /* Montgomery ladder */
+    fp25519 x_2={{1,0,0,0}}, z_2=FP25519_ZERO;
+    fp25519 x_3=u, z_3={{1,0,0,0}};
+    uint64_t swap=0;
+    for(int t=254;t>=0;t--){
+        uint64_t kt=(s[t/8]>>(t%8))&1;
+        swap^=kt;
+        fp25519_cswap(&x_2,&x_3,swap);
+        fp25519_cswap(&z_2,&z_3,swap);
+        swap=kt;
+
+        fp25519 A,B,C,D,AA,BB,E,DA,CB;
+        fp25519_add(&A,&x_2,&z_2);
+        fp25519_sqr(&AA,&A);
+        fp25519_sub(&B,&x_2,&z_2);
+        fp25519_sqr(&BB,&B);
+        fp25519_sub(&E,&AA,&BB);
+        fp25519_add(&C,&x_3,&z_3);
+        fp25519_sub(&D,&x_3,&z_3);
+        fp25519_mul(&DA,&D,&A);
+        fp25519_mul(&CB,&C,&B);
+
+        fp25519 sum,diff;
+        fp25519_add(&sum,&DA,&CB);
+        fp25519_sqr(&x_3,&sum);
+        fp25519_sub(&diff,&DA,&CB);
+        fp25519_sqr(&z_3,&diff);
+        fp25519_mul(&z_3,&z_3,&u);
+
+        fp25519_mul(&x_2,&AA,&BB);
+        fp25519 a24e;
+        fp25519_mul_a24(&a24e,&E);
+        fp25519 t2; fp25519_add(&t2,&AA,&a24e);
+        fp25519_mul(&z_2,&E,&t2);
+    }
+    fp25519_cswap(&x_2,&x_3,swap);
+    fp25519_cswap(&z_2,&z_3,swap);
+    /* Result = x_2 / z_2 */
+    fp25519 inv_z; fp25519_inv(&inv_z,&z_2);
+    fp25519 result; fp25519_mul(&result,&x_2,&inv_z);
+    fp25519_to_le(u_out,&result);
+}
+
+static void x25519_keygen(uint8_t priv[X25519_KEY_LEN], uint8_t pub[X25519_KEY_LEN]) {
+    random_bytes(priv,X25519_KEY_LEN);
+    /* Basepoint u=9 */
+    uint8_t basepoint[32]={9};
+    x25519_scalar_mult(priv,basepoint,pub);
+}
+
+static int x25519_shared_secret(const uint8_t priv[X25519_KEY_LEN], const uint8_t peer[X25519_KEY_LEN], uint8_t out[X25519_KEY_LEN]) {
+    x25519_scalar_mult(priv,peer,out);
+    /* Check for all-zeros result (low-order point) */
+    uint8_t z=0; for(int i=0;i<32;i++) z|=out[i];
+    return z!=0 ? 0 : -1;
+}
+
+/* ================================================================
+ * ChaCha20 Stream Cipher (RFC 8439)
+ * ================================================================ */
+static uint32_t rotl32(uint32_t x, int n){return (x<<n)|(x>>(32-n));}
+
+#define QR(a,b,c,d) \
+    a+=b;d^=a;d=rotl32(d,16); \
+    c+=d;b^=c;b=rotl32(b,12); \
+    a+=b;d^=a;d=rotl32(d,8);  \
+    c+=d;b^=c;b=rotl32(b,7);
+
+static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter, uint8_t out[64]) {
+    uint32_t s[16];
+    s[0]=0x61707865; s[1]=0x3320646e; s[2]=0x79622d32; s[3]=0x6b206574;
+    for(int i=0;i<8;i++) s[4+i]=(uint32_t)key[4*i]|((uint32_t)key[4*i+1]<<8)|((uint32_t)key[4*i+2]<<16)|((uint32_t)key[4*i+3]<<24);
+    s[12]=counter;
+    for(int i=0;i<3;i++) s[13+i]=(uint32_t)nonce[4*i]|((uint32_t)nonce[4*i+1]<<8)|((uint32_t)nonce[4*i+2]<<16)|((uint32_t)nonce[4*i+3]<<24);
+    uint32_t w[16]; memcpy(w,s,64);
+    for(int i=0;i<10;i++){
+        QR(w[0],w[4],w[8],w[12])  QR(w[1],w[5],w[9],w[13])
+        QR(w[2],w[6],w[10],w[14]) QR(w[3],w[7],w[11],w[15])
+        QR(w[0],w[5],w[10],w[15]) QR(w[1],w[6],w[11],w[12])
+        QR(w[2],w[7],w[8],w[13])  QR(w[3],w[4],w[9],w[14])
+    }
+    for(int i=0;i<16;i++) w[i]+=s[i];
+    for(int i=0;i<16;i++){out[4*i]=(uint8_t)w[i];out[4*i+1]=(uint8_t)(w[i]>>8);out[4*i+2]=(uint8_t)(w[i]>>16);out[4*i+3]=(uint8_t)(w[i]>>24);}
+}
+
+static void chacha20_encrypt(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter,
+                              const uint8_t *in, size_t len, uint8_t *out) {
+    for(size_t off=0;off<len;off+=64){
+        uint8_t ks[64];
+        chacha20_block(key,nonce,counter++,ks);
+        size_t n=len-off; if(n>64) n=64;
+        for(size_t j=0;j<n;j++) out[off+j]=in[off+j]^ks[j];
+    }
+}
+
+/* ================================================================
+ * Poly1305 MAC (RFC 8439)
+ * Prime: p = 2^130 - 5.  Accumulator in 3×64-bit limbs.
+ * ================================================================ */
+static void poly1305_mac(const uint8_t key[32], const uint8_t *msg, size_t msg_len, uint8_t tag[16]) {
+    /* Clamp r */
+    uint64_t r0=0,r1=0;
+    for(int i=0;i<8;i++) r0|=(uint64_t)key[i]<<(8*i);
+    for(int i=0;i<8;i++) r1|=(uint64_t)key[8+i]<<(8*i);
+    r0&=0x0FFFFFFC0FFFFFFF; r1&=0x0FFFFFFC0FFFFFFC;
+    /* r as 3 limbs of 44/44/42 bits for schoolbook multiply with __uint128_t */
+    uint64_t rr0 = r0 & 0xFFFFFFFFFFF;
+    uint64_t rr1 = ((r0>>44)|(r1<<20)) & 0xFFFFFFFFFFF;
+    uint64_t rr2 = (r1>>24) & 0x3FFFFFFFFFF;
+
+    uint64_t h0=0,h1=0,h2=0;
+    /* Precompute 20*r limbs for modular reduction (2^130 ≡ 5 mod p, ×4 for limb alignment) */
+    uint64_t s1=20*rr1, s2=20*rr2;
+
+    for(size_t i=0;i<msg_len;i+=16){
+        /* Read up to 16 bytes of message block */
+        uint8_t blk[17]={0};
+        size_t n=msg_len-i; if(n>16) n=16;
+        memcpy(blk,msg+i,n);
+        blk[n]=1; /* pad byte */
+        /* Parse block as little-endian 130-bit number */
+        uint64_t t0=0,t1=0,t2=0;
+        for(int j=0;j<8&&j<(int)(n+1);j++) t0|=(uint64_t)blk[j]<<(8*j);
+        for(int j=0;j<8&&(j+8)<(int)(n+1);j++) t1|=(uint64_t)blk[8+j]<<(8*j);
+        if(n>=16) t2=(uint64_t)blk[16];
+        /* Split into 44-bit limbs */
+        uint64_t b0 = t0 & 0xFFFFFFFFFFF;
+        uint64_t b1 = ((t0>>44)|(t1<<20)) & 0xFFFFFFFFFFF;
+        uint64_t b2 = ((t1>>24)|(t2<<40)) & 0x3FFFFFFFFFF;
+
+        h0+=b0; h1+=b1; h2+=b2;
+
+        /* h = h * r mod p using 44-bit limbs */
+        uint128_t d0=(uint128_t)h0*rr0 + (uint128_t)h1*s2 + (uint128_t)h2*s1;
+        uint128_t d1=(uint128_t)h0*rr1 + (uint128_t)h1*rr0 + (uint128_t)h2*s2;
+        uint128_t d2=(uint128_t)h0*rr2 + (uint128_t)h1*rr1 + (uint128_t)h2*rr0;
+
+        /* Partial reduction / carry propagation */
+        uint64_t c0=(uint64_t)(d0>>44); h0=(uint64_t)d0 & 0xFFFFFFFFFFF;
+        d1+=c0;
+        uint64_t c1=(uint64_t)(d1>>44); h1=(uint64_t)d1 & 0xFFFFFFFFFFF;
+        d2+=c1;
+        uint64_t c2=(uint64_t)(d2>>42); h2=(uint64_t)d2 & 0x3FFFFFFFFFF;
+        h0+=c2*5;
+        uint64_t c3=h0>>44; h0&=0xFFFFFFFFFFF;
+        h1+=c3;
+    }
+    /* Final reduction */
+    uint64_t c4=h1>>44; h1&=0xFFFFFFFFFFF;
+    h2+=c4;
+    uint64_t c5=h2>>42; h2&=0x3FFFFFFFFFF;
+    h0+=c5*5;
+    uint64_t c6=h0>>44; h0&=0xFFFFFFFFFFF;
+    h1+=c6;
+
+    /* Compute h - p; keep if h >= p */
+    uint64_t g0=h0+5; uint64_t cg=g0>>44; g0&=0xFFFFFFFFFFF;
+    uint64_t g1=h1+cg; cg=g1>>44; g1&=0xFFFFFFFFFFF;
+    uint64_t g2=h2+cg-(1ULL<<42);
+    uint64_t mask2=-(g2>>63); /* if g2 < 0 (underflow), mask=0xFFF..., keep h; else keep g */
+    h0=(h0&mask2)|(g0&~mask2);
+    h1=(h1&mask2)|(g1&~mask2);
+    h2=(h2&mask2)|(g2&~mask2);
+
+    /* Convert back to 128-bit number */
+    uint64_t lo=h0|(h1<<44);
+    uint64_t hi=(h1>>20)|(h2<<24);
+
+    /* Add s (second half of key) */
+    uint64_t s_lo=0,s_hi=0;
+    for(int i=0;i<8;i++) s_lo|=(uint64_t)key[16+i]<<(8*i);
+    for(int i=0;i<8;i++) s_hi|=(uint64_t)key[24+i]<<(8*i);
+    uint128_t sum=(uint128_t)lo+s_lo;
+    lo=(uint64_t)sum;
+    sum=(uint128_t)hi+s_hi+(uint64_t)(sum>>64);
+    hi=(uint64_t)sum;
+
+    /* Output little-endian */
+    for(int i=0;i<8;i++){tag[i]=(lo>>(8*i))&0xFF; tag[8+i]=(hi>>(8*i))&0xFF;}
+}
+
+/* ================================================================
+ * ChaCha20-Poly1305 AEAD (RFC 8439)
+ * ================================================================ */
+static void chacha20_poly1305_encrypt(const uint8_t key[32], const uint8_t nonce[12],
+                                        const uint8_t *aad, size_t al,
+                                        const uint8_t *pt, size_t pl,
+                                        uint8_t *ct, uint8_t tag[16]) {
+    /* 1. Generate Poly1305 one-time key */
+    uint8_t poly_key[64];
+    chacha20_block(key,nonce,0,poly_key);
+    /* 2. Encrypt plaintext with counter starting at 1 */
+    chacha20_encrypt(key,nonce,1,pt,pl,ct);
+    /* 3. Construct MAC input and compute tag */
+    size_t apad=(16-(al%16))%16;
+    size_t cpad=(16-(pl%16))%16;
+    size_t mac_len=al+apad+pl+cpad+16;
+    uint8_t *mac_data=malloc(mac_len);
+    if(!mac_data) die("malloc failed");
+    size_t mp=0;
+    memcpy(mac_data+mp,aad,al); mp+=al;
+    memset(mac_data+mp,0,apad); mp+=apad;
+    memcpy(mac_data+mp,ct,pl); mp+=pl;
+    memset(mac_data+mp,0,cpad); mp+=cpad;
+    for(int i=0;i<8;i++) mac_data[mp++]=(al>>(8*i))&0xFF;
+    for(int i=0;i<8;i++) mac_data[mp++]=(pl>>(8*i))&0xFF;
+    poly1305_mac(poly_key,mac_data,mac_len,tag);
+    free(mac_data);
+    secure_zero(poly_key,sizeof(poly_key));
+}
+
+static int chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[12],
+                                       const uint8_t *aad, size_t al,
+                                       const uint8_t *ct, size_t cl,
+                                       uint8_t *pt, const uint8_t exp_tag[16]) {
+    /* 1. Generate Poly1305 one-time key */
+    uint8_t poly_key[64];
+    chacha20_block(key,nonce,0,poly_key);
+    /* 2. Verify tag first */
+    size_t apad=(16-(al%16))%16;
+    size_t cpad=(16-(cl%16))%16;
+    size_t mac_len=al+apad+cl+cpad+16;
+    uint8_t *mac_data=malloc(mac_len);
+    if(!mac_data) die("malloc failed");
+    size_t mp=0;
+    memcpy(mac_data+mp,aad,al); mp+=al;
+    memset(mac_data+mp,0,apad); mp+=apad;
+    memcpy(mac_data+mp,ct,cl); mp+=cl;
+    memset(mac_data+mp,0,cpad); mp+=cpad;
+    for(int i=0;i<8;i++) mac_data[mp++]=(al>>(8*i))&0xFF;
+    for(int i=0;i<8;i++) mac_data[mp++]=(cl>>(8*i))&0xFF;
+    uint8_t tag[16];
+    poly1305_mac(poly_key,mac_data,mac_len,tag);
+    free(mac_data);
+    secure_zero(poly_key,sizeof(poly_key));
+    if(!ct_memeq(tag,exp_tag,16)) return -1;
+    /* 3. Decrypt */
+    chacha20_encrypt(key,nonce,1,ct,cl,pt);
+    return 0;
+}
+
 /* OID constants */
 static const uint8_t OID_ECDSA_SHA384[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
 static const uint8_t OID_ECDSA_SHA256[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
@@ -2428,10 +2807,12 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
 }
 
 /* Build ClientHello for TLS 1.2/1.3.
-   only_group: 0 = emit both P-256 and P-384 key shares (initial CH),
-               TLS_GROUP_SECP256R1 = emit only P-256, TLS_GROUP_SECP384R1 = emit only P-384 (after HRR) */
+   only_group: 0 = emit all key shares (initial CH),
+               specific group = emit only that group's key share (after HRR) */
 static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT_LEN],
-                                  const uint8_t p384_pub[P384_POINT_LEN], const char *host,
+                                  const uint8_t p384_pub[P384_POINT_LEN],
+                                  const uint8_t x25519_pub[X25519_KEY_LEN],
+                                  const char *host,
                                   uint8_t client_random[32], uint16_t only_group) {
     size_t p=0;
     /* Handshake header - fill length later */
@@ -2450,10 +2831,13 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     buf[p++]=32;
     random_bytes(buf+p,32); p+=32;
 
-    /* Cipher suites: TLS 1.3 + TLS 1.2 GCM + CBC + SCSV */
-    buf[p++]=0x00; buf[p++]=0x1E; /* 30 bytes = 15 suites */
+    /* Cipher suites: TLS 1.3 + TLS 1.2 GCM + ChaCha20-Poly1305 + CBC + SCSV */
+    buf[p++]=0x00; buf[p++]=0x24; /* 36 bytes = 18 suites */
     buf[p++]=0x13; buf[p++]=0x01; /* TLS_AES_128_GCM_SHA256 */
     buf[p++]=0x13; buf[p++]=0x02; /* TLS_AES_256_GCM_SHA384 */
+    buf[p++]=0x13; buf[p++]=0x03; /* TLS_CHACHA20_POLY1305_SHA256 */
+    buf[p++]=0xCC; buf[p++]=0xA9; /* TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 */
+    buf[p++]=0xCC; buf[p++]=0xA8; /* TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2B; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2F; /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2C; /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
@@ -2494,8 +2878,9 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 
     /* supported_groups */
     buf[p++]=0x00;buf[p++]=0x0a;
-    buf[p++]=0x00;buf[p++]=0x06; /* ext len */
-    buf[p++]=0x00;buf[p++]=0x04; /* list len */
+    buf[p++]=0x00;buf[p++]=0x08; /* ext len */
+    buf[p++]=0x00;buf[p++]=0x06; /* list len = 3 groups * 2 bytes */
+    buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF); /* x25519 (preferred) */
     buf[p++]=(TLS_GROUP_SECP256R1>>8);buf[p++]=(TLS_GROUP_SECP256R1&0xFF); /* secp256r1 */
     buf[p++]=(TLS_GROUP_SECP384R1>>8);buf[p++]=(TLS_GROUP_SECP384R1&0xFF); /* secp384r1 */
 
@@ -2524,9 +2909,20 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
         buf[p++]=(TLS_GROUP_SECP384R1>>8);buf[p++]=(TLS_GROUP_SECP384R1&0xFF);
         PUT16(buf+p,P384_POINT_LEN);p+=2;
         memcpy(buf+p,p384_pub,P384_POINT_LEN);p+=P384_POINT_LEN;
+    } else if(only_group==TLS_GROUP_X25519) {
+        PUT16(buf+p,(uint16_t)(X25519_KEY_LEN+4+2));p+=2;
+        PUT16(buf+p,(uint16_t)(X25519_KEY_LEN+4));p+=2;
+        buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF);
+        PUT16(buf+p,X25519_KEY_LEN);p+=2;
+        memcpy(buf+p,x25519_pub,X25519_KEY_LEN);p+=X25519_KEY_LEN;
     } else {
-        PUT16(buf+p,(uint16_t)(P256_POINT_LEN+4+P384_POINT_LEN+4+2));p+=2;
-        PUT16(buf+p,(uint16_t)(P256_POINT_LEN+4+P384_POINT_LEN+4));p+=2;
+        /* Emit X25519 first (most preferred), then P-256, then P-384 */
+        uint16_t shares_len=X25519_KEY_LEN+4+P256_POINT_LEN+4+P384_POINT_LEN+4;
+        PUT16(buf+p,(uint16_t)(shares_len+2));p+=2;
+        PUT16(buf+p,shares_len);p+=2;
+        buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF);
+        PUT16(buf+p,X25519_KEY_LEN);p+=2;
+        memcpy(buf+p,x25519_pub,X25519_KEY_LEN);p+=X25519_KEY_LEN;
         buf[p++]=(TLS_GROUP_SECP256R1>>8);buf[p++]=(TLS_GROUP_SECP256R1&0xFF);
         PUT16(buf+p,P256_POINT_LEN);p+=2;
         memcpy(buf+p,p256_pub,P256_POINT_LEN);p+=P256_POINT_LEN;
@@ -2587,7 +2983,7 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     if(b+2>sh_end) die("ServerHello truncated at cipher suite");
     uint16_t cs=GET16(b); b+=2;
     *cipher_suite_out=cs;
-    if(cs!=0x1301 && cs!=0x1302 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 && cs!=0x009D && cs!=0x009C && cs!=0xC014 && cs!=0xC013 && cs!=0x0035 && cs!=0x002F && cs!=0xC00A && cs!=0xC009) {
+    if(cs!=0x1301 && cs!=0x1302 && cs!=0x1303 && cs!=0xCCA9 && cs!=0xCCA8 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 && cs!=0x009D && cs!=0x009C && cs!=0xC014 && cs!=0xC013 && cs!=0x0035 && cs!=0x002F && cs!=0xC00A && cs!=0xC009) {
         fprintf(stderr,"cipher suite 0x%04x\n",cs);
         die("unexpected cipher suite");
     }
@@ -2608,7 +3004,10 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
             if(etype==0x0033 && elen>=4) { /* key_share */
                 uint16_t group=GET16(b);
                 uint16_t klen=GET16(b+2);
-                if(group==TLS_GROUP_SECP256R1 && klen==P256_POINT_LEN && elen>=4+P256_POINT_LEN) {
+                if(group==TLS_GROUP_X25519 && klen==X25519_KEY_LEN && elen>=4+X25519_KEY_LEN) {
+                    memcpy(server_pub,b+4,X25519_KEY_LEN);
+                    *pub_len=X25519_KEY_LEN;
+                } else if(group==TLS_GROUP_SECP256R1 && klen==P256_POINT_LEN && elen>=4+P256_POINT_LEN) {
                     memcpy(server_pub,b+4,P256_POINT_LEN);
                     *pub_len=P256_POINT_LEN;
                 } else if(group==TLS_GROUP_SECP384R1 && klen==P384_POINT_LEN && elen>=4+P384_POINT_LEN) {
@@ -2638,10 +3037,10 @@ static void make_nonce(uint8_t nonce[AES_GCM_NONCE_LEN], const uint8_t iv[AES_GC
 static int decrypt_record(const uint8_t *rec, size_t rec_len,
                            const uint8_t *key, const uint8_t iv[AES_GCM_NONCE_LEN],
                            uint64_t seq, uint8_t *pt, size_t *pt_len,
-                           int is_aes256) {
+                           int is_aes256, int is_chacha) {
     if(seq==UINT64_MAX) die("sequence number overflow");
-    if(rec_len<AES_GCM_TAG_LEN+1) die("encrypted record too short");
-    size_t ct_len=rec_len-AES_GCM_TAG_LEN;
+    if(rec_len<16+1) die("encrypted record too short");
+    size_t ct_len=rec_len-16; /* both GCM and ChaCha20-Poly1305 use 16-byte tags */
     const uint8_t *tag=rec+ct_len;
 
     uint8_t nonce[AES_GCM_NONCE_LEN];
@@ -2651,8 +3050,13 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
     uint8_t aad[5]={TLS_RT_APPDATA,(TLS_VERSION_12>>8),(TLS_VERSION_12&0xFF),0,0};
     PUT16(aad+3,(uint16_t)rec_len);
 
-    size_t kl=is_aes256?AES256_KEY_LEN:AES128_KEY_LEN;
-    int r=aes_gcm_decrypt_impl(key,kl,nonce,aad,5,rec,ct_len,pt,tag);
+    int r;
+    if(is_chacha)
+        r=chacha20_poly1305_decrypt(key,nonce,aad,5,rec,ct_len,pt,tag);
+    else {
+        size_t kl=is_aes256?AES256_KEY_LEN:AES128_KEY_LEN;
+        r=aes_gcm_decrypt_impl(key,kl,nonce,aad,5,rec,ct_len,pt,tag);
+    }
     if(r<0) die("AEAD decrypt failed");
 
     /* Find inner content type (last non-zero byte) */
@@ -2669,7 +3073,7 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
 static void encrypt_and_send(int fd, uint8_t inner_type,
                               const uint8_t *data, size_t len,
                               const uint8_t *key, const uint8_t iv[AES_GCM_NONCE_LEN],
-                              uint64_t seq, int is_aes256) {
+                              uint64_t seq, int is_aes256, int is_chacha) {
     if(seq==UINT64_MAX) die("sequence number overflow");
     /* Build inner plaintext: data + content_type */
     if(len>16384) die("TLS 1.3 record too large to encrypt");
@@ -2682,17 +3086,20 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
     make_nonce(nonce,iv,seq);
 
     size_t ct_len=len+1;
-    uint8_t *ct=malloc(ct_len+AES_GCM_TAG_LEN);
+    uint8_t *ct=malloc(ct_len+16);
     if(!ct) die("malloc failed");
-    uint8_t tag[AES_GCM_TAG_LEN];
+    uint8_t tag[16];
 
     uint8_t aad[5]={TLS_RT_APPDATA,(TLS_VERSION_12>>8),(TLS_VERSION_12&0xFF),0,0};
-    PUT16(aad+3,(uint16_t)(ct_len+AES_GCM_TAG_LEN));
+    PUT16(aad+3,(uint16_t)(ct_len+16));
 
-    aes_gcm_encrypt_impl(key,is_aes256?AES256_KEY_LEN:AES128_KEY_LEN,nonce,aad,5,inner,ct_len,ct,tag);
-    memcpy(ct+ct_len,tag,AES_GCM_TAG_LEN);
+    if(is_chacha)
+        chacha20_poly1305_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
+    else
+        aes_gcm_encrypt_impl(key,is_aes256?AES256_KEY_LEN:AES128_KEY_LEN,nonce,aad,5,inner,ct_len,ct,tag);
+    memcpy(ct+ct_len,tag,16);
 
-    tls_send_record(fd,TLS_RT_APPDATA,ct,ct_len+AES_GCM_TAG_LEN);
+    tls_send_record(fd,TLS_RT_APPDATA,ct,ct_len+16);
     free(inner); free(ct);
 }
 
@@ -2895,6 +3302,70 @@ static int tls12_decrypt_record_cbc(const uint8_t *rec, size_t rec_len,
 }
 
 /* ================================================================
+ * TLS 1.2 ChaCha20-Poly1305 Record Encrypt / Decrypt
+ * Nonce: implicit IV(12) XOR padded seq (same as TLS 1.3)
+ * AAD: seq(8) || type(1) || version(2) || plaintext_len(2)
+ * Record body: ciphertext || tag(16), NO explicit nonce prefix
+ * ================================================================ */
+static void tls12_encrypt_and_send_chacha(int fd, uint8_t content_type,
+                                            const uint8_t *data, size_t len,
+                                            const uint8_t *write_key,
+                                            const uint8_t write_iv[12],
+                                            uint64_t seq) {
+    if(seq==UINT64_MAX) die("sequence number overflow");
+    uint8_t nonce[12];
+    memcpy(nonce,write_iv,12);
+    for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
+
+    uint8_t aad[13];
+    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
+    aad[8]=content_type;
+    aad[9]=(TLS_VERSION_12>>8); aad[10]=(TLS_VERSION_12&0xFF);
+    PUT16(aad+11,(uint16_t)len);
+
+    if(len>16384) die("TLS 1.2 ChaCha record too large");
+    uint8_t *ct=malloc(len);
+    if(!ct) die("malloc failed");
+    uint8_t tag[CHACHA20_POLY1305_TAG_LEN];
+    chacha20_poly1305_encrypt(write_key,nonce,aad,13,data,len,ct,tag);
+
+    size_t rec_len=len+CHACHA20_POLY1305_TAG_LEN;
+    uint8_t *rec=malloc(rec_len);
+    if(!rec) die("malloc failed");
+    memcpy(rec,ct,len);
+    memcpy(rec+len,tag,CHACHA20_POLY1305_TAG_LEN);
+    tls_send_record(fd,content_type,rec,rec_len);
+    free(ct); free(rec);
+}
+
+static int tls12_decrypt_record_chacha(const uint8_t *rec, size_t rec_len,
+                                         uint8_t content_type,
+                                         const uint8_t *read_key,
+                                         const uint8_t read_iv[12],
+                                         uint64_t seq,
+                                         uint8_t *pt, size_t *pt_len) {
+    if(seq==UINT64_MAX) return -1;
+    if(rec_len<CHACHA20_POLY1305_TAG_LEN) return -1;
+    size_t ct_len=rec_len-CHACHA20_POLY1305_TAG_LEN;
+    const uint8_t *tag=rec+ct_len;
+
+    uint8_t nonce[12];
+    memcpy(nonce,read_iv,12);
+    for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
+
+    uint8_t aad[13];
+    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
+    aad[8]=content_type;
+    aad[9]=(TLS_VERSION_12>>8); aad[10]=(TLS_VERSION_12&0xFF);
+    PUT16(aad+11,(uint16_t)ct_len);
+
+    int r=chacha20_poly1305_decrypt(read_key,nonce,aad,13,rec,ct_len,pt,tag);
+    if(r<0) return -1;
+    *pt_len=ct_len;
+    return 0;
+}
+
+/* ================================================================
  * Connection context for TLS handshake dispatch
  * ================================================================ */
 typedef struct {
@@ -2903,6 +3374,7 @@ typedef struct {
     uint8_t client_random[32], server_random[32];
     uint8_t p256_priv[P256_SCALAR_LEN], p256_pub[P256_POINT_LEN];
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
+    uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub[X25519_KEY_LEN];
     uint8_t server_pub[P384_POINT_LEN]; size_t server_pub_len;
     uint16_t cipher_suite;
     sha256_ctx transcript;
@@ -2931,10 +3403,15 @@ static void tls12_handshake(tls_conn *conn) {
     sha256_ctx transcript = conn->transcript;
     sha384_ctx transcript384 = conn->transcript384;
 
+    uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub[X25519_KEY_LEN];
+    memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
+    memcpy(x25519_pub, conn->x25519_pub, X25519_KEY_LEN);
+
     int is_rsa_kex = (cipher_suite==0x009D || cipher_suite==0x009C || cipher_suite==0x0035 || cipher_suite==0x002F);
     int is_cbc = (cipher_suite==0xC014 || cipher_suite==0xC013 || cipher_suite==0x0035 || cipher_suite==0x002F || cipher_suite==0xC00A || cipher_suite==0xC009);
-    printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s)\n",cipher_suite,
-           is_rsa_kex?" RSA-kex":"", is_cbc?" CBC":"");
+    int is_chacha = (cipher_suite==0xCCA8 || cipher_suite==0xCCA9);
+    printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
+           is_rsa_kex?" RSA-kex":"", is_cbc?" CBC":"", is_chacha?" ChaCha20":"");
 
     /* Read plaintext handshake messages */
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
@@ -2985,7 +3462,9 @@ static void tls12_handshake(tls_conn *conn) {
                     if(ske[0]!=0x03) die("expected named_curve type in SKE");
                     ske_curve=GET16(ske+1);
                     uint8_t pk_len=ske[3];
-                    if(ske_curve==TLS_GROUP_SECP256R1) {
+                    if(ske_curve==TLS_GROUP_X25519) {
+                        if(pk_len!=X25519_KEY_LEN) die("expected 32-byte X25519 key");
+                    } else if(ske_curve==TLS_GROUP_SECP256R1) {
                         if(pk_len!=P256_POINT_LEN) die("expected uncompressed P-256 point");
                     } else if(ske_curve==TLS_GROUP_SECP384R1) {
                         if(pk_len!=P384_POINT_LEN) die("expected uncompressed P-384 point");
@@ -3124,6 +3603,16 @@ static void tls12_handshake(tls_conn *conn) {
         ss12_len=48;
         secure_zero(pms,sizeof(pms));
         printf("Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",enc_len);
+    } else if(ske_curve==TLS_GROUP_X25519) {
+        uint8_t cke[5+X25519_KEY_LEN];
+        cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=X25519_KEY_LEN+1; cke[4]=X25519_KEY_LEN;
+        memcpy(cke+5, x25519_pub, X25519_KEY_LEN);
+        tls_send_record(fd,TLS_RT_HANDSHAKE,cke,sizeof(cke));
+        sha256_update(&transcript, cke, sizeof(cke));
+        sha384_update(&transcript384, cke, sizeof(cke));
+        if(x25519_shared_secret(x25519_priv, ske_pubkey, ss12)<0) die("X25519 shared secret is zero");
+        ss12_len=X25519_KEY_LEN;
+        printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (X25519)\n");
     } else if(ske_curve==TLS_GROUP_SECP256R1) {
         uint8_t cke[5+P256_POINT_LEN];
         cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=P256_POINT_LEN+1; cke[4]=P256_POINT_LEN;
@@ -3147,15 +3636,21 @@ static void tls12_handshake(tls_conn *conn) {
     }
     secure_zero(p256_priv,sizeof(p256_priv));
     secure_zero(p384_priv,sizeof(p384_priv));
+    secure_zero(x25519_priv,sizeof(x25519_priv));
 
     /* TLS 1.2 key derivation */
     int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D || cipher_suite==0xC014 || cipher_suite==0x0035 || cipher_suite==0xC00A);
-    /* PRF hash: 0x009D (GCM-SHA384) uses SHA-384, 0xC014 (CBC-SHA) uses SHA-256 (default TLS 1.2 PRF) */
+    /* PRF hash: 0x009D (GCM-SHA384) uses SHA-384, ChaCha20 suites use SHA-256 */
     int prf_is_sha384 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D);
     const hash_alg *alg = prf_is_sha384 ? &SHA384_ALG : &SHA256_ALG;
-    size_t key_len = is_aes256 ? AES256_KEY_LEN : AES128_KEY_LEN;
+    size_t key_len;
+    if(is_chacha) key_len=32;
+    else key_len = is_aes256 ? AES256_KEY_LEN : AES128_KEY_LEN;
     size_t mac_key_len = is_cbc ? SHA1_DIGEST_LEN : 0;
-    size_t iv_len = is_cbc ? 16 : 4;
+    size_t iv_len;
+    if(is_cbc) iv_len=16;
+    else if(is_chacha) iv_len=12;
+    else iv_len=4; /* GCM implicit nonce */
     const hash_alg *mac_alg = is_cbc ? &SHA1_ALG : NULL;
 
     uint8_t pms_seed[64];
@@ -3210,6 +3705,8 @@ static void tls12_handshake(tls_conn *conn) {
 
         if(is_cbc)
             tls12_encrypt_and_send_cbc(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, key_len, c_mk, mac_key_len, mac_alg, 0);
+        else if(is_chacha)
+            tls12_encrypt_and_send_chacha(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, c_wiv, 0);
         else
             tls12_encrypt_and_send(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, c_wiv, 0, key_len);
         sha256_update(&transcript, fin_msg, 16);
@@ -3230,6 +3727,8 @@ static void tls12_handshake(tls_conn *conn) {
         int dec_ok;
         if(is_cbc)
             dec_ok=tls12_decrypt_record_cbc(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, key_len, s_mk, mac_key_len, mac_alg, 0, pt12, &pt12_len);
+        else if(is_chacha)
+            dec_ok=tls12_decrypt_record_chacha(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, s_wiv, 0, pt12, &pt12_len);
         else
             dec_ok=tls12_decrypt_record(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, s_wiv, 0, pt12, &pt12_len, key_len);
         if(dec_ok<0) die("Failed to decrypt server Finished");
@@ -3260,6 +3759,8 @@ static void tls12_handshake(tls_conn *conn) {
             path,host);
         if(is_cbc)
             tls12_encrypt_and_send_cbc(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++);
+        else if(is_chacha)
+            tls12_encrypt_and_send_chacha(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++);
         else
             tls12_encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++,key_len);
         printf("Sent HTTP GET %s\n\n",path);
@@ -3276,6 +3777,8 @@ static void tls12_handshake(tls_conn *conn) {
             int dec_ok2;
             if(is_cbc)
                 dec_ok2=tls12_decrypt_record_cbc(rec,rec_len,TLS_RT_APPDATA,s_wk,key_len,s_mk,mac_key_len,mac_alg,s12_seq++,pt12,&pt12_len);
+            else if(is_chacha)
+                dec_ok2=tls12_decrypt_record_chacha(rec,rec_len,TLS_RT_APPDATA,s_wk,s_wiv,s12_seq++,pt12,&pt12_len);
             else
                 dec_ok2=tls12_decrypt_record(rec,rec_len,TLS_RT_APPDATA,s_wk,s_wiv,s12_seq++,pt12,&pt12_len,key_len);
             if(dec_ok2<0) {
@@ -3293,6 +3796,8 @@ static void tls12_handshake(tls_conn *conn) {
     /* Send close_notify */
     if(is_cbc)
         { uint8_t alert[2]={1,0}; tls12_encrypt_and_send_cbc(fd,TLS_RT_ALERT,alert,2,c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++); }
+    else if(is_chacha)
+        { uint8_t alert[2]={1,0}; tls12_encrypt_and_send_chacha(fd,TLS_RT_ALERT,alert,2,c_wk,c_wiv,c12_seq++); }
     else
         { uint8_t alert[2]={1,0}; tls12_encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_wk,c_wiv,c12_seq++,key_len); }
     printf("\n=== Done ===\n");
@@ -3308,6 +3813,7 @@ static void tls12_handshake(tls_conn *conn) {
     secure_zero(c_mk,sizeof(c_mk)); secure_zero(s_mk,sizeof(s_mk));
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(p256_priv,sizeof(p256_priv));
+    secure_zero(x25519_priv,sizeof(x25519_priv));
     close(fd);
 }
 
@@ -3325,19 +3831,28 @@ static void tls13_handshake(tls_conn *conn) {
     uint8_t p256_priv[P256_SCALAR_LEN], p384_priv[P384_SCALAR_LEN];
     memcpy(p256_priv, conn->p256_priv, P256_SCALAR_LEN);
     memcpy(p384_priv, conn->p384_priv, P384_SCALAR_LEN);
+    uint8_t x25519_priv[X25519_KEY_LEN];
+    memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
     sha256_ctx transcript = conn->transcript;
     sha384_ctx transcript384 = conn->transcript384;
 
     int is_aes256 = (cipher_suite == 0x1302);
+    int is_chacha = (cipher_suite == 0x1303);
     const hash_alg *alg = is_aes256 ? &SHA384_ALG : &SHA256_ALG;
     size_t hash_len = alg->digest_len;
 
-    uint16_t selected_group = (server_pub_len==P256_POINT_LEN) ? TLS_GROUP_SECP256R1 : TLS_GROUP_SECP384R1;
+    uint16_t selected_group;
+    if(server_pub_len==X25519_KEY_LEN) selected_group=TLS_GROUP_X25519;
+    else if(server_pub_len==P256_POINT_LEN) selected_group=TLS_GROUP_SECP256R1;
+    else selected_group=TLS_GROUP_SECP384R1;
     printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",cipher_suite,selected_group);
 
     /* Compute shared secret based on negotiated group */
     uint8_t shared[P384_SCALAR_LEN]; size_t shared_len;
-    if(selected_group==TLS_GROUP_SECP256R1) {
+    if(selected_group==TLS_GROUP_X25519) {
+        if(x25519_shared_secret(x25519_priv,server_pub,shared)<0) die("X25519 shared secret is zero");
+        shared_len=X25519_KEY_LEN;
+    } else if(selected_group==TLS_GROUP_SECP256R1) {
         uint8_t ss[P256_SCALAR_LEN];
         ecdhe_p256_shared_secret(p256_priv,server_pub,ss);
         memcpy(shared,ss,P256_SCALAR_LEN);
@@ -3349,6 +3864,7 @@ static void tls13_handshake(tls_conn *conn) {
     }
     secure_zero(p256_priv,sizeof(p256_priv));
     secure_zero(p384_priv,sizeof(p384_priv));
+    secure_zero(x25519_priv,sizeof(x25519_priv));
     printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Derive handshake keys */
@@ -3371,7 +3887,7 @@ static void tls13_handshake(tls_conn *conn) {
     hkdf_expand_label_u(alg,hs_secret,"s hs traffic",th1,alg->digest_len,s_hs_traffic,alg->digest_len);
     hkdf_expand_label_u(alg,hs_secret,"c hs traffic",th1,alg->digest_len,c_hs_traffic,alg->digest_len);
 
-    size_t kl = is_aes256 ? AES256_KEY_LEN : AES128_KEY_LEN;
+    size_t kl = is_aes256 ? AES256_KEY_LEN : (is_chacha ? 32 : AES128_KEY_LEN);
     uint8_t s_hs_key[AES256_KEY_LEN], s_hs_iv[AES_GCM_NONCE_LEN], c_hs_key[AES256_KEY_LEN], c_hs_iv[AES_GCM_NONCE_LEN];
     hkdf_expand_label_u(alg,s_hs_traffic,"key",NULL,0,s_hs_key,kl);
     hkdf_expand_label_u(alg,s_hs_traffic,"iv",NULL,0,s_hs_iv,AES_GCM_NONCE_LEN);
@@ -3397,7 +3913,7 @@ static void tls13_handshake(tls_conn *conn) {
     while(!got_finished) {
         if(rtype!=TLS_RT_APPDATA) die("expected encrypted record");
         uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
-        int inner=decrypt_record(rec,rec_len,s_hs_key,s_hs_iv,s_hs_seq++,pt,&pt_len,is_aes256);
+        int inner=decrypt_record(rec,rec_len,s_hs_key,s_hs_iv,s_hs_seq++,pt,&pt_len,is_aes256,is_chacha);
         if(inner!=TLS_RT_HANDSHAKE) die("expected handshake inside encrypted record");
 
         /* Append to handshake buffer */
@@ -3588,7 +4104,7 @@ static void tls13_handshake(tls_conn *conn) {
         cert_msg[1]=0; cert_msg[2]=0; cert_msg[3]=4; /* length = 4 */
         cert_msg[4]=0; /* certificate_request_context length = 0 */
         cert_msg[5]=0; cert_msg[6]=0; cert_msg[7]=0; /* certificate_list length = 0 */
-        encrypt_and_send(fd,TLS_RT_HANDSHAKE,cert_msg,8,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256);
+        encrypt_and_send(fd,TLS_RT_HANDSHAKE,cert_msg,8,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
         if(is_aes256) sha384_update(&transcript384,cert_msg,8);
         else sha256_update(&transcript,cert_msg,8);
         printf("Sent empty client Certificate\n");
@@ -3610,7 +4126,7 @@ static void tls13_handshake(tls_conn *conn) {
         uint8_t fin_msg[52]; fin_msg[0]=0x14;
         fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=(uint8_t)hash_len;
         memcpy(fin_msg+4,verify,hash_len);
-        encrypt_and_send(fd,TLS_RT_HANDSHAKE,fin_msg,4+hash_len,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256);
+        encrypt_and_send(fd,TLS_RT_HANDSHAKE,fin_msg,4+hash_len,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
     }
     printf("Sent client Finished\n");
 
@@ -3621,7 +4137,7 @@ static void tls13_handshake(tls_conn *conn) {
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
-        encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256);
+        encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
         printf("Sent HTTP GET %s\n\n",path);
     }
 
@@ -3633,7 +4149,7 @@ static void tls13_handshake(tls_conn *conn) {
         if(rtype<0) break;
         if(rtype==TLS_RT_APPDATA) {
             uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
-            int inner=decrypt_record(rec,rec_len,s_ap_key,s_ap_iv,s_ap_seq++,pt,&pt_len,is_aes256);
+            int inner=decrypt_record(rec,rec_len,s_ap_key,s_ap_iv,s_ap_seq++,pt,&pt_len,is_aes256,is_chacha);
             if(inner==TLS_RT_APPDATA) { /* application data */
                 fwrite(pt,1,pt_len,stdout);
             } else if(inner==TLS_RT_ALERT) { /* alert */
@@ -3657,7 +4173,7 @@ static void tls13_handshake(tls_conn *conn) {
                     if(request_update==1) {
                         /* Send KeyUpdate(update_not_requested) with current client keys */
                         uint8_t ku_msg[5]={24,0,0,1,0};
-                        encrypt_and_send(fd,TLS_RT_HANDSHAKE,ku_msg,5,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256);
+                        encrypt_and_send(fd,TLS_RT_HANDSHAKE,ku_msg,5,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
                         /* Derive new client traffic secret */
                         {
                             uint8_t new_c[SHA384_DIGEST_LEN];
@@ -3678,11 +4194,12 @@ static void tls13_handshake(tls_conn *conn) {
         }
     }
     /* Send close_notify */
-    { uint8_t alert[2]={1,0}; encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_ap_key,c_ap_iv,c_ap_seq,is_aes256); }
+    { uint8_t alert[2]={1,0}; encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_ap_key,c_ap_iv,c_ap_seq,is_aes256,is_chacha); }
     printf("\n=== Done ===\n");
     free(saved_cert_msg);
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(p256_priv,sizeof(p256_priv));
+    secure_zero(x25519_priv,sizeof(x25519_priv));
     secure_zero(shared,sizeof(shared));
     secure_zero(early_secret,sizeof(early_secret));
     secure_zero(derived1,sizeof(derived1));
@@ -3705,17 +4222,19 @@ static void do_https_get(const char *host, int port, const char *path) {
     int fd=tcp_connect(host,port);
     printf("Connected to %s:%d\n",host,port);
 
-    /* Generate ECDHE keypairs for both curves */
+    /* Generate ECDHE keypairs for all groups */
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
     ecdhe_keygen(p384_priv,p384_pub);
     uint8_t p256_priv[P256_SCALAR_LEN], p256_pub[P256_POINT_LEN];
     ecdhe_p256_keygen(p256_priv,p256_pub);
-    printf("Generated ECDHE keypairs (P-256 + P-384)\n");
+    uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub_key[X25519_KEY_LEN];
+    x25519_keygen(x25519_priv,x25519_pub_key);
+    printf("Generated ECDHE keypairs (X25519 + P-256 + P-384)\n");
 
     /* Build & send ClientHello */
     uint8_t ch[CH_BUF_SIZE];
     uint8_t client_random[32];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,host,client_random,0);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,host,client_random,0);
     /* For the record layer, first ClientHello uses version 0x0301.
        Send header+body in one write to avoid middlebox issues with TCP fragmentation. */
     {
@@ -3779,7 +4298,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                 }
             }
         }
-        if(hrr_group!=TLS_GROUP_SECP256R1 && hrr_group!=TLS_GROUP_SECP384R1)
+        if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_SECP256R1 && hrr_group!=TLS_GROUP_SECP384R1)
             die("HRR selected unsupported group");
         printf("  HRR selected group 0x%04x\n",hrr_group);
 
@@ -3806,7 +4325,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         }
 
         /* Build new ClientHello with only the requested group */
-        ch_len=build_client_hello(ch,p256_pub,p384_pub,host,client_random,hrr_group);
+        ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,host,client_random,hrr_group);
         if(hrr_aes256)
             sha384_update(&transcript384,ch,ch_len);
         else
@@ -3850,6 +4369,8 @@ static void do_https_get(const char *host, int port, const char *path) {
     memcpy(conn.p256_pub, p256_pub, P256_POINT_LEN);
     memcpy(conn.p384_priv, p384_priv, P384_SCALAR_LEN);
     memcpy(conn.p384_pub, p384_pub, P384_POINT_LEN);
+    memcpy(conn.x25519_priv, x25519_priv, X25519_KEY_LEN);
+    memcpy(conn.x25519_pub, x25519_pub_key, X25519_KEY_LEN);
     memcpy(conn.server_pub, server_pub, server_pub_len);
     conn.server_pub_len = server_pub_len;
     conn.cipher_suite = cipher_suite;
@@ -3864,6 +4385,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* Clear local secret material */
     secure_zero(p256_priv, sizeof(p256_priv));
     secure_zero(p384_priv, sizeof(p384_priv));
+    secure_zero(x25519_priv, sizeof(x25519_priv));
 
     if(version == TLS_VERSION_12) {
         tls12_handshake(&conn);
@@ -3893,7 +4415,7 @@ int main(int argc, char **argv) {
     char *colon = strchr(host, ':');
     if (colon) { port = atoi(colon + 1); *colon = '\0'; }
     printf("TLS 1.2/1.3 HTTPS Client — from scratch in C\n");
-    printf("Ciphers: TLS_AES_128_GCM_SHA256, ECDHE-{ECDSA,RSA}-AES{128,256}-GCM-SHA{256,384}\n\n");
+    printf("Ciphers: AES-GCM, ChaCha20-Poly1305 | Key Exchange: X25519, P-256, P-384\n\n");
     do_https_get(host, port, path);
     return 0;
 }
