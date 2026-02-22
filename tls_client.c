@@ -2336,6 +2336,11 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             fprintf(stderr,"No issuer found for cert %d\n",i);
             return -1;
         }
+        /* Detect cycle: issuer must not be the same cert */
+        if(certs[i].tbs==certs[found].tbs){
+            fprintf(stderr,"Certificate chain cycle detected at cert %d\n",i);
+            return -1;
+        }
         /* Swap found cert to position i+1 if needed */
         if(found!=i+1){
             x509_cert tmp=certs[i+1]; certs[i+1]=certs[found]; certs[found]=tmp;
