@@ -168,6 +168,60 @@ static void sha256_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
 }
 
 /* ================================================================
+ * SHA-1 (needed for HMAC-SHA-1 in TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA)
+ * ================================================================ */
+#define SHA1_DIGEST_LEN 20
+
+typedef struct { uint32_t h[5]; uint8_t buf[64]; size_t buf_len; uint64_t total; } sha1_ctx;
+
+static void sha1_transform(sha1_ctx *ctx, const uint8_t blk[64]) {
+    uint32_t w[80];
+    for(int i=0;i<16;i++) w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)|((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
+    for(int i=16;i<80;i++){uint32_t t=w[i-3]^w[i-8]^w[i-14]^w[i-16];w[i]=(t<<1)|(t>>31);}
+    uint32_t a=ctx->h[0],b=ctx->h[1],c=ctx->h[2],d=ctx->h[3],e=ctx->h[4];
+    for(int i=0;i<80;i++){
+        uint32_t f,k;
+        if(i<20)      {f=(b&c)|((~b)&d);k=0x5A827999;}
+        else if(i<40) {f=b^c^d;k=0x6ED9EBA1;}
+        else if(i<60) {f=(b&c)|(b&d)|(c&d);k=0x8F1BBCDC;}
+        else          {f=b^c^d;k=0xCA62C1D6;}
+        uint32_t tmp=((a<<5)|(a>>27))+f+e+k+w[i];
+        e=d;d=c;c=(b<<30)|(b>>2);b=a;a=tmp;
+    }
+    ctx->h[0]+=a;ctx->h[1]+=b;ctx->h[2]+=c;ctx->h[3]+=d;ctx->h[4]+=e;
+}
+
+static void sha1_init(sha1_ctx *ctx) {
+    ctx->h[0]=0x67452301;ctx->h[1]=0xEFCDAB89;ctx->h[2]=0x98BADCFE;ctx->h[3]=0x10325476;ctx->h[4]=0xC3D2E1F0;
+    ctx->buf_len=0;ctx->total=0;
+}
+
+static void sha1_update(sha1_ctx *ctx, const uint8_t *data, size_t len) {
+    ctx->total+=len;
+    while(len>0){
+        size_t space=64-ctx->buf_len, chunk=len<space?len:space;
+        memcpy(ctx->buf+ctx->buf_len,data,chunk);
+        ctx->buf_len+=chunk;data+=chunk;len-=chunk;
+        if(ctx->buf_len==64){sha1_transform(ctx,ctx->buf);ctx->buf_len=0;}
+    }
+}
+
+static void sha1_final(sha1_ctx *ctx, uint8_t out[20]) {
+    uint64_t bits=ctx->total*8;
+    uint8_t pad=0x80;
+    sha1_update(ctx,&pad,1);
+    pad=0;
+    while(ctx->buf_len!=56) sha1_update(ctx,&pad,1);
+    uint8_t lb[8]; for(int i=7;i>=0;i--){lb[i]=bits&0xFF;bits>>=8;}
+    sha1_update(ctx,lb,8);
+    for(int i=0;i<5;i++){out[4*i]=(ctx->h[i]>>24)&0xFF;out[4*i+1]=(ctx->h[i]>>16)&0xFF;out[4*i+2]=(ctx->h[i]>>8)&0xFF;out[4*i+3]=ctx->h[i]&0xFF;}
+}
+
+static void sha1_hash(const uint8_t *data, size_t len, uint8_t out[20]) {
+    sha1_ctx c; sha1_init(&c); sha1_update(&c,data,len); sha1_final(&c,out);
+}
+
+/* ================================================================
  * AES-128
  * ================================================================ */
 static const uint8_t aes_sbox[256] = {
@@ -325,6 +379,109 @@ static int aes_gcm_decrypt_impl(const uint8_t *key, size_t key_len, const uint8_
         for(size_t j=0;j<n;j++) pt[i+j]=ct[i+j]^ks[j];
     }
     return 0;
+}
+
+/* ================================================================
+ * AES Inverse Cipher (for CBC decrypt)
+ * ================================================================ */
+static const uint8_t aes_inv_sbox[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+};
+
+static uint8_t ct_inv_sbox(uint8_t idx) {
+    uint8_t result=0;
+    for(unsigned i=0;i<256;i++){
+        uint8_t mask=(uint8_t)(((uint32_t)((uint8_t)i^idx)-1)>>8);
+        result|=aes_inv_sbox[i]&mask;
+    }
+    return result;
+}
+
+static uint8_t xtm(uint8_t x, uint8_t m) {
+    /* Multiply x by m in GF(2^8) — used for InvMixColumns */
+    uint8_t r=0;
+    for(int i=0;i<8;i++){
+        if(m&1) r^=x;
+        uint8_t hi=x&0x80;
+        x=(x<<1)^(hi?0x1b:0);
+        m>>=1;
+    }
+    return r;
+}
+
+static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
+    uint8_t s[16]; memcpy(s,in,16);
+    for(int i=0;i<16;i++) s[i]^=rk[16*nr+i];
+    for(int r=nr-1;r>=0;r--){
+        /* InvShiftRows */
+        uint8_t t;
+        t=s[13];s[13]=s[9];s[9]=s[5];s[5]=s[1];s[1]=t;
+        t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
+        t=s[3];s[3]=s[7];s[7]=s[11];s[11]=s[15];s[15]=t;
+        /* InvSubBytes */
+        for(int i=0;i<16;i++) s[i]=ct_inv_sbox(s[i]);
+        /* AddRoundKey */
+        for(int i=0;i<16;i++) s[i]^=rk[16*r+i];
+        /* InvMixColumns (skip for round 0) */
+        if(r>0){
+            for(int c=0;c<4;c++){
+                uint8_t *col=s+4*c, a0=col[0],a1=col[1],a2=col[2],a3=col[3];
+                col[0]=xtm(a0,0x0e)^xtm(a1,0x0b)^xtm(a2,0x0d)^xtm(a3,0x09);
+                col[1]=xtm(a0,0x09)^xtm(a1,0x0e)^xtm(a2,0x0b)^xtm(a3,0x0d);
+                col[2]=xtm(a0,0x0d)^xtm(a1,0x09)^xtm(a2,0x0e)^xtm(a3,0x0b);
+                col[3]=xtm(a0,0x0b)^xtm(a1,0x0d)^xtm(a2,0x09)^xtm(a3,0x0e);
+            }
+        }
+    }
+    memcpy(out,s,16);
+}
+
+/* ================================================================
+ * AES-CBC Encrypt / Decrypt
+ * ================================================================ */
+static void aes_cbc_encrypt(const uint8_t *key, size_t key_len,
+                              const uint8_t iv[16], const uint8_t *pt, size_t len,
+                              uint8_t *ct) {
+    uint8_t rk[240]; int nr;
+    if(key_len==AES256_KEY_LEN){aes256_expand(key,rk);nr=14;}
+    else{aes128_expand(key,rk);nr=10;}
+    uint8_t prev[16]; memcpy(prev,iv,16);
+    for(size_t i=0;i<len;i+=16){
+        uint8_t blk[16];
+        for(int j=0;j<16;j++) blk[j]=pt[i+j]^prev[j];
+        aes_encrypt(rk,nr,blk,ct+i);
+        memcpy(prev,ct+i,16);
+    }
+}
+
+static void aes_cbc_decrypt(const uint8_t *key, size_t key_len,
+                              const uint8_t iv[16], const uint8_t *ct, size_t len,
+                              uint8_t *pt) {
+    uint8_t rk[240]; int nr;
+    if(key_len==AES256_KEY_LEN){aes256_expand(key,rk);nr=14;}
+    else{aes128_expand(key,rk);nr=10;}
+    uint8_t prev[16]; memcpy(prev,iv,16);
+    for(size_t i=0;i<len;i+=16){
+        uint8_t blk[16];
+        aes_decrypt(rk,nr,ct+i,blk);
+        for(int j=0;j<16;j++) pt[i+j]=blk[j]^prev[j];
+        memcpy(prev,ct+i,16);
+    }
 }
 
 /* ================================================================
@@ -790,6 +947,9 @@ typedef struct {
     size_t digest_len, block_size;
 } hash_alg;
 
+static void sha1_init_v(void *ctx){sha1_init((sha1_ctx*)ctx);}
+static void sha1_update_v(void *ctx,const uint8_t *d,size_t l){sha1_update((sha1_ctx*)ctx,d,l);}
+static void sha1_final_v(void *ctx,uint8_t *o){sha1_final((sha1_ctx*)ctx,o);}
 static void sha256_init_v(void *ctx){sha256_init((sha256_ctx*)ctx);}
 static void sha256_update_v(void *ctx,const uint8_t *d,size_t l){sha256_update((sha256_ctx*)ctx,d,l);}
 static void sha256_final_v(void *ctx,uint8_t *o){sha256_final((sha256_ctx*)ctx,o);}
@@ -797,6 +957,7 @@ static void sha384_init_v(void *ctx){sha384_init((sha384_ctx*)ctx);}
 static void sha384_update_v(void *ctx,const uint8_t *d,size_t l){sha384_update((sha384_ctx*)ctx,d,l);}
 static void sha384_final_v(void *ctx,uint8_t *o){sha384_final((sha384_ctx*)ctx,o);}
 
+static const hash_alg SHA1_ALG={sha1_init_v,sha1_update_v,sha1_final_v,sha1_hash,SHA1_DIGEST_LEN,64};
 static const hash_alg SHA256_ALG={sha256_init_v,sha256_update_v,sha256_final_v,sha256_hash,SHA256_DIGEST_LEN,64};
 static const hash_alg SHA384_ALG={sha384_init_v,sha384_update_v,sha384_final_v,sha384_hash,SHA384_DIGEST_LEN,128};
 
@@ -1611,6 +1772,35 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
     uint8_t hp[48];
     hash_fn(mp,8+hash_len+salt_len,hp);
     return ct_memeq(hp,h,hash_len) & (pad_ok == 0);
+}
+
+/* ================================================================
+ * RSA PKCS#1 v1.5 Type 2 Encryption (for RSA key transport)
+ * ================================================================ */
+static int rsa_encrypt(const uint8_t *pt, size_t pt_len,
+                        const uint8_t *modulus, size_t mod_len,
+                        const uint8_t *exponent, size_t exp_len,
+                        uint8_t *ct) {
+    if(mod_len < pt_len+11) return -1; /* need at least 8 bytes padding + 3 overhead */
+    uint8_t em[512];
+    if(mod_len>sizeof(em)) return -1;
+    em[0]=0x00; em[1]=0x02;
+    size_t pad_len=mod_len-pt_len-3;
+    /* Fill padding with random non-zero bytes */
+    random_bytes(em+2,pad_len);
+    for(size_t i=0;i<pad_len;i++){
+        while(em[2+i]==0) random_bytes(em+2+i,1);
+    }
+    em[2+pad_len]=0x00;
+    memcpy(em+3+pad_len,pt,pt_len);
+
+    bignum msg_bn, n_bn, e_bn, ct_bn;
+    bn_from_bytes(&msg_bn,em,mod_len);
+    bn_from_bytes(&n_bn,modulus,mod_len);
+    bn_from_bytes(&e_bn,exponent,exp_len);
+    bn_modexp(&ct_bn,&msg_bn,&e_bn,&n_bn);
+    bn_to_bytes(&ct_bn,ct,mod_len);
+    return 0;
 }
 
 /* ================================================================
