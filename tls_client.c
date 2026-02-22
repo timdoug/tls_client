@@ -762,7 +762,7 @@ static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
         *len = *p++;
     } else {
         int nb = *p++ & 0x7F;
-        if (nb > 3 || p + nb > end) return NULL;
+        if (nb == 0 || nb > 3 || p + nb > end) return NULL; /* nb==0: reject BER indefinite length */
         *len = 0;
         for (int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
     }
