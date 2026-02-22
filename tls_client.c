@@ -1411,6 +1411,13 @@ static const uint8_t OID_SHA512_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x
 static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
 static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
 static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
+static const uint8_t OID_BASIC_CONSTRAINTS[] = {0x55,0x1D,0x13};
+
+/* HelloRetryRequest sentinel random (RFC 8446 §4.1.3) */
+static const uint8_t HRR_RANDOM[32] = {
+    0xCF,0x21,0xAD,0x74,0xE5,0x9A,0x61,0x11,0xBE,0x1D,0x8C,0x02,0x1E,0x65,0xB8,0x91,
+    0xC2,0xA2,0x11,0x16,0x7A,0xBB,0x8C,0x5E,0x07,0x9E,0x09,0xE2,0xC8,0xA8,0x33,0x9C
+};
 
 /* P-256 curve order n (big-endian) */
 static const uint8_t P256_ORDER[32] = {
@@ -1824,6 +1831,7 @@ typedef struct {
     const uint8_t *rsa_e; size_t rsa_e_len;        /* RSA exponent */
     const uint8_t *san; size_t san_len;            /* SAN extension value */
     time_t not_before, not_after;                  /* validity period */
+    int is_ca;                                      /* basicConstraints CA flag */
 } x509_cert;
 
 static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
@@ -1940,6 +1948,25 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
                         if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
                         const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
                         if(oct&&tag==0x04){cert->san=oct;cert->san_len=len;}
+                    } else if(oid_eq(eoid,len,OID_BASIC_CONSTRAINTS,sizeof(OID_BASIC_CONSTRAINTS))){
+                        const uint8_t *rest=eoid+len;
+                        /* skip optional critical BOOLEAN */
+                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+                        /* OCTET STRING wrapping */
+                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+                        if(oct&&tag==0x04){
+                            const uint8_t *oct_end=oct+len;
+                            /* SEQUENCE inside */
+                            const uint8_t *sq=der_read_tl(oct,oct_end,&tag,&len);
+                            if(sq&&tag==0x30&&len>0){
+                                /* first element: BOOLEAN CA flag if present */
+                                if(*sq==0x01){
+                                    const uint8_t *bv=der_read_tl(sq,sq+len,&tag,&len);
+                                    if(bv&&tag==0x01&&len==1&&bv[0]!=0)
+                                        cert->is_ca=1;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2180,6 +2207,14 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         }
     }
 
+    /* Reject RSA keys smaller than 2048 bits */
+    for(int i=0;i<chain_count;i++){
+        if(certs[i].key_type==2 && certs[i].rsa_n_len<256){
+            fprintf(stderr,"Certificate %d has RSA key < 2048 bits\n",i);
+            return -1;
+        }
+    }
+
     /* Verify leaf hostname */
     if(!verify_hostname(&certs[0],hostname)){
         fprintf(stderr,"Hostname verification failed for %s\n",hostname);
@@ -2251,6 +2286,11 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             return -1;
         }
         printf("    Certificate %d signature verified\n",i);
+        /* Intermediate cert must have CA:TRUE basicConstraints */
+        if(!certs[i+1].is_ca){
+            fprintf(stderr,"Certificate %d used as CA but lacks basicConstraints CA:TRUE\n",i+1);
+            return -1;
+        }
     }
     fprintf(stderr,"No matching root CA found in trust store\n");
     return -1;
@@ -2294,10 +2334,12 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
     return hdr[0];
 }
 
-/* Build ClientHello for TLS 1.2/1.3 */
+/* Build ClientHello for TLS 1.2/1.3.
+   only_group: 0 = emit both P-256 and P-384 key shares (initial CH),
+               0x0017 = emit only P-256, 0x0018 = emit only P-384 (after HRR) */
 static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
                                   const uint8_t p384_pub[97], const char *host,
-                                  uint8_t client_random[32]) {
+                                  uint8_t client_random[32], uint16_t only_group) {
     size_t p=0;
     /* Handshake header - fill length later */
     buf[p++]=0x01; /* ClientHello */
@@ -2366,16 +2408,30 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
     buf[p++]=0x05;buf[p++]=0x01; /* rsa_pkcs1_sha384 */
     buf[p++]=0x04;buf[p++]=0x01; /* rsa_pkcs1_sha256 */
 
-    /* key_share (both P-256 and P-384) */
+    /* key_share */
     buf[p++]=0x00;buf[p++]=0x33;
-    PUT16(buf+p,(uint16_t)(65+4+97+4+2));p+=2; /* ext data len */
-    PUT16(buf+p,(uint16_t)(65+4+97+4));p+=2;   /* client shares len */
-    buf[p++]=0x00;buf[p++]=0x17;                /* secp256r1 */
-    PUT16(buf+p,65);p+=2;
-    memcpy(buf+p,p256_pub,65);p+=65;
-    buf[p++]=0x00;buf[p++]=0x18;                /* secp384r1 */
-    PUT16(buf+p,97);p+=2;
-    memcpy(buf+p,p384_pub,97);p+=97;
+    if(only_group==0x0017) {
+        PUT16(buf+p,(uint16_t)(65+4+2));p+=2;
+        PUT16(buf+p,(uint16_t)(65+4));p+=2;
+        buf[p++]=0x00;buf[p++]=0x17;
+        PUT16(buf+p,65);p+=2;
+        memcpy(buf+p,p256_pub,65);p+=65;
+    } else if(only_group==0x0018) {
+        PUT16(buf+p,(uint16_t)(97+4+2));p+=2;
+        PUT16(buf+p,(uint16_t)(97+4));p+=2;
+        buf[p++]=0x00;buf[p++]=0x18;
+        PUT16(buf+p,97);p+=2;
+        memcpy(buf+p,p384_pub,97);p+=97;
+    } else {
+        PUT16(buf+p,(uint16_t)(65+4+97+4+2));p+=2;
+        PUT16(buf+p,(uint16_t)(65+4+97+4));p+=2;
+        buf[p++]=0x00;buf[p++]=0x17;
+        PUT16(buf+p,65);p+=2;
+        memcpy(buf+p,p256_pub,65);p+=65;
+        buf[p++]=0x00;buf[p++]=0x18;
+        PUT16(buf+p,97);p+=2;
+        memcpy(buf+p,p384_pub,97);p+=97;
+    }
 
     /* supported_versions (TLS 1.3 preferred, TLS 1.2 fallback) */
     buf[p++]=0x00;buf[p++]=0x2b;
@@ -2465,7 +2521,7 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
         }
     }
     (void)end;
-    if(version==0x0304 && *pub_len==0) die("TLS 1.3 but no key_share in ServerHello");
+    /* Note: pub_len==0 with version 0x0304 is valid for HelloRetryRequest */
     return version;
 }
 
@@ -2627,7 +2683,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* Build & send ClientHello */
     uint8_t ch[1024];
     uint8_t client_random[32];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,host,client_random);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,host,client_random,0);
     /* For the record layer, first ClientHello uses version 0x0301.
        Send header+body in one write to avoid middlebox issues with TCP fragmentation. */
     {
@@ -2661,6 +2717,95 @@ static void do_https_get(const char *host, int port, const char *path) {
     sha256_update(&transcript,rec,sh_msg_len);
     sha384_update(&transcript384,rec,sh_msg_len);
     size_t sh_leftover=rec_len>sh_msg_len ? rec_len-sh_msg_len : 0;
+
+    /* ================================================================
+     * HelloRetryRequest Handling (RFC 8446 §4.1.4)
+     * ================================================================ */
+    if(memcmp(server_random,HRR_RANDOM,32)==0) {
+        printf("Received HelloRetryRequest (cipher=0x%04x)\n",cipher_suite);
+        /* Parse HRR extensions to find selected group */
+        uint16_t hrr_group=0;
+        {
+            const uint8_t *b=rec+4; /* skip handshake header */
+            b+=2; /* version */
+            b+=32; /* random */
+            uint8_t sid_len=*b++; b+=sid_len; /* session id */
+            b+=2; /* cipher suite */
+            b++; /* compression */
+            if(b+2<=rec+sh_msg_len) {
+                uint16_t ext_total=GET16(b); b+=2;
+                const uint8_t *ext_end=b+ext_total;
+                if(ext_end>rec+sh_msg_len) ext_end=rec+sh_msg_len;
+                while(b+4<=ext_end) {
+                    uint16_t etype=GET16(b); b+=2;
+                    uint16_t elen=GET16(b); b+=2;
+                    if(b+elen>ext_end) break;
+                    if(etype==0x0033 && elen==2) { /* key_share with just selected group */
+                        hrr_group=GET16(b);
+                    }
+                    b+=elen;
+                }
+            }
+        }
+        if(hrr_group!=0x0017 && hrr_group!=0x0018)
+            die("HRR selected unsupported group");
+        printf("  HRR selected group 0x%04x\n",hrr_group);
+
+        int hrr_aes256 = (cipher_suite == 0x1302);
+
+        /* Transcript replacement per RFC 8446 §4.4.1:
+           Hash(CH1) → synthetic message_hash, then add HRR */
+        if(hrr_aes256) {
+            uint8_t ch1_hash[48];
+            sha384_ctx tc=transcript384; sha384_final(&tc,ch1_hash);
+            sha384_init(&transcript384);
+            uint8_t synth[4+48]={0xFE,0x00,0x00,48};
+            memcpy(synth+4,ch1_hash,48);
+            sha384_update(&transcript384,synth,sizeof(synth));
+            sha384_update(&transcript384,rec,sh_msg_len);
+        } else {
+            uint8_t ch1_hash[32];
+            sha256_ctx tc=transcript; sha256_final(&tc,ch1_hash);
+            sha256_init(&transcript);
+            uint8_t synth[4+32]={0xFE,0x00,0x00,32};
+            memcpy(synth+4,ch1_hash,32);
+            sha256_update(&transcript,synth,sizeof(synth));
+            sha256_update(&transcript,rec,sh_msg_len);
+        }
+
+        /* Build new ClientHello with only the requested group */
+        ch_len=build_client_hello(ch,p256_pub,p384_pub,host,client_random,hrr_group);
+        if(hrr_aes256)
+            sha384_update(&transcript384,ch,ch_len);
+        else
+            sha256_update(&transcript,ch,ch_len);
+
+        /* Send new ClientHello */
+        tls_send_record(fd,0x16,ch,ch_len);
+        printf("Sent new ClientHello with group 0x%04x (%zu bytes)\n",hrr_group,ch_len);
+
+        /* Read real ServerHello (skip CCS if present) */
+        rtype=tls_read_record(fd,rec,&rec_len);
+        if(rtype==0x14) { /* ChangeCipherSpec, skip */
+            rtype=tls_read_record(fd,rec,&rec_len);
+        }
+        if(rtype==0x15 && rec_len>=2) { fprintf(stderr,"Alert: level=%d desc=%d\n",rec[0],rec[1]); die("server sent alert after HRR"); }
+        if(rtype!=0x16) die("expected handshake record after HRR");
+        if(rec[0]!=0x02) die("expected ServerHello after HRR");
+        version=parse_server_hello(rec,rec_len,server_pub,&server_pub_len,server_random,&cipher_suite);
+        if(version!=0x0304) die("expected TLS 1.3 after HRR");
+        if(server_pub_len==0) die("no key_share in real ServerHello after HRR");
+        sh_msg_len=4+GET24(rec+1);
+        if(hrr_aes256)
+            sha384_update(&transcript384,rec,sh_msg_len);
+        else
+            sha256_update(&transcript,rec,sh_msg_len);
+        sh_leftover=rec_len>sh_msg_len ? rec_len-sh_msg_len : 0;
+        printf("Received real ServerHello after HRR (cipher=0x%04x)\n",cipher_suite);
+    }
+
+    /* Verify TLS 1.3 ServerHello has key_share */
+    if(version==0x0304 && server_pub_len==0) die("TLS 1.3 but no key_share in ServerHello");
 
     /* ================================================================
      * TLS 1.2 Handshake Path
@@ -2961,6 +3106,8 @@ static void do_https_get(const char *host, int port, const char *path) {
                 break;
             }
         }
+        /* Send close_notify */
+        { uint8_t alert[2]={1,0}; tls12_encrypt_and_send(fd,0x15,alert,2,c_wk,c_wiv,c12_seq++,key_len); }
         printf("\n=== Done ===\n");
 
         free(cert12_msg);
@@ -3289,12 +3436,13 @@ static void do_https_get(const char *host, int port, const char *path) {
     printf("Sent client Finished\n");
 
     /* Send HTTP GET (encrypted with application keys) */
+    uint64_t c_ap_seq=0;
     {
         char req[512];
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
-        encrypt_and_send(fd,0x17,(uint8_t*)req,rlen,c_ap_key,c_ap_iv,0,is_aes256);
+        encrypt_and_send(fd,0x17,(uint8_t*)req,rlen,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256);
         printf("Sent HTTP GET %s\n\n",path);
     }
 
@@ -3314,7 +3462,47 @@ static void do_https_get(const char *host, int port, const char *path) {
                 printf("\n[TLS Alert: %d %d]\n",pt[0],pt_len>1?pt[1]:-1);
                 break;
             } else if(inner==0x16) {
-                /* NewSessionTicket or other post-handshake, skip */
+                /* Post-handshake message */
+                if(pt_len>=5 && pt[0]==24 && GET24(pt+1)==1) {
+                    /* KeyUpdate (type 24, length 1) */
+                    uint8_t request_update=pt[4];
+                    /* Derive new server traffic secret */
+                    if(is_aes256) {
+                        uint8_t new_s[48];
+                        hkdf_expand_label_384(s_ap_traffic,"traffic upd",NULL,0,new_s,48);
+                        memcpy(s_ap_traffic,new_s,48);
+                        hkdf_expand_label_384(s_ap_traffic,"key",NULL,0,s_ap_key,32);
+                        hkdf_expand_label_384(s_ap_traffic,"iv",NULL,0,s_ap_iv,12);
+                    } else {
+                        uint8_t new_s[32];
+                        hkdf_expand_label(s_ap_traffic,"traffic upd",NULL,0,new_s,32);
+                        memcpy(s_ap_traffic,new_s,32);
+                        hkdf_expand_label(s_ap_traffic,"key",NULL,0,s_ap_key,16);
+                        hkdf_expand_label(s_ap_traffic,"iv",NULL,0,s_ap_iv,12);
+                    }
+                    s_ap_seq=0;
+                    if(request_update==1) {
+                        /* Send KeyUpdate(update_not_requested) with current client keys */
+                        uint8_t ku_msg[5]={24,0,0,1,0};
+                        encrypt_and_send(fd,0x16,ku_msg,5,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256);
+                        /* Derive new client traffic secret */
+                        if(is_aes256) {
+                            uint8_t new_c[48];
+                            hkdf_expand_label_384(c_ap_traffic,"traffic upd",NULL,0,new_c,48);
+                            memcpy(c_ap_traffic,new_c,48);
+                            hkdf_expand_label_384(c_ap_traffic,"key",NULL,0,c_ap_key,32);
+                            hkdf_expand_label_384(c_ap_traffic,"iv",NULL,0,c_ap_iv,12);
+                        } else {
+                            uint8_t new_c[32];
+                            hkdf_expand_label(c_ap_traffic,"traffic upd",NULL,0,new_c,32);
+                            memcpy(c_ap_traffic,new_c,32);
+                            hkdf_expand_label(c_ap_traffic,"key",NULL,0,c_ap_key,16);
+                            hkdf_expand_label(c_ap_traffic,"iv",NULL,0,c_ap_iv,12);
+                        }
+                        c_ap_seq=0;
+                    }
+                }
+                /* else: NewSessionTicket or other post-handshake, skip */
             }
         } else if(rtype==0x15) {
             break;
@@ -3322,6 +3510,8 @@ static void do_https_get(const char *host, int port, const char *path) {
             break;
         }
     }
+    /* Send close_notify */
+    { uint8_t alert[2]={1,0}; encrypt_and_send(fd,0x15,alert,2,c_ap_key,c_ap_iv,c_ap_seq,is_aes256); }
     printf("\n=== Done ===\n");
     free(saved_cert_msg);
     secure_zero(p384_priv,sizeof(p384_priv));
