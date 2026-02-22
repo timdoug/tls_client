@@ -2035,6 +2035,14 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
                                 }
                             }
                         }
+                    } else {
+                        /* RFC 5280 §4.2: reject unrecognized critical extensions */
+                        const uint8_t *rest=eoid+len;
+                        if(rest<ext_end2&&*rest==0x01){
+                            const uint8_t *cv=der_read_tl(rest,ext_end2,&tag,&len);
+                            if(cv&&tag==0x01&&len==1&&cv[0]!=0)
+                                return -1; /* critical extension we cannot process */
+                        }
                     }
                 }
             }
