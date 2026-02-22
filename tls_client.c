@@ -2028,6 +2028,24 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
     return 0;
 }
 
+/* Validate leaf certificate: hostname, EKU, keyUsage */
+static int validate_leaf_cert(const x509_cert *leaf, const char *hostname) {
+    if(!verify_hostname(leaf,hostname)){
+        fprintf(stderr,"Hostname verification failed for %s\n",hostname);
+        return -1;
+    }
+    printf("    Hostname verified: %s\n",hostname);
+    if(leaf->has_eku && !leaf->eku_server_auth){
+        fprintf(stderr,"Leaf certificate EKU does not include serverAuth\n");
+        return -1;
+    }
+    if(leaf->has_key_usage && !(leaf->key_usage & 0x80)){
+        fprintf(stderr,"Leaf certificate keyUsage missing digitalSignature\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* ================================================================
  * Certificate Chain Validation
  * ================================================================ */
@@ -2083,23 +2101,8 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         }
     }
 
-    /* Verify leaf hostname */
-    if(!verify_hostname(&certs[0],hostname)){
-        fprintf(stderr,"Hostname verification failed for %s\n",hostname);
-        return -1;
-    }
-    printf("    Hostname verified: %s\n",hostname);
-
-    /* Leaf: if EKU present, must include serverAuth */
-    if(certs[0].has_eku && !certs[0].eku_server_auth){
-        fprintf(stderr,"Leaf certificate EKU does not include serverAuth\n");
-        return -1;
-    }
-    /* Leaf: if keyUsage present, must include digitalSignature (bit 0) */
-    if(certs[0].has_key_usage && !(certs[0].key_usage & 0x80)){
-        fprintf(stderr,"Leaf certificate keyUsage missing digitalSignature\n");
-        return -1;
-    }
+    /* Validate leaf certificate */
+    if(validate_leaf_cert(&certs[0],hostname)<0) return -1;
 
     /* Check validity period for all chain certs */
     time_t now=time(NULL);
