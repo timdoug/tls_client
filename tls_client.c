@@ -2450,14 +2450,16 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     buf[p++]=32;
     random_bytes(buf+p,32); p+=32;
 
-    /* Cipher suites: TLS 1.3 + TLS 1.2 ECDHE-GCM + SCSV */
-    buf[p++]=0x00; buf[p++]=0x0E; /* 14 bytes = 7 suites */
+    /* Cipher suites: TLS 1.3 + TLS 1.2 ECDHE-GCM + RSA-GCM + ECDHE-CBC + SCSV */
+    buf[p++]=0x00; buf[p++]=0x12; /* 18 bytes = 9 suites */
     buf[p++]=0x13; buf[p++]=0x01; /* TLS_AES_128_GCM_SHA256 */
     buf[p++]=0x13; buf[p++]=0x02; /* TLS_AES_256_GCM_SHA384 */
     buf[p++]=0xC0; buf[p++]=0x2B; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2F; /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2C; /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
     buf[p++]=0xC0; buf[p++]=0x30; /* TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 */
+    buf[p++]=0x00; buf[p++]=0x9D; /* TLS_RSA_WITH_AES_256_GCM_SHA384 */
+    buf[p++]=0xC0; buf[p++]=0x14; /* TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA */
     buf[p++]=0x00; buf[p++]=0xFF; /* TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746) */
 
     /* Compression */
@@ -2579,7 +2581,7 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     if(b+2>sh_end) die("ServerHello truncated at cipher suite");
     uint16_t cs=GET16(b); b+=2;
     *cipher_suite_out=cs;
-    if(cs!=0x1301 && cs!=0x1302 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030) {
+    if(cs!=0x1301 && cs!=0x1302 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 && cs!=0x009D && cs!=0xC014) {
         fprintf(stderr,"cipher suite 0x%04x\n",cs);
         die("unexpected cipher suite");
     }
@@ -2923,7 +2925,10 @@ static void tls12_handshake(tls_conn *conn) {
     sha256_ctx transcript = conn->transcript;
     sha384_ctx transcript384 = conn->transcript384;
 
-    printf("Negotiated TLS 1.2 (cipher suite 0x%04x)\n",cipher_suite);
+    int is_rsa_kex = (cipher_suite == 0x009D);
+    int is_cbc = (cipher_suite == 0xC014);
+    printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s)\n",cipher_suite,
+           is_rsa_kex?" RSA-kex":"", is_cbc?" CBC":"");
 
     /* Read plaintext handshake messages */
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
@@ -2966,7 +2971,8 @@ static void tls12_handshake(tls_conn *conn) {
                     memcpy(cert12_msg, hs12_buf+pos+4, mlen);
                     cert12_msg_len=mlen;
                     break;
-                case 12: { /* ServerKeyExchange */
+                case 12: { /* ServerKeyExchange (not sent for RSA key transport) */
+                    if(is_rsa_kex) die("unexpected ServerKeyExchange for RSA key transport");
                     printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
                     if(mlen<8) die("ServerKeyExchange too short");
                     const uint8_t *ske=hs12_buf+pos+4;
@@ -3074,7 +3080,45 @@ static void tls12_handshake(tls_conn *conn) {
 
     /* Send ClientKeyExchange */
     uint8_t ss12[P384_SCALAR_LEN]; size_t ss12_len;
-    if(ske_curve==TLS_GROUP_SECP256R1) {
+    if(is_rsa_kex) {
+        /* RSA key transport: encrypt PMS with server's RSA public key */
+        if(!cert12_msg) die("No certificate for RSA key exchange");
+        if(cert12_msg_len<6) die("Certificate message too short");
+        const uint8_t *cp2=cert12_msg;
+        uint32_t ll2=GET24(cp2); cp2+=3;
+        if(3+ll2>cert12_msg_len) die("cert list length");
+        if(ll2<3) die("cert list too short");
+        uint32_t cl2=GET24(cp2); cp2+=3;
+        if(6+cl2>cert12_msg_len) die("first cert exceeds message");
+        x509_cert leaf;
+        if(x509_parse(&leaf,cp2,cl2)!=0) die("Failed to parse leaf cert for RSA kex");
+        if(leaf.key_type!=2) die("RSA key transport requires RSA cert");
+
+        uint8_t pms[48];
+        pms[0]=0x03; pms[1]=0x03; /* TLS 1.2 version */
+        random_bytes(pms+2,46);
+
+        uint8_t encrypted_pms[512];
+        if(rsa_encrypt(pms,48,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len,encrypted_pms)<0)
+            die("RSA encrypt failed");
+
+        size_t enc_len=leaf.rsa_n_len;
+        uint8_t cke[4+2+512];
+        uint32_t cke_body_len=2+enc_len;
+        cke[0]=0x10;
+        cke[1]=(cke_body_len>>16)&0xFF; cke[2]=(cke_body_len>>8)&0xFF; cke[3]=cke_body_len&0xFF;
+        PUT16(cke+4,(uint16_t)enc_len);
+        memcpy(cke+6,encrypted_pms,enc_len);
+        size_t cke_total=4+2+enc_len;
+        tls_send_record(fd,TLS_RT_HANDSHAKE,cke,cke_total);
+        sha256_update(&transcript, cke, cke_total);
+        sha384_update(&transcript384, cke, cke_total);
+
+        memcpy(ss12,pms,48);
+        ss12_len=48;
+        secure_zero(pms,sizeof(pms));
+        printf("Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",enc_len);
+    } else if(ske_curve==TLS_GROUP_SECP256R1) {
         uint8_t cke[5+P256_POINT_LEN];
         cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=P256_POINT_LEN+1; cke[4]=P256_POINT_LEN;
         memcpy(cke+5, p256_pub, P256_POINT_LEN);
@@ -3099,9 +3143,14 @@ static void tls12_handshake(tls_conn *conn) {
     secure_zero(p384_priv,sizeof(p384_priv));
 
     /* TLS 1.2 key derivation */
-    int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030);
-    const hash_alg *alg = is_aes256 ? &SHA384_ALG : &SHA256_ALG;
+    int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D || cipher_suite==0xC014);
+    /* PRF hash: 0x009D (GCM-SHA384) uses SHA-384, 0xC014 (CBC-SHA) uses SHA-256 (default TLS 1.2 PRF) */
+    int prf_is_sha384 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D);
+    const hash_alg *alg = prf_is_sha384 ? &SHA384_ALG : &SHA256_ALG;
     size_t key_len = is_aes256 ? AES256_KEY_LEN : AES128_KEY_LEN;
+    size_t mac_key_len = is_cbc ? SHA1_DIGEST_LEN : 0;
+    size_t iv_len = is_cbc ? 16 : 4;
+    const hash_alg *mac_alg = is_cbc ? &SHA1_ALG : NULL;
 
     uint8_t pms_seed[64];
     memcpy(pms_seed, client_random, 32);
@@ -3114,15 +3163,19 @@ static void tls12_handshake(tls_conn *conn) {
     memcpy(ke_seed, server_random, 32);
     memcpy(ke_seed+32, client_random, 32);
 
-    size_t kb_len = key_len*2 + 8; /* 2 keys + 2 IVs(4 each) */
-    uint8_t key_block[72];
+    size_t kb_len = mac_key_len*2 + key_len*2 + iv_len*2;
+    uint8_t key_block[136]; /* max: 20*2 + 32*2 + 16*2 = 136 */
     tls12_prf_u(alg, tls12_master, 48, "key expansion", ke_seed, 64, key_block, kb_len);
 
-    uint8_t c_wk[32], s_wk[32], c_wiv[4], s_wiv[4];
-    memcpy(c_wk, key_block, key_len);
-    memcpy(s_wk, key_block+key_len, key_len);
-    memcpy(c_wiv, key_block+key_len*2, 4);
-    memcpy(s_wiv, key_block+key_len*2+4, 4);
+    uint8_t c_mk[20]={0}, s_mk[20]={0}; /* MAC keys (CBC only) */
+    uint8_t c_wk[32], s_wk[32], c_wiv[16]={0}, s_wiv[16]={0};
+    size_t off=0;
+    memcpy(c_mk, key_block+off, mac_key_len); off+=mac_key_len;
+    memcpy(s_mk, key_block+off, mac_key_len); off+=mac_key_len;
+    memcpy(c_wk, key_block+off, key_len); off+=key_len;
+    memcpy(s_wk, key_block+off, key_len); off+=key_len;
+    memcpy(c_wiv, key_block+off, iv_len); off+=iv_len;
+    memcpy(s_wiv, key_block+off, iv_len);
     printf("Derived TLS 1.2 traffic keys\n");
 
     /* Send ChangeCipherSpec */
@@ -3133,7 +3186,7 @@ static void tls12_handshake(tls_conn *conn) {
     {
         uint8_t th12[SHA384_DIGEST_LEN];
         size_t th12_len;
-        if(is_aes256) {
+        if(prf_is_sha384) {
             sha384_ctx tc384=transcript384; sha384_final(&tc384,th12);
             th12_len=SHA384_DIGEST_LEN;
         } else {
@@ -3149,7 +3202,10 @@ static void tls12_handshake(tls_conn *conn) {
         fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=12;
         memcpy(fin_msg+4, verify_data, 12);
 
-        tls12_encrypt_and_send(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, c_wiv, 0, key_len);
+        if(is_cbc)
+            tls12_encrypt_and_send_cbc(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, key_len, c_mk, mac_key_len, mac_alg, 0);
+        else
+            tls12_encrypt_and_send(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, c_wiv, 0, key_len);
         sha256_update(&transcript, fin_msg, 16);
         sha384_update(&transcript384, fin_msg, 16);
         printf("Sent Finished (encrypted)\n");
@@ -3165,14 +3221,18 @@ static void tls12_handshake(tls_conn *conn) {
     if(rtype!=TLS_RT_HANDSHAKE) die("expected Finished from server");
     {
         uint8_t pt12[256]; size_t pt12_len;
-        if(tls12_decrypt_record(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, s_wiv, 0, pt12, &pt12_len, key_len)<0)
-            die("Failed to decrypt server Finished");
+        int dec_ok;
+        if(is_cbc)
+            dec_ok=tls12_decrypt_record_cbc(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, key_len, s_mk, mac_key_len, mac_alg, 0, pt12, &pt12_len);
+        else
+            dec_ok=tls12_decrypt_record(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, s_wiv, 0, pt12, &pt12_len, key_len);
+        if(dec_ok<0) die("Failed to decrypt server Finished");
         if(pt12[0]!=0x14) die("expected Finished message type");
         if(pt12_len<4||GET24(pt12+1)!=12) die("Server Finished length mismatch");
 
         uint8_t th12_sf[SHA384_DIGEST_LEN];
         size_t th12_sf_len;
-        if(is_aes256) {
+        if(prf_is_sha384) {
             sha384_ctx tc384=transcript384; sha384_final(&tc384,th12_sf);
             th12_sf_len=SHA384_DIGEST_LEN;
         } else {
@@ -3192,7 +3252,10 @@ static void tls12_handshake(tls_conn *conn) {
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
-        tls12_encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++,key_len);
+        if(is_cbc)
+            tls12_encrypt_and_send_cbc(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++);
+        else
+            tls12_encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++,key_len);
         printf("Sent HTTP GET %s\n\n",path);
     }
 
@@ -3204,7 +3267,12 @@ static void tls12_handshake(tls_conn *conn) {
         if(rtype<0) break;
         if(rtype==TLS_RT_APPDATA) {
             uint8_t pt12[REC_BUF_SIZE]; size_t pt12_len;
-            if(tls12_decrypt_record(rec,rec_len,TLS_RT_APPDATA,s_wk,s_wiv,s12_seq++,pt12,&pt12_len,key_len)<0) {
+            int dec_ok2;
+            if(is_cbc)
+                dec_ok2=tls12_decrypt_record_cbc(rec,rec_len,TLS_RT_APPDATA,s_wk,key_len,s_mk,mac_key_len,mac_alg,s12_seq++,pt12,&pt12_len);
+            else
+                dec_ok2=tls12_decrypt_record(rec,rec_len,TLS_RT_APPDATA,s_wk,s_wiv,s12_seq++,pt12,&pt12_len,key_len);
+            if(dec_ok2<0) {
                 fprintf(stderr,"Decrypt failed at seq %llu\n",(unsigned long long)(s12_seq-1));
                 break;
             }
@@ -3217,7 +3285,10 @@ static void tls12_handshake(tls_conn *conn) {
         }
     }
     /* Send close_notify */
-    { uint8_t alert[2]={1,0}; tls12_encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_wk,c_wiv,c12_seq++,key_len); }
+    if(is_cbc)
+        { uint8_t alert[2]={1,0}; tls12_encrypt_and_send_cbc(fd,TLS_RT_ALERT,alert,2,c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++); }
+    else
+        { uint8_t alert[2]={1,0}; tls12_encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_wk,c_wiv,c12_seq++,key_len); }
     printf("\n=== Done ===\n");
 
     free(cert12_msg);
@@ -3228,6 +3299,7 @@ static void tls12_handshake(tls_conn *conn) {
     secure_zero(key_block,sizeof(key_block));
     secure_zero(c_wk,sizeof(c_wk)); secure_zero(s_wk,sizeof(s_wk));
     secure_zero(c_wiv,sizeof(c_wiv)); secure_zero(s_wiv,sizeof(s_wiv));
+    secure_zero(c_mk,sizeof(c_mk)); secure_zero(s_mk,sizeof(s_mk));
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(p256_priv,sizeof(p256_priv));
     close(fd);
