@@ -1740,20 +1740,19 @@ static int rsa_pss_verify_sha256(const uint8_t hash[32],
 
     /* DB should be: 00...00 || 01 || salt — verify in constant time */
     size_t pad_len=db_len-salt_len-1;
-    uint8_t ok=0;
-    for(size_t i=0;i<pad_len;i++) ok|=db[i];
-    ok|=db[pad_len]^0x01;
-    if(ok) return 0;
+    uint8_t pad_ok=0;
+    for(size_t i=0;i<pad_len;i++) pad_ok|=db[i];
+    pad_ok|=db[pad_len]^0x01;
     const uint8_t *salt=db+pad_len+1;
 
-    /* M' = (8 zero bytes) || mHash || salt */
+    /* M' = (8 zero bytes) || mHash || salt — always compute to avoid timing leak */
     uint8_t mp[8+32+32];
     memset(mp,0,8);
     memcpy(mp+8,hash,32);
     memcpy(mp+40,salt,salt_len);
 
     uint8_t hp[32]; sha256_hash(mp,72,hp);
-    return ct_memeq(hp,h,32);
+    return ct_memeq(hp,h,32) & (pad_ok == 0);
 }
 
 static int rsa_pss_verify_sha384(const uint8_t hash[48],
@@ -1801,19 +1800,19 @@ static int rsa_pss_verify_sha384(const uint8_t hash[48],
     db[0]&=0x7F;
 
     size_t pad_len=db_len-salt_len-1;
-    uint8_t ok=0;
-    for(size_t i=0;i<pad_len;i++) ok|=db[i];
-    ok|=db[pad_len]^0x01;
-    if(ok) return 0;
+    uint8_t pad_ok=0;
+    for(size_t i=0;i<pad_len;i++) pad_ok|=db[i];
+    pad_ok|=db[pad_len]^0x01;
     const uint8_t *salt=db+pad_len+1;
 
+    /* Always compute hash to avoid timing leak on padding validity */
     uint8_t mp[8+48+48];
     memset(mp,0,8);
     memcpy(mp+8,hash,48);
     memcpy(mp+56,salt,salt_len);
 
     uint8_t hp[48]; sha384_hash(mp,104,hp);
-    return ct_memeq(hp,h,48);
+    return ct_memeq(hp,h,48) & (pad_ok == 0);
 }
 
 /* ================================================================
