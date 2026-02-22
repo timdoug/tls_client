@@ -3343,6 +3343,11 @@ static void do_https_get(const char *host, int port, const char *path) {
                     if(4+cv_sig_len>mlen) die("CertificateVerify sig length mismatch");
                     const uint8_t *cv_sig=cv+4;
 
+                    /* RFC 8446 §4.4.3: only these sig algos allowed in TLS 1.3 CertificateVerify */
+                    if(cv_algo!=0x0403 && cv_algo!=0x0503 &&
+                       cv_algo!=0x0804 && cv_algo!=0x0805)
+                        die("CertificateVerify uses sig algo not in offered list");
+
                     /* Transcript hash up to (but not including) CertificateVerify */
                     uint8_t th_cv[48];
                     if(is_aes256) {
@@ -3385,10 +3390,6 @@ static void do_https_get(const char *host, int port, const char *path) {
                         uint8_t h[48]; sha384_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
                             cv_ok=rsa_pss_verify_sha384(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
-                    } else if(cv_algo==0x0401){ /* rsa_pkcs1_sha256 */
-                        uint8_t h[32]; sha256_hash(cv_content,cv_content_len,h);
-                        if(leaf.key_type==2)
-                            cv_ok=rsa_pkcs1_verify_sha256(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     }
                     if(!cv_ok) die("CertificateVerify signature verification failed");
                     printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",cv_algo);
