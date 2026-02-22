@@ -168,94 +168,6 @@ static void sha256_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
 }
 
 /* ================================================================
- * HMAC-SHA256
- * ================================================================ */
-static void hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen, uint8_t out[32]) {
-    uint8_t k[64]={0};
-    if (klen>64) sha256_hash(key,klen,k); else memcpy(k,key,klen);
-    uint8_t ip[64], op[64];
-    for (int i=0;i<64;i++) { ip[i]=k[i]^0x36; op[i]=k[i]^0x5c; }
-    sha256_ctx c; sha256_init(&c); sha256_update(&c,ip,64); sha256_update(&c,msg,mlen);
-    uint8_t inner[32]; sha256_final(&c,inner);
-    sha256_init(&c); sha256_update(&c,op,64); sha256_update(&c,inner,32); sha256_final(&c,out);
-}
-
-/* ================================================================
- * HKDF + TLS 1.3 label helpers
- * ================================================================ */
-static void hkdf_extract(const uint8_t *salt, size_t slen, const uint8_t *ikm, size_t ilen, uint8_t out[32]) {
-    if (slen == 0) { uint8_t z[32]={0}; hmac_sha256(z,32,ikm,ilen,out); }
-    else hmac_sha256(salt,slen,ikm,ilen,out);
-}
-
-static void hkdf_expand(const uint8_t prk[32], const uint8_t *info, size_t ilen, uint8_t *out, size_t olen) {
-    uint8_t t[32]; size_t tl=0, done=0; uint8_t ctr=1;
-    while (done < olen) {
-        sha256_ctx c; sha256_init(&c);
-        uint8_t ik[64]={0}, ok[64]={0}; memcpy(ik,prk,32);
-        for(int i=0;i<64;i++){ik[i]^=0x36;ok[i]=((i<32)?prk[i]:0)^0x5c;}
-        sha256_update(&c,ik,64);
-        if (tl>0) sha256_update(&c,t,tl);
-        sha256_update(&c,info,ilen);
-        sha256_update(&c,&ctr,1);
-        uint8_t inner[32]; sha256_final(&c,inner);
-        sha256_ctx c2; sha256_init(&c2); sha256_update(&c2,ok,64); sha256_update(&c2,inner,32);
-        sha256_final(&c2,t); tl=32;
-        size_t use = olen-done; if(use>32) use=32;
-        memcpy(out+done,t,use); done+=use; ctr++;
-    }
-}
-
-static void hkdf_expand_label(const uint8_t secret[32], const char *label,
-                               const uint8_t *ctx, size_t clen, uint8_t *out, size_t olen) {
-    uint8_t info[256]; size_t p=0;
-    size_t label_len=strlen(label);
-    if(2+1+6+label_len+1+clen>sizeof(info)) die("hkdf_expand_label: info overflow");
-    info[p++]=(olen>>8)&0xFF; info[p++]=olen&0xFF;
-    size_t ll=6+label_len;
-    info[p++]=ll&0xFF;
-    memcpy(info+p,"tls13 ",6); p+=6;
-    memcpy(info+p,label,label_len); p+=label_len;
-    info[p++]=clen&0xFF;
-    if(clen>0){memcpy(info+p,ctx,clen);p+=clen;}
-    hkdf_expand(secret,info,p,out,olen);
-}
-
-/* ================================================================
- * TLS 1.2 PRF (P_SHA256)
- * ================================================================ */
-static void tls12_prf(const uint8_t *secret, size_t secret_len,
-                       const char *label,
-                       const uint8_t *seed, size_t seed_len,
-                       uint8_t *out, size_t out_len) {
-    uint8_t lseed[256];
-    size_t label_len = strlen(label);
-    size_t ls_len = label_len + seed_len;
-    if(ls_len > sizeof(lseed)) die("tls12_prf: label+seed overflow");
-    memcpy(lseed, label, label_len);
-    memcpy(lseed + label_len, seed, seed_len);
-
-    uint8_t a[32];
-    hmac_sha256(secret, secret_len, lseed, ls_len, a); /* A(1) */
-
-    size_t done = 0;
-    while (done < out_len) {
-        uint8_t buf[32 + 256];
-        memcpy(buf, a, 32);
-        memcpy(buf + 32, lseed, ls_len);
-        uint8_t hmac_out[32];
-        hmac_sha256(secret, secret_len, buf, 32 + ls_len, hmac_out);
-
-        size_t use = out_len - done;
-        if (use > 32) use = 32;
-        memcpy(out + done, hmac_out, use);
-        done += use;
-
-        hmac_sha256(secret, secret_len, a, 32, a); /* A(i+1) */
-    }
-}
-
-/* ================================================================
  * AES-128
  * ================================================================ */
 static const uint8_t aes_sbox[256] = {
@@ -868,6 +780,105 @@ static void sha384_hash(const uint8_t *data, size_t len, uint8_t out[48]) {
     sha384_ctx c; sha384_init(&c); sha384_update(&c,data,len); sha384_final(&c,out);
 }
 
+/* Hash algorithm abstraction for unified HMAC/HKDF/PRF */
+typedef void (*hash_fn_t)(const uint8_t*, size_t, uint8_t*);
+typedef struct {
+    void (*init)(void*);
+    void (*update)(void*, const uint8_t*, size_t);
+    void (*final_fn)(void*, uint8_t*);
+    hash_fn_t hash;
+    size_t digest_len, block_size;
+} hash_alg;
+
+static void sha256_init_v(void *ctx){sha256_init((sha256_ctx*)ctx);}
+static void sha256_update_v(void *ctx,const uint8_t *d,size_t l){sha256_update((sha256_ctx*)ctx,d,l);}
+static void sha256_final_v(void *ctx,uint8_t *o){sha256_final((sha256_ctx*)ctx,o);}
+static void sha384_init_v(void *ctx){sha384_init((sha384_ctx*)ctx);}
+static void sha384_update_v(void *ctx,const uint8_t *d,size_t l){sha384_update((sha384_ctx*)ctx,d,l);}
+static void sha384_final_v(void *ctx,uint8_t *o){sha384_final((sha384_ctx*)ctx,o);}
+
+static const hash_alg SHA256_ALG={sha256_init_v,sha256_update_v,sha256_final_v,sha256_hash,SHA256_DIGEST_LEN,64};
+static const hash_alg SHA384_ALG={sha384_init_v,sha384_update_v,sha384_final_v,sha384_hash,SHA384_DIGEST_LEN,128};
+
+static void hmac(const hash_alg *alg, const uint8_t *key, size_t klen,
+                  const uint8_t *msg, size_t mlen, uint8_t *out) {
+    uint8_t k[128]={0};
+    if(klen>alg->block_size) alg->hash(key,klen,k); else memcpy(k,key,klen);
+    uint8_t ip[128], op[128];
+    for(size_t i=0;i<alg->block_size;i++){ip[i]=k[i]^0x36;op[i]=k[i]^0x5c;}
+    union{sha256_ctx s2;sha384_ctx s3;}u;
+    alg->init(&u); alg->update(&u,ip,alg->block_size); alg->update(&u,msg,mlen);
+    uint8_t inner[48]; alg->final_fn(&u,inner);
+    alg->init(&u); alg->update(&u,op,alg->block_size); alg->update(&u,inner,alg->digest_len);
+    alg->final_fn(&u,out);
+}
+
+static void hkdf_extract_u(const hash_alg *alg, const uint8_t *salt, size_t slen,
+                             const uint8_t *ikm, size_t ilen, uint8_t *out) {
+    if(slen==0){uint8_t z[48]={0}; hmac(alg,z,alg->digest_len,ikm,ilen,out);}
+    else hmac(alg,salt,slen,ikm,ilen,out);
+}
+
+static void hkdf_expand_u(const hash_alg *alg, const uint8_t *prk,
+                            const uint8_t *info, size_t ilen, uint8_t *out, size_t olen) {
+    uint8_t t[48]; size_t tl=0, done=0; uint8_t ctr=1;
+    while(done<olen){
+        union{sha256_ctx s2;sha384_ctx s3;}u;
+        uint8_t ik[128]={0},ok[128]={0};
+        memcpy(ik,prk,alg->digest_len);
+        for(size_t i=0;i<alg->block_size;i++){ik[i]^=0x36;ok[i]=((i<alg->digest_len)?prk[i]:0)^0x5c;}
+        alg->init(&u); alg->update(&u,ik,alg->block_size);
+        if(tl>0) alg->update(&u,t,tl);
+        alg->update(&u,info,ilen);
+        alg->update(&u,&ctr,1);
+        uint8_t inner[48]; alg->final_fn(&u,inner);
+        union{sha256_ctx s2;sha384_ctx s3;}u2;
+        alg->init(&u2); alg->update(&u2,ok,alg->block_size); alg->update(&u2,inner,alg->digest_len);
+        alg->final_fn(&u2,t); tl=alg->digest_len;
+        size_t use=olen-done; if(use>alg->digest_len) use=alg->digest_len;
+        memcpy(out+done,t,use); done+=use; ctr++;
+    }
+}
+
+static void hkdf_expand_label_u(const hash_alg *alg, const uint8_t *secret, const char *label,
+                                  const uint8_t *ctx, size_t clen, uint8_t *out, size_t olen) {
+    uint8_t info[256]; size_t p=0;
+    size_t label_len=strlen(label);
+    if(2+1+6+label_len+1+clen>sizeof(info)) die("hkdf_expand_label: info overflow");
+    info[p++]=(olen>>8)&0xFF; info[p++]=olen&0xFF;
+    size_t ll=6+label_len;
+    info[p++]=ll&0xFF;
+    memcpy(info+p,"tls13 ",6); p+=6;
+    memcpy(info+p,label,label_len); p+=label_len;
+    info[p++]=clen&0xFF;
+    if(clen>0){memcpy(info+p,ctx,clen);p+=clen;}
+    hkdf_expand_u(alg,secret,info,p,out,olen);
+}
+
+static void tls12_prf_u(const hash_alg *alg, const uint8_t *secret, size_t secret_len,
+                          const char *label, const uint8_t *seed, size_t seed_len,
+                          uint8_t *out, size_t out_len) {
+    uint8_t lseed[256];
+    size_t label_len=strlen(label);
+    size_t ls_len=label_len+seed_len;
+    if(ls_len>sizeof(lseed)) die("tls12_prf: label+seed overflow");
+    memcpy(lseed,label,label_len);
+    memcpy(lseed+label_len,seed,seed_len);
+    uint8_t a[48];
+    hmac(alg,secret,secret_len,lseed,ls_len,a);
+    size_t done=0;
+    while(done<out_len){
+        uint8_t buf[48+256];
+        memcpy(buf,a,alg->digest_len);
+        memcpy(buf+alg->digest_len,lseed,ls_len);
+        uint8_t hmac_out[48];
+        hmac(alg,secret,secret_len,buf,alg->digest_len+ls_len,hmac_out);
+        size_t use=out_len-done; if(use>alg->digest_len) use=alg->digest_len;
+        memcpy(out+done,hmac_out,use); done+=use;
+        hmac(alg,secret,secret_len,a,alg->digest_len,a);
+    }
+}
+
 /* SHA-512: same algorithm as SHA-384, different IVs, full 64-byte output */
 typedef sha384_ctx sha512_ctx;
 #define sha512_transform sha384_transform
@@ -895,88 +906,6 @@ static void sha512_final(sha512_ctx *ctx, uint8_t out[64]) {
 
 static void sha512_hash(const uint8_t *data, size_t len, uint8_t out[64]) {
     sha512_ctx c; sha512_init(&c); sha512_update(&c,data,len); sha512_final(&c,out);
-}
-
-/* HMAC-SHA384 */
-static void hmac_sha384(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen, uint8_t out[48]) {
-    uint8_t k[128]={0};
-    if (klen>128) sha384_hash(key,klen,k); else memcpy(k,key,klen);
-    uint8_t ip[128], op[128];
-    for (int i=0;i<128;i++) { ip[i]=k[i]^0x36; op[i]=k[i]^0x5c; }
-    sha384_ctx c; sha384_init(&c); sha384_update(&c,ip,128); sha384_update(&c,msg,mlen);
-    uint8_t inner[48]; sha384_final(&c,inner);
-    sha384_init(&c); sha384_update(&c,op,128); sha384_update(&c,inner,48); sha384_final(&c,out);
-}
-
-/* TLS 1.2 PRF using SHA-384 (for AES-256 cipher suites) */
-static void tls12_prf_sha384(const uint8_t *secret, size_t secret_len,
-                              const char *label,
-                              const uint8_t *seed, size_t seed_len,
-                              uint8_t *out, size_t out_len) {
-    uint8_t lseed[256];
-    size_t label_len = strlen(label);
-    size_t ls_len = label_len + seed_len;
-    if(ls_len > sizeof(lseed)) die("tls12_prf_sha384: label+seed overflow");
-    memcpy(lseed, label, label_len);
-    memcpy(lseed + label_len, seed, seed_len);
-
-    uint8_t a[48];
-    hmac_sha384(secret, secret_len, lseed, ls_len, a);
-
-    size_t done = 0;
-    while (done < out_len) {
-        uint8_t buf[48 + 256];
-        memcpy(buf, a, 48);
-        memcpy(buf + 48, lseed, ls_len);
-        uint8_t hmac_out[48];
-        hmac_sha384(secret, secret_len, buf, 48 + ls_len, hmac_out);
-
-        size_t use = out_len - done;
-        if (use > 48) use = 48;
-        memcpy(out + done, hmac_out, use);
-        done += use;
-
-        hmac_sha384(secret, secret_len, a, 48, a);
-    }
-}
-
-/* HKDF-SHA384 variants for TLS_AES_256_GCM_SHA384 (0x1302) */
-static void hkdf_extract_384(const uint8_t *salt, size_t slen, const uint8_t *ikm, size_t ilen, uint8_t out[48]) {
-    if (slen == 0) { uint8_t z[48]={0}; hmac_sha384(z,48,ikm,ilen,out); }
-    else hmac_sha384(salt,slen,ikm,ilen,out);
-}
-
-static void hkdf_expand_384(const uint8_t prk[48], const uint8_t *info, size_t ilen, uint8_t *out, size_t olen) {
-    uint8_t t[48]; size_t tl=0, done=0; uint8_t ctr=1;
-    while (done < olen) {
-        sha384_ctx c; sha384_init(&c);
-        uint8_t ik[128]={0}, ok[128]={0}; memcpy(ik,prk,48);
-        for(int i=0;i<128;i++){ik[i]^=0x36;ok[i]=((i<48)?prk[i]:0)^0x5c;}
-        sha384_update(&c,ik,128);
-        if (tl>0) sha384_update(&c,t,tl);
-        sha384_update(&c,info,ilen);
-        sha384_update(&c,&ctr,1);
-        uint8_t inner[48]; sha384_final(&c,inner);
-        sha384_ctx c2; sha384_init(&c2); sha384_update(&c2,ok,128); sha384_update(&c2,inner,48);
-        sha384_final(&c2,t); tl=48;
-        size_t use = olen-done; if(use>48) use=48;
-        memcpy(out+done,t,use); done+=use; ctr++;
-    }
-}
-
-static void hkdf_expand_label_384(const uint8_t secret[48], const char *label,
-                                    const uint8_t *ctx, size_t clen, uint8_t *out, size_t olen) {
-    uint8_t info[256]; size_t p=0;
-    size_t label_len=strlen(label);
-    if(2+1+6+label_len+1+clen>sizeof(info)) die("hkdf_expand_label_384: info overflow");
-    info[p++]=(olen>>8)&0xFF; info[p++]=olen&0xFF;
-    size_t ll=6+label_len;
-    info[p++]=ll&0xFF;
-    memcpy(info+p,"tls13 ",6); p+=6;
-    memcpy(info+p,label,label_len); p+=label_len;
-    info[p++]=clen&0xFF;
-    if(clen>0){memcpy(info+p,ctx,clen);p+=clen;}
-    hkdf_expand_384(secret,info,p,out,olen);
 }
 
 /* OID constants */
@@ -1622,7 +1551,6 @@ static int rsa_pkcs1_verify(const uint8_t *hash, size_t hash_len,
 /* ================================================================
  * RSA-PSS Signature Verification (unified)
  * ================================================================ */
-typedef void (*hash_fn_t)(const uint8_t*, size_t, uint8_t*);
 
 static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
                            hash_fn_t hash_fn,
@@ -2959,6 +2887,7 @@ static void do_https_get(const char *host, int port, const char *path) {
 
         /* TLS 1.2 key derivation */
         int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030);
+        const hash_alg *alg = is_aes256 ? &SHA384_ALG : &SHA256_ALG;
         size_t key_len = is_aes256 ? AES256_KEY_LEN : AES128_KEY_LEN;
 
         uint8_t pms_seed[64];
@@ -2966,10 +2895,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         memcpy(pms_seed+32, server_random, 32);
 
         uint8_t tls12_master[48];
-        if(is_aes256)
-            tls12_prf_sha384(ss12, ss12_len, "master secret", pms_seed, 64, tls12_master, 48);
-        else
-            tls12_prf(ss12, ss12_len, "master secret", pms_seed, 64, tls12_master, 48);
+        tls12_prf_u(alg, ss12, ss12_len, "master secret", pms_seed, 64, tls12_master, 48);
 
         uint8_t ke_seed[64];
         memcpy(ke_seed, server_random, 32);
@@ -2977,10 +2903,7 @@ static void do_https_get(const char *host, int port, const char *path) {
 
         size_t kb_len = key_len*2 + 8; /* 2 keys + 2 IVs(4 each) */
         uint8_t key_block[72];
-        if(is_aes256)
-            tls12_prf_sha384(tls12_master, 48, "key expansion", ke_seed, 64, key_block, kb_len);
-        else
-            tls12_prf(tls12_master, 48, "key expansion", ke_seed, 64, key_block, kb_len);
+        tls12_prf_u(alg, tls12_master, 48, "key expansion", ke_seed, 64, key_block, kb_len);
 
         uint8_t c_wk[32], s_wk[32], c_wiv[4], s_wiv[4];
         memcpy(c_wk, key_block, key_len);
@@ -3006,10 +2929,7 @@ static void do_https_get(const char *host, int port, const char *path) {
             }
 
             uint8_t verify_data[12];
-            if(is_aes256)
-                tls12_prf_sha384(tls12_master, 48, "client finished", th12, th12_len, verify_data, 12);
-            else
-                tls12_prf(tls12_master, 48, "client finished", th12, th12_len, verify_data, 12);
+            tls12_prf_u(alg, tls12_master, 48, "client finished", th12, th12_len, verify_data, 12);
 
             uint8_t fin_msg[16];
             fin_msg[0]=0x14;
@@ -3047,10 +2967,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                 th12_sf_len=SHA256_DIGEST_LEN;
             }
             uint8_t expected[12];
-            if(is_aes256)
-                tls12_prf_sha384(tls12_master, 48, "server finished", th12_sf, th12_sf_len, expected, 12);
-            else
-                tls12_prf(tls12_master, 48, "server finished", th12_sf, th12_sf_len, expected, 12);
+            tls12_prf_u(alg, tls12_master, 48, "server finished", th12_sf, th12_sf_len, expected, 12);
             if(!ct_memeq(expected, pt12+4, 12)) die("Server Finished verify failed!");
             printf("Server Finished VERIFIED\n");
         }
@@ -3110,7 +3027,8 @@ static void do_https_get(const char *host, int port, const char *path) {
     (void)sh_leftover; /* only used in TLS 1.2 path */
     uint16_t selected_group = (server_pub_len==P256_POINT_LEN) ? TLS_GROUP_SECP256R1 : TLS_GROUP_SECP384R1;
     int is_aes256 = (cipher_suite == 0x1302);
-    size_t hash_len = is_aes256 ? SHA384_DIGEST_LEN : SHA256_DIGEST_LEN;
+    const hash_alg *alg = is_aes256 ? &SHA384_ALG : &SHA256_ALG;
+    size_t hash_len = alg->digest_len;
     printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",cipher_suite,selected_group);
 
     /* Compute shared secret based on negotiated group */
@@ -3131,24 +3049,12 @@ static void do_https_get(const char *host, int port, const char *path) {
 
     /* Derive handshake keys */
     uint8_t early_secret[SHA384_DIGEST_LEN];
-    if(is_aes256) {
-        uint8_t z[SHA384_DIGEST_LEN]={0}; hkdf_extract_384(z,SHA384_DIGEST_LEN,z,SHA384_DIGEST_LEN,early_secret);
-    } else {
-        uint8_t z[SHA256_DIGEST_LEN]={0}; hkdf_extract(z,SHA256_DIGEST_LEN,z,SHA256_DIGEST_LEN,early_secret);
-    }
+    { uint8_t z[SHA384_DIGEST_LEN]={0}; hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret); }
     uint8_t derived1[SHA384_DIGEST_LEN];
-    if(is_aes256) {
-        uint8_t empty_hash[SHA384_DIGEST_LEN]; sha384_hash(NULL,0,empty_hash);
-        hkdf_expand_label_384(early_secret,"derived",empty_hash,SHA384_DIGEST_LEN,derived1,SHA384_DIGEST_LEN);
-    } else {
-        uint8_t empty_hash[SHA256_DIGEST_LEN]; sha256_hash(NULL,0,empty_hash);
-        hkdf_expand_label(early_secret,"derived",empty_hash,SHA256_DIGEST_LEN,derived1,SHA256_DIGEST_LEN);
-    }
+    { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
+      hkdf_expand_label_u(alg,early_secret,"derived",empty_hash,alg->digest_len,derived1,alg->digest_len); }
     uint8_t hs_secret[SHA384_DIGEST_LEN];
-    if(is_aes256)
-        hkdf_extract_384(derived1,SHA384_DIGEST_LEN,shared,shared_len,hs_secret);
-    else
-        hkdf_extract(derived1,SHA256_DIGEST_LEN,shared,shared_len,hs_secret);
+    hkdf_extract_u(alg,derived1,alg->digest_len,shared,shared_len,hs_secret);
 
     uint8_t th1[SHA384_DIGEST_LEN];
     if(is_aes256) {
@@ -3158,26 +3064,15 @@ static void do_https_get(const char *host, int port, const char *path) {
     }
 
     uint8_t s_hs_traffic[SHA384_DIGEST_LEN], c_hs_traffic[SHA384_DIGEST_LEN];
-    if(is_aes256) {
-        hkdf_expand_label_384(hs_secret,"s hs traffic",th1,SHA384_DIGEST_LEN,s_hs_traffic,SHA384_DIGEST_LEN);
-        hkdf_expand_label_384(hs_secret,"c hs traffic",th1,SHA384_DIGEST_LEN,c_hs_traffic,SHA384_DIGEST_LEN);
-    } else {
-        hkdf_expand_label(hs_secret,"s hs traffic",th1,SHA256_DIGEST_LEN,s_hs_traffic,SHA256_DIGEST_LEN);
-        hkdf_expand_label(hs_secret,"c hs traffic",th1,SHA256_DIGEST_LEN,c_hs_traffic,SHA256_DIGEST_LEN);
-    }
+    hkdf_expand_label_u(alg,hs_secret,"s hs traffic",th1,alg->digest_len,s_hs_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,hs_secret,"c hs traffic",th1,alg->digest_len,c_hs_traffic,alg->digest_len);
 
+    size_t kl = is_aes256 ? AES256_KEY_LEN : AES128_KEY_LEN;
     uint8_t s_hs_key[AES256_KEY_LEN], s_hs_iv[AES_GCM_NONCE_LEN], c_hs_key[AES256_KEY_LEN], c_hs_iv[AES_GCM_NONCE_LEN];
-    if(is_aes256) {
-        hkdf_expand_label_384(s_hs_traffic,"key",NULL,0,s_hs_key,AES256_KEY_LEN);
-        hkdf_expand_label_384(s_hs_traffic,"iv",NULL,0,s_hs_iv,AES_GCM_NONCE_LEN);
-        hkdf_expand_label_384(c_hs_traffic,"key",NULL,0,c_hs_key,AES256_KEY_LEN);
-        hkdf_expand_label_384(c_hs_traffic,"iv",NULL,0,c_hs_iv,AES_GCM_NONCE_LEN);
-    } else {
-        hkdf_expand_label(s_hs_traffic,"key",NULL,0,s_hs_key,AES128_KEY_LEN);
-        hkdf_expand_label(s_hs_traffic,"iv",NULL,0,s_hs_iv,AES_GCM_NONCE_LEN);
-        hkdf_expand_label(c_hs_traffic,"key",NULL,0,c_hs_key,AES128_KEY_LEN);
-        hkdf_expand_label(c_hs_traffic,"iv",NULL,0,c_hs_iv,AES_GCM_NONCE_LEN);
-    }
+    hkdf_expand_label_u(alg,s_hs_traffic,"key",NULL,0,s_hs_key,kl);
+    hkdf_expand_label_u(alg,s_hs_traffic,"iv",NULL,0,s_hs_iv,AES_GCM_NONCE_LEN);
+    hkdf_expand_label_u(alg,c_hs_traffic,"key",NULL,0,c_hs_key,kl);
+    hkdf_expand_label_u(alg,c_hs_traffic,"iv",NULL,0,c_hs_iv,AES_GCM_NONCE_LEN);
     printf("Derived handshake traffic keys\n");
 
     /* Read encrypted handshake messages */
@@ -3307,10 +3202,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                     printf("  Server Finished\n");
                     /* Verify server finished */
                     uint8_t fin_key[SHA384_DIGEST_LEN];
-                    if(is_aes256)
-                        hkdf_expand_label_384(s_hs_traffic,"finished",NULL,0,fin_key,SHA384_DIGEST_LEN);
-                    else
-                        hkdf_expand_label(s_hs_traffic,"finished",NULL,0,fin_key,SHA256_DIGEST_LEN);
+                    hkdf_expand_label_u(alg,s_hs_traffic,"finished",NULL,0,fin_key,alg->digest_len);
                     uint8_t th_before_fin[SHA384_DIGEST_LEN];
                     if(is_aes256) {
                         sha384_ctx tc=transcript384; sha384_final(&tc,th_before_fin);
@@ -3318,10 +3210,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                         sha256_ctx tc=transcript; sha256_final(&tc,th_before_fin);
                     }
                     uint8_t expected[SHA384_DIGEST_LEN];
-                    if(is_aes256)
-                        hmac_sha384(fin_key,SHA384_DIGEST_LEN,th_before_fin,SHA384_DIGEST_LEN,expected);
-                    else
-                        hmac_sha256(fin_key,SHA256_DIGEST_LEN,th_before_fin,SHA256_DIGEST_LEN,expected);
+                    hmac(alg,fin_key,alg->digest_len,th_before_fin,alg->digest_len,expected);
                     if(!ct_memeq(expected,hs_buf+pos+4,hash_len)) die("Server Finished verify failed!");
                     printf("  Server Finished VERIFIED\n");
                     if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
@@ -3358,41 +3247,20 @@ static void do_https_get(const char *host, int port, const char *path) {
     }
 
     uint8_t derived2[SHA384_DIGEST_LEN];
-    if(is_aes256) {
-        uint8_t empty_hash[SHA384_DIGEST_LEN]; sha384_hash(NULL,0,empty_hash);
-        hkdf_expand_label_384(hs_secret,"derived",empty_hash,SHA384_DIGEST_LEN,derived2,SHA384_DIGEST_LEN);
-    } else {
-        uint8_t empty_hash[SHA256_DIGEST_LEN]; sha256_hash(NULL,0,empty_hash);
-        hkdf_expand_label(hs_secret,"derived",empty_hash,SHA256_DIGEST_LEN,derived2,SHA256_DIGEST_LEN);
-    }
+    { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
+      hkdf_expand_label_u(alg,hs_secret,"derived",empty_hash,alg->digest_len,derived2,alg->digest_len); }
     uint8_t master_secret[SHA384_DIGEST_LEN];
-    if(is_aes256) {
-        uint8_t z[SHA384_DIGEST_LEN]={0}; hkdf_extract_384(derived2,SHA384_DIGEST_LEN,z,SHA384_DIGEST_LEN,master_secret);
-    } else {
-        uint8_t z[SHA256_DIGEST_LEN]={0}; hkdf_extract(derived2,SHA256_DIGEST_LEN,z,SHA256_DIGEST_LEN,master_secret);
-    }
+    { uint8_t z[SHA384_DIGEST_LEN]={0}; hkdf_extract_u(alg,derived2,alg->digest_len,z,alg->digest_len,master_secret); }
 
     uint8_t s_ap_traffic[SHA384_DIGEST_LEN], c_ap_traffic[SHA384_DIGEST_LEN];
-    if(is_aes256) {
-        hkdf_expand_label_384(master_secret,"s ap traffic",th_sf,SHA384_DIGEST_LEN,s_ap_traffic,SHA384_DIGEST_LEN);
-        hkdf_expand_label_384(master_secret,"c ap traffic",th_sf,SHA384_DIGEST_LEN,c_ap_traffic,SHA384_DIGEST_LEN);
-    } else {
-        hkdf_expand_label(master_secret,"s ap traffic",th_sf,SHA256_DIGEST_LEN,s_ap_traffic,SHA256_DIGEST_LEN);
-        hkdf_expand_label(master_secret,"c ap traffic",th_sf,SHA256_DIGEST_LEN,c_ap_traffic,SHA256_DIGEST_LEN);
-    }
+    hkdf_expand_label_u(alg,master_secret,"s ap traffic",th_sf,alg->digest_len,s_ap_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,master_secret,"c ap traffic",th_sf,alg->digest_len,c_ap_traffic,alg->digest_len);
 
     uint8_t s_ap_key[AES256_KEY_LEN], s_ap_iv[AES_GCM_NONCE_LEN], c_ap_key[AES256_KEY_LEN], c_ap_iv[AES_GCM_NONCE_LEN];
-    if(is_aes256) {
-        hkdf_expand_label_384(s_ap_traffic,"key",NULL,0,s_ap_key,AES256_KEY_LEN);
-        hkdf_expand_label_384(s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
-        hkdf_expand_label_384(c_ap_traffic,"key",NULL,0,c_ap_key,AES256_KEY_LEN);
-        hkdf_expand_label_384(c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
-    } else {
-        hkdf_expand_label(s_ap_traffic,"key",NULL,0,s_ap_key,AES128_KEY_LEN);
-        hkdf_expand_label(s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
-        hkdf_expand_label(c_ap_traffic,"key",NULL,0,c_ap_key,AES128_KEY_LEN);
-        hkdf_expand_label(c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
-    }
+    hkdf_expand_label_u(alg,s_ap_traffic,"key",NULL,0,s_ap_key,kl);
+    hkdf_expand_label_u(alg,s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
+    hkdf_expand_label_u(alg,c_ap_traffic,"key",NULL,0,c_ap_key,kl);
+    hkdf_expand_label_u(alg,c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
     printf("Derived application traffic keys\n");
 
     /* Send client ChangeCipherSpec (compat) */
@@ -3401,15 +3269,9 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* Send client Finished */
     {
         uint8_t fin_key[SHA384_DIGEST_LEN];
-        if(is_aes256)
-            hkdf_expand_label_384(c_hs_traffic,"finished",NULL,0,fin_key,SHA384_DIGEST_LEN);
-        else
-            hkdf_expand_label(c_hs_traffic,"finished",NULL,0,fin_key,SHA256_DIGEST_LEN);
+        hkdf_expand_label_u(alg,c_hs_traffic,"finished",NULL,0,fin_key,alg->digest_len);
         uint8_t verify[SHA384_DIGEST_LEN];
-        if(is_aes256)
-            hmac_sha384(fin_key,SHA384_DIGEST_LEN,th_sf,SHA384_DIGEST_LEN,verify);
-        else
-            hmac_sha256(fin_key,SHA256_DIGEST_LEN,th_sf,SHA256_DIGEST_LEN,verify);
+        hmac(alg,fin_key,alg->digest_len,th_sf,alg->digest_len,verify);
         uint8_t fin_msg[52]; fin_msg[0]=0x14;
         fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=(uint8_t)hash_len;
         memcpy(fin_msg+4,verify,hash_len);
@@ -3449,18 +3311,12 @@ static void do_https_get(const char *host, int port, const char *path) {
                     /* KeyUpdate (type 24, length 1) */
                     uint8_t request_update=pt[4];
                     /* Derive new server traffic secret */
-                    if(is_aes256) {
+                    {
                         uint8_t new_s[SHA384_DIGEST_LEN];
-                        hkdf_expand_label_384(s_ap_traffic,"traffic upd",NULL,0,new_s,SHA384_DIGEST_LEN);
-                        memcpy(s_ap_traffic,new_s,SHA384_DIGEST_LEN);
-                        hkdf_expand_label_384(s_ap_traffic,"key",NULL,0,s_ap_key,AES256_KEY_LEN);
-                        hkdf_expand_label_384(s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
-                    } else {
-                        uint8_t new_s[SHA256_DIGEST_LEN];
-                        hkdf_expand_label(s_ap_traffic,"traffic upd",NULL,0,new_s,SHA256_DIGEST_LEN);
-                        memcpy(s_ap_traffic,new_s,SHA256_DIGEST_LEN);
-                        hkdf_expand_label(s_ap_traffic,"key",NULL,0,s_ap_key,AES128_KEY_LEN);
-                        hkdf_expand_label(s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
+                        hkdf_expand_label_u(alg,s_ap_traffic,"traffic upd",NULL,0,new_s,alg->digest_len);
+                        memcpy(s_ap_traffic,new_s,alg->digest_len);
+                        hkdf_expand_label_u(alg,s_ap_traffic,"key",NULL,0,s_ap_key,kl);
+                        hkdf_expand_label_u(alg,s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
                     }
                     s_ap_seq=0;
                     if(request_update==1) {
@@ -3468,18 +3324,12 @@ static void do_https_get(const char *host, int port, const char *path) {
                         uint8_t ku_msg[5]={24,0,0,1,0};
                         encrypt_and_send(fd,TLS_RT_HANDSHAKE,ku_msg,5,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256);
                         /* Derive new client traffic secret */
-                        if(is_aes256) {
+                        {
                             uint8_t new_c[SHA384_DIGEST_LEN];
-                            hkdf_expand_label_384(c_ap_traffic,"traffic upd",NULL,0,new_c,SHA384_DIGEST_LEN);
-                            memcpy(c_ap_traffic,new_c,SHA384_DIGEST_LEN);
-                            hkdf_expand_label_384(c_ap_traffic,"key",NULL,0,c_ap_key,AES256_KEY_LEN);
-                            hkdf_expand_label_384(c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
-                        } else {
-                            uint8_t new_c[SHA256_DIGEST_LEN];
-                            hkdf_expand_label(c_ap_traffic,"traffic upd",NULL,0,new_c,SHA256_DIGEST_LEN);
-                            memcpy(c_ap_traffic,new_c,SHA256_DIGEST_LEN);
-                            hkdf_expand_label(c_ap_traffic,"key",NULL,0,c_ap_key,AES128_KEY_LEN);
-                            hkdf_expand_label(c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
+                            hkdf_expand_label_u(alg,c_ap_traffic,"traffic upd",NULL,0,new_c,alg->digest_len);
+                            memcpy(c_ap_traffic,new_c,alg->digest_len);
+                            hkdf_expand_label_u(alg,c_ap_traffic,"key",NULL,0,c_ap_key,kl);
+                            hkdf_expand_label_u(alg,c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
                         }
                         c_ap_seq=0;
                     }
