@@ -2995,7 +2995,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                             die("SKE signature algorithm not in offered list");
 
                         /* Signed data: client_random || server_random || params */
-                        uint8_t signed_data[200];
+                        uint8_t signed_data[256];
                         memcpy(signed_data, client_random, 32);
                         memcpy(signed_data+32, server_random, 32);
                         memcpy(signed_data+64, ske, params_len);
