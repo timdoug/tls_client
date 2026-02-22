@@ -1,13 +1,15 @@
 /*
  * tls_client.c — TLS 1.2/1.3 HTTPS client from scratch in C.
- * Implements: SHA-256, SHA-384, HMAC, HKDF, AES-128/256-GCM, ChaCha20-Poly1305,
- *             ECDHE-P256/P384, X25519, TLS 1.2/1.3
+ * Implements: SHA-1, SHA-256, SHA-384, HMAC, HKDF, AES-128/256-GCM,
+ *             AES-128/256-CBC, ChaCha20-Poly1305, ECDHE-P256/P384, X25519,
+ *             TLS 1.2/1.3
  * No external crypto libraries.
  *
  * Compile:  cc -O2 -o tls_client tls_client.c
  * Run:      ./tls_client
  *
- * Certificate verification: SHA-384, ECDSA-P384, RSA PKCS#1 v1.5, X.509 chain.
+ * Certificate verification: SHA-256/384/512, ECDSA-P256/P384,
+ *   RSA PKCS#1 v1.5, RSA-PSS, X.509 chain.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,7 +182,7 @@ static void sha256_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
 }
 
 /* ================================================================
- * SHA-1 (needed for HMAC-SHA-1 in TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA)
+ * SHA-1 (needed for HMAC-SHA-1 MAC in TLS 1.2 AES-CBC-SHA cipher suites)
  * ================================================================ */
 #define SHA1_DIGEST_LEN 20
 
@@ -243,7 +245,7 @@ static void sha1_hash(const uint8_t *data, size_t len, uint8_t out[20]) {
 }
 
 /* ================================================================
- * AES-128
+ * AES (128/256)
  * ================================================================ */
 static const uint8_t aes_sbox[256] = {
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
@@ -331,7 +333,7 @@ static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t
 }
 
 /* ================================================================
- * AES-128-GCM
+ * AES-GCM (128/256)
  * ================================================================ */
 static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
     uint8_t v[16],z[16]; memcpy(v,y,16); memset(z,0,16);
@@ -779,7 +781,7 @@ static void ec384_scalar_mul(ec384 *r, const ec384 *p, const uint8_t scalar[48])
     *r=R0;
 }
 
-/* ECDHE: generate keypair, compute shared secret */
+/* ECDHE P-384: generate keypair, compute shared secret */
 static void ecdhe_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_POINT_LEN]) {
     random_bytes(priv,P384_SCALAR_LEN);
     priv[0] |= 0x80; /* Set top bit so Montgomery ladder never hits infinity */
@@ -1125,7 +1127,6 @@ static void sha512_hash(const uint8_t *data, size_t len, uint8_t out[64]) {
     sha512_ctx c; sha512_init(&c); sha512_update(&c,data,len); sha512_final(&c,out);
 }
 
-/* OID constants */
 /* ================================================================
  * Big-Number Arithmetic (for RSA and ECDSA mod-n operations)
  * ================================================================ */
@@ -1772,7 +1773,7 @@ static void chacha20_encrypt(const uint8_t key[32], const uint8_t nonce[12], uin
 
 /* ================================================================
  * Poly1305 MAC (RFC 8439)
- * Prime: p = 2^130 - 5.  Accumulator in 3×64-bit limbs.
+ * Prime: p = 2^130 - 5.  Accumulator in 3 x 64-bit words (44/44/42-bit limbs).
  * ================================================================ */
 static void poly1305_mac(const uint8_t key[32], const uint8_t *msg,
     size_t msg_len, uint8_t tag[16]) {
@@ -2870,7 +2871,7 @@ static void tls_send_record(int fd, uint8_t type, const uint8_t *data, size_t le
     free(buf);
 }
 
-/* Read a TLS record. Returns content type. */
+/* Read a TLS record. Returns content type, or -1 on error. */
 static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
     uint8_t hdr[5];
     if(read_exact(fd,hdr,5)<0) return -1;
@@ -3742,7 +3743,7 @@ static void tls12_handshake(tls_conn *conn) {
     int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030
                   || cipher_suite==0x009D || cipher_suite==0xC014
                   || cipher_suite==0x0035 || cipher_suite==0xC00A);
-    /* PRF hash: 0x009D (GCM-SHA384) uses SHA-384, ChaCha20 suites use SHA-256 */
+    /* PRF hash: AES-256-GCM suites (0xC02C, 0xC030, 0x009D) use SHA-384; all others SHA-256 */
     int prf_is_sha384 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D);
     const hash_alg *alg = prf_is_sha384 ? &SHA384_ALG : &SHA256_ALG;
     size_t key_len;
@@ -4573,7 +4574,7 @@ int main(int argc, char **argv) {
     char *colon = strchr(host, ':');
     if (colon) { port = atoi(colon + 1); *colon = '\0'; }
     printf("TLS 1.2/1.3 HTTPS Client — from scratch in C\n");
-    printf("Ciphers: AES-GCM, ChaCha20-Poly1305 | Key Exchange: X25519, P-256, P-384\n\n");
+    printf("Ciphers: AES-128/256-GCM, AES-CBC, ChaCha20-Poly1305 | Key Exchange: X25519, P-256, P-384, RSA\n\n");
     do_https_get(host, port, path);
     return 0;
 }
