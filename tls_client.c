@@ -2951,6 +2951,12 @@ static void do_https_get(const char *host, int port, const char *path) {
                         uint16_t sig_len_val=GET16(sig_ptr); sig_ptr+=2;
                         if(params_len+4+sig_len_val>mlen) die("SKE signature truncated");
 
+                        /* Validate sig algo against offered signature_algorithms */
+                        if(sig_algo!=0x0403 && sig_algo!=0x0503 &&
+                           sig_algo!=0x0804 && sig_algo!=0x0805 &&
+                           sig_algo!=0x0401 && sig_algo!=0x0501)
+                            die("SKE signature algorithm not in offered list");
+
                         /* Signed data: client_random || server_random || params */
                         uint8_t signed_data[200];
                         memcpy(signed_data, client_random, 32);
