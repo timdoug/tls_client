@@ -1948,6 +1948,9 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
             const uint8_t *exts_val=der_read_tl(ext_outer,ext_outer+len,&tag,&len);
             if(exts_val&&tag==0x30){
                 const uint8_t *ep=exts_val, *exts_end=exts_val+len;
+                #define MAX_EXT_OIDS 20
+                struct { const uint8_t *oid; size_t len; } seen_oids[MAX_EXT_OIDS];
+                int seen_count=0;
                 while(ep<exts_end){
                     const uint8_t *ext_seq=der_read_tl(ep,exts_end,&tag,&len);
                     if(!ext_seq||tag!=0x30) break;
@@ -1955,6 +1958,16 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
                     ep=ext_end2;
                     const uint8_t *eoid=der_read_tl(ext_seq,ext_end2,&tag,&len);
                     if(!eoid||tag!=0x06) continue;
+                    /* RFC 5280 §4.2: each extension OID must be unique */
+                    for(int si=0;si<seen_count;si++){
+                        if(seen_oids[si].len==len && memcmp(seen_oids[si].oid,eoid,len)==0)
+                            return -1;
+                    }
+                    if(seen_count<MAX_EXT_OIDS){
+                        seen_oids[seen_count].oid=eoid;
+                        seen_oids[seen_count].len=len;
+                        seen_count++;
+                    }
                     if(oid_eq(eoid,len,OID_SAN,sizeof(OID_SAN))){
                         const uint8_t *rest=eoid+len;
                         if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
