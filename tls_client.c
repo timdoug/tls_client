@@ -3392,7 +3392,7 @@ static void tls13_handshake(tls_conn *conn) {
     }
 
     /* Process encrypted records until we get Finished */
-    int got_finished=0, got_cert_verify=0;
+    int got_finished=0, got_cert_verify=0, got_cert_request=0;
     uint8_t *saved_cert_msg=NULL; size_t saved_cert_msg_len=0;
     while(!got_finished) {
         if(rtype!=TLS_RT_APPDATA) die("expected encrypted record");
@@ -3427,6 +3427,12 @@ static void tls13_handshake(tls_conn *conn) {
                     if(!saved_cert_msg) die("malloc failed");
                     memcpy(saved_cert_msg,hs_buf+pos+4,mlen);
                     saved_cert_msg_len=mlen;
+                    break;
+                case 13: /* CertificateRequest */
+                    printf("  CertificateRequest (%u bytes)\n",(unsigned)mlen);
+                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&transcript,hs_buf+pos,msg_total);
+                    got_cert_request=1;
                     break;
                 case 15: { /* CertificateVerify */
                     printf("  CertificateVerify (%u bytes)\n",(unsigned)mlen);
@@ -3572,16 +3578,39 @@ static void tls13_handshake(tls_conn *conn) {
     /* Send client ChangeCipherSpec (compat) */
     { uint8_t ccs=1; tls_send_record(fd,TLS_RT_CCS,&ccs,1); }
 
+    uint64_t c_hs_seq=0;
+
+    /* If server requested client cert, send empty Certificate (RFC 8446 §4.4.2) */
+    if(got_cert_request) {
+        /* Empty Certificate: context_len(1)=0, cert_list_len(3)=0 */
+        uint8_t cert_msg[8];
+        cert_msg[0]=0x0b; /* Certificate */
+        cert_msg[1]=0; cert_msg[2]=0; cert_msg[3]=4; /* length = 4 */
+        cert_msg[4]=0; /* certificate_request_context length = 0 */
+        cert_msg[5]=0; cert_msg[6]=0; cert_msg[7]=0; /* certificate_list length = 0 */
+        encrypt_and_send(fd,TLS_RT_HANDSHAKE,cert_msg,8,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256);
+        if(is_aes256) sha384_update(&transcript384,cert_msg,8);
+        else sha256_update(&transcript,cert_msg,8);
+        printf("Sent empty client Certificate\n");
+    }
+
     /* Send client Finished */
     {
+        /* Transcript hash includes client Certificate if sent */
+        uint8_t th_for_fin[SHA384_DIGEST_LEN];
+        if(is_aes256) {
+            sha384_ctx tc=transcript384; sha384_final(&tc,th_for_fin);
+        } else {
+            sha256_ctx tc=transcript; sha256_final(&tc,th_for_fin);
+        }
         uint8_t fin_key[SHA384_DIGEST_LEN];
         hkdf_expand_label_u(alg,c_hs_traffic,"finished",NULL,0,fin_key,alg->digest_len);
         uint8_t verify[SHA384_DIGEST_LEN];
-        hmac(alg,fin_key,alg->digest_len,th_sf,alg->digest_len,verify);
+        hmac(alg,fin_key,alg->digest_len,th_for_fin,alg->digest_len,verify);
         uint8_t fin_msg[52]; fin_msg[0]=0x14;
         fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=(uint8_t)hash_len;
         memcpy(fin_msg+4,verify,hash_len);
-        encrypt_and_send(fd,TLS_RT_HANDSHAKE,fin_msg,4+hash_len,c_hs_key,c_hs_iv,0,is_aes256);
+        encrypt_and_send(fd,TLS_RT_HANDSHAKE,fin_msg,4+hash_len,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256);
     }
     printf("Sent client Finished\n");
 
