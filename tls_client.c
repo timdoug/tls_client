@@ -2375,14 +2375,15 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[65],
     buf[p++]=32;
     random_bytes(buf+p,32); p+=32;
 
-    /* Cipher suites: TLS 1.3 + TLS 1.2 ECDHE-GCM */
-    buf[p++]=0x00; buf[p++]=0x0C; /* 12 bytes = 6 suites */
+    /* Cipher suites: TLS 1.3 + TLS 1.2 ECDHE-GCM + SCSV */
+    buf[p++]=0x00; buf[p++]=0x0E; /* 14 bytes = 7 suites */
     buf[p++]=0x13; buf[p++]=0x01; /* TLS_AES_128_GCM_SHA256 */
     buf[p++]=0x13; buf[p++]=0x02; /* TLS_AES_256_GCM_SHA384 */
     buf[p++]=0xC0; buf[p++]=0x2B; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2F; /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x2C; /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
     buf[p++]=0xC0; buf[p++]=0x30; /* TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 */
+    buf[p++]=0x00; buf[p++]=0xFF; /* TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746) */
 
     /* Compression */
     buf[p++]=0x01; buf[p++]=0x00;
