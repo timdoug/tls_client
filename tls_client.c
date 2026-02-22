@@ -130,8 +130,11 @@ typedef struct { uint32_t h[8]; uint8_t buf[64]; size_t buf_len; uint64_t total;
 
 static void sha256_transform(sha256_ctx *ctx, const uint8_t blk[64]) {
     uint32_t w[64], a,b,c,d,e,f,g,h;
-    for (int i=0;i<16;i++) w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)|((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
-    for (int i=16;i<64;i++) w[i]=SIG1(w[i-2])+w[i-7]+SIG0(w[i-15])+w[i-16];
+    for (int i=0;i<16;i++)
+        w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)
+            |((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
+    for (int i=16;i<64;i++)
+        w[i]=SIG1(w[i-2])+w[i-7]+SIG0(w[i-15])+w[i-16];
     a=ctx->h[0];b=ctx->h[1];c=ctx->h[2];d=ctx->h[3];
     e=ctx->h[4];f=ctx->h[5];g=ctx->h[6];h=ctx->h[7];
     for (int i=0;i<64;i++) {
@@ -166,7 +169,10 @@ static void sha256_final(sha256_ctx *ctx, uint8_t out[32]) {
     while (ctx->buf_len != 56) sha256_update(ctx, &pad, 1);
     uint8_t lb[8]; for (int i=7;i>=0;i--) { lb[i]=bits&0xFF; bits>>=8; }
     sha256_update(ctx, lb, 8);
-    for (int i=0;i<8;i++) { out[4*i]=(ctx->h[i]>>24)&0xFF; out[4*i+1]=(ctx->h[i]>>16)&0xFF; out[4*i+2]=(ctx->h[i]>>8)&0xFF; out[4*i+3]=ctx->h[i]&0xFF; }
+    for (int i=0;i<8;i++) {
+        out[4*i]=(ctx->h[i]>>24)&0xFF; out[4*i+1]=(ctx->h[i]>>16)&0xFF;
+        out[4*i+2]=(ctx->h[i]>>8)&0xFF; out[4*i+3]=ctx->h[i]&0xFF;
+    }
 }
 
 static void sha256_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
@@ -182,8 +188,13 @@ typedef struct { uint32_t h[5]; uint8_t buf[64]; size_t buf_len; uint64_t total;
 
 static void sha1_transform(sha1_ctx *ctx, const uint8_t blk[64]) {
     uint32_t w[80];
-    for(int i=0;i<16;i++) w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)|((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
-    for(int i=16;i<80;i++){uint32_t t=w[i-3]^w[i-8]^w[i-14]^w[i-16];w[i]=(t<<1)|(t>>31);}
+    for(int i=0;i<16;i++)
+        w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)
+            |((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
+    for(int i=16;i<80;i++){
+        uint32_t t=w[i-3]^w[i-8]^w[i-14]^w[i-16];
+        w[i]=(t<<1)|(t>>31);
+    }
     uint32_t a=ctx->h[0],b=ctx->h[1],c=ctx->h[2],d=ctx->h[3],e=ctx->h[4];
     for(int i=0;i<80;i++){
         uint32_t f,k;
@@ -198,7 +209,8 @@ static void sha1_transform(sha1_ctx *ctx, const uint8_t blk[64]) {
 }
 
 static void sha1_init(sha1_ctx *ctx) {
-    ctx->h[0]=0x67452301;ctx->h[1]=0xEFCDAB89;ctx->h[2]=0x98BADCFE;ctx->h[3]=0x10325476;ctx->h[4]=0xC3D2E1F0;
+    ctx->h[0]=0x67452301; ctx->h[1]=0xEFCDAB89; ctx->h[2]=0x98BADCFE;
+    ctx->h[3]=0x10325476; ctx->h[4]=0xC3D2E1F0;
     ctx->buf_len=0;ctx->total=0;
 }
 
@@ -220,7 +232,10 @@ static void sha1_final(sha1_ctx *ctx, uint8_t out[20]) {
     while(ctx->buf_len!=56) sha1_update(ctx,&pad,1);
     uint8_t lb[8]; for(int i=7;i>=0;i--){lb[i]=bits&0xFF;bits>>=8;}
     sha1_update(ctx,lb,8);
-    for(int i=0;i<5;i++){out[4*i]=(ctx->h[i]>>24)&0xFF;out[4*i+1]=(ctx->h[i]>>16)&0xFF;out[4*i+2]=(ctx->h[i]>>8)&0xFF;out[4*i+3]=ctx->h[i]&0xFF;}
+    for(int i=0;i<5;i++){
+        out[4*i]=(ctx->h[i]>>24)&0xFF; out[4*i+1]=(ctx->h[i]>>16)&0xFF;
+        out[4*i+2]=(ctx->h[i]>>8)&0xFF; out[4*i+3]=ctx->h[i]&0xFF;
+    }
 }
 
 static void sha1_hash(const uint8_t *data, size_t len, uint8_t out[20]) {
@@ -267,7 +282,10 @@ static void aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
         uint8_t *p=rk+16*i, *n=rk+16*(i+1);
         uint8_t t[4]={ct_sbox(p[13]),ct_sbox(p[14]),ct_sbox(p[15]),ct_sbox(p[12])};
         t[0]^=aes_rcon[i];
-        for(int j=0;j<4;j++){n[j]=p[j]^t[j];n[4+j]=p[4+j]^n[j];n[8+j]=p[8+j]^n[4+j];n[12+j]=p[12+j]^n[8+j];}
+        for(int j=0;j<4;j++){
+            n[j]=p[j]^t[j]; n[4+j]=p[4+j]^n[j];
+            n[8+j]=p[8+j]^n[4+j]; n[12+j]=p[12+j]^n[8+j];
+        }
     }
 }
 
@@ -332,9 +350,15 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t al,
     uint8_t x[16]={0}, blk[16];
     size_t i;
     for(i=0;i+16<=al;i+=16){for(int j=0;j<16;j++)x[j]^=aad[i+j];gf128_mul(x,x,h);}
-    if(i<al){memset(blk,0,16);memcpy(blk,aad+i,al-i);for(int j=0;j<16;j++)x[j]^=blk[j];gf128_mul(x,x,h);}
+    if(i<al){
+        memset(blk,0,16); memcpy(blk,aad+i,al-i);
+        for(int j=0;j<16;j++) x[j]^=blk[j]; gf128_mul(x,x,h);
+    }
     for(i=0;i+16<=cl;i+=16){for(int j=0;j<16;j++)x[j]^=ct[i+j];gf128_mul(x,x,h);}
-    if(i<cl){memset(blk,0,16);memcpy(blk,ct+i,cl-i);for(int j=0;j<16;j++)x[j]^=blk[j];gf128_mul(x,x,h);}
+    if(i<cl){
+        memset(blk,0,16); memcpy(blk,ct+i,cl-i);
+        for(int j=0;j<16;j++) x[j]^=blk[j]; gf128_mul(x,x,h);
+    }
     memset(blk,0,16);
     uint64_t ab=al*8, cb=cl*8;
     for(int j=0;j<8;j++){blk[7-j]=(ab>>(8*j))&0xFF;blk[15-j]=(cb>>(8*j))&0xFF;}
@@ -515,7 +539,10 @@ static uint64_t fp384_add_raw(fp384 *r, const fp384 *a, const fp384 *b) {
 
 static uint64_t fp384_sub_raw(fp384 *r, const fp384 *a, const fp384 *b) {
     __int128 borrow=0;
-    for(int i=0;i<6;i++){borrow=(__int128)a->v[i]-b->v[i]+borrow;r->v[i]=(uint64_t)borrow;borrow>>=64;}
+    for(int i=0;i<6;i++){
+        borrow=(__int128)a->v[i]-b->v[i]+borrow;
+        r->v[i]=(uint64_t)borrow; borrow>>=64;
+    }
     return (borrow<0)?1:0;
 }
 
@@ -570,7 +597,10 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
       for(int i=1;i<6;i++) sh[i]=(w[i+6]<<32)|(w[i+5]>>32);
       sh[6]=w[11]>>32;
       __int128 borrow=0;
-      for(int i=0;i<10;i++){borrow=(__int128)acc[i]-sh[i]+borrow;acc[i]=(uint64_t)borrow;borrow>>=64;}
+      for(int i=0;i<10;i++){
+          borrow=(__int128)acc[i]-sh[i]+borrow;
+          acc[i]=(uint64_t)borrow; borrow>>=64;
+      }
     }
     /* Second pass: reduce acc[6..9] * K + acc[0..5] */
     { uint64_t hi2[6]={acc[6],acc[7],acc[8],acc[9],0,0}, lo2[6];
@@ -590,7 +620,10 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
         for(int i=1;i<4;i++) sh[i]=(hi2[i]<<32)|(hi2[i-1]>>32);
         sh[4]=hi2[3]>>32;
         __int128 borrow=0;
-        for(int i=0;i<10;i++){borrow=(__int128)acc[i]-sh[i]+borrow;acc[i]=(uint64_t)borrow;borrow>>=64;}
+        for(int i=0;i<10;i++){
+          borrow=(__int128)acc[i]-sh[i]+borrow;
+          acc[i]=(uint64_t)borrow; borrow>>=64;
+      }
       }
     }
     /* Final: constant-time conditional subtraction of p (at most 4 times) */
@@ -630,9 +663,15 @@ static void fp384_to_bytes(uint8_t b[48], const fp384 *a) {
  * ================================================================ */
 typedef struct { fp384 x,y,z; } ec384;
 
-static const fp384 P384_B ={{0x2A85C8EDD3EC2AEF,0xC656398D8A2ED19D,0x0314088F5013875A,0x181D9C6EFE814112,0x988E056BE3F82D19,0xB3312FA7E23EE7E4}};
-static const fp384 P384_GX={{0x3A545E3872760AB7,0x5502F25DBF55296C,0x59F741E082542A38,0x6E1D3B628BA79B98,0x8EB1C71EF320AD74,0xAA87CA22BE8B0537}};
-static const fp384 P384_GY={{0x7A431D7C90EA0E5F,0x0A60B1CE1D7E819D,0xE9DA3113B5F0B8C0,0xF8F41DBD289A147C,0x5D9E98BF9292DC29,0x3617DE4A96262C6F}};
+static const fp384 P384_B ={{
+    0x2A85C8EDD3EC2AEF, 0xC656398D8A2ED19D, 0x0314088F5013875A,
+    0x181D9C6EFE814112, 0x988E056BE3F82D19, 0xB3312FA7E23EE7E4}};
+static const fp384 P384_GX={{
+    0x3A545E3872760AB7, 0x5502F25DBF55296C, 0x59F741E082542A38,
+    0x6E1D3B628BA79B98, 0x8EB1C71EF320AD74, 0xAA87CA22BE8B0537}};
+static const fp384 P384_GY={{
+    0x7A431D7C90EA0E5F, 0x0A60B1CE1D7E819D, 0xE9DA3113B5F0B8C0,
+    0xF8F41DBD289A147C, 0x5D9E98BF9292DC29, 0x3617DE4A96262C6F}};
 
 /* Check if affine point (x,y) is on curve: y^2 = x^3 - 3x + b */
 static int ec384_on_curve(const fp384 *x, const fp384 *y) {
@@ -761,7 +800,8 @@ static void ecdhe_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_POINT_L
     }
 }
 
-static void ecdhe_shared_secret(const uint8_t priv[P384_SCALAR_LEN], const uint8_t peer_pub[P384_POINT_LEN], uint8_t secret[P384_SCALAR_LEN]) {
+static void ecdhe_shared_secret(const uint8_t priv[P384_SCALAR_LEN],
+    const uint8_t peer_pub[P384_POINT_LEN], uint8_t secret[P384_SCALAR_LEN]) {
     fp384 px,py;
     fp384_from_bytes(&px,peer_pub+1);
     fp384_from_bytes(&py,peer_pub+49);
@@ -815,7 +855,8 @@ static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
         *len = *p++;
     } else {
         int nb = *p++ & 0x7F;
-        if (nb == 0 || nb > 3 || p + nb > end) return NULL; /* nb==0: reject BER indefinite length */
+        /* nb==0: reject BER indefinite length */
+        if (nb == 0 || nb > 3 || p + nb > end) return NULL;
         *len = 0;
         for (int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
     }
@@ -957,15 +998,22 @@ static void sha1_init_v(void *ctx){sha1_init((sha1_ctx*)ctx);}
 static void sha1_update_v(void *ctx,const uint8_t *d,size_t l){sha1_update((sha1_ctx*)ctx,d,l);}
 static void sha1_final_v(void *ctx,uint8_t *o){sha1_final((sha1_ctx*)ctx,o);}
 static void sha256_init_v(void *ctx){sha256_init((sha256_ctx*)ctx);}
-static void sha256_update_v(void *ctx,const uint8_t *d,size_t l){sha256_update((sha256_ctx*)ctx,d,l);}
+static void sha256_update_v(void *ctx,const uint8_t *d,size_t l){
+    sha256_update((sha256_ctx*)ctx,d,l);
+}
 static void sha256_final_v(void *ctx,uint8_t *o){sha256_final((sha256_ctx*)ctx,o);}
 static void sha384_init_v(void *ctx){sha384_init((sha384_ctx*)ctx);}
-static void sha384_update_v(void *ctx,const uint8_t *d,size_t l){sha384_update((sha384_ctx*)ctx,d,l);}
+static void sha384_update_v(void *ctx,const uint8_t *d,size_t l){
+    sha384_update((sha384_ctx*)ctx,d,l);
+}
 static void sha384_final_v(void *ctx,uint8_t *o){sha384_final((sha384_ctx*)ctx,o);}
 
-static const hash_alg SHA1_ALG={sha1_init_v,sha1_update_v,sha1_final_v,sha1_hash,SHA1_DIGEST_LEN,64};
-static const hash_alg SHA256_ALG={sha256_init_v,sha256_update_v,sha256_final_v,sha256_hash,SHA256_DIGEST_LEN,64};
-static const hash_alg SHA384_ALG={sha384_init_v,sha384_update_v,sha384_final_v,sha384_hash,SHA384_DIGEST_LEN,128};
+static const hash_alg SHA1_ALG={
+    sha1_init_v,sha1_update_v,sha1_final_v,sha1_hash,SHA1_DIGEST_LEN,64};
+static const hash_alg SHA256_ALG={
+    sha256_init_v,sha256_update_v,sha256_final_v,sha256_hash,SHA256_DIGEST_LEN,64};
+static const hash_alg SHA384_ALG={
+    sha384_init_v,sha384_update_v,sha384_final_v,sha384_hash,SHA384_DIGEST_LEN,128};
 
 static void hmac(const hash_alg *alg, const uint8_t *key, size_t klen,
                   const uint8_t *msg, size_t mlen, uint8_t *out) {
@@ -993,7 +1041,9 @@ static void hkdf_expand_u(const hash_alg *alg, const uint8_t *prk,
         union{sha256_ctx s2;sha384_ctx s3;}u;
         uint8_t ik[128]={0},ok[128]={0};
         memcpy(ik,prk,alg->digest_len);
-        for(size_t i=0;i<alg->block_size;i++){ik[i]^=0x36;ok[i]=((i<alg->digest_len)?prk[i]:0)^0x5c;}
+        for(size_t i=0;i<alg->block_size;i++){
+            ik[i]^=0x36; ok[i]=((i<alg->digest_len)?prk[i]:0)^0x5c;
+        }
         alg->init(&u); alg->update(&u,ik,alg->block_size);
         if(tl>0) alg->update(&u,t,tl);
         alg->update(&u,info,ilen);
@@ -1234,7 +1284,10 @@ static uint64_t fp256_add_raw(fp256 *r, const fp256 *a, const fp256 *b) {
 
 static uint64_t fp256_sub_raw(fp256 *r, const fp256 *a, const fp256 *b) {
     __int128 borrow=0;
-    for(int i=0;i<4;i++){borrow=(__int128)a->v[i]-b->v[i]+borrow;r->v[i]=(uint64_t)borrow;borrow>>=64;}
+    for(int i=0;i<4;i++){
+        borrow=(__int128)a->v[i]-b->v[i]+borrow;
+        r->v[i]=(uint64_t)borrow; borrow>>=64;
+    }
     return (borrow<0)?1:0;
 }
 
@@ -1465,7 +1518,8 @@ static void ecdhe_p256_keygen(uint8_t priv[P256_SCALAR_LEN], uint8_t pub[P256_PO
     else printf("  P-256 point verified on curve\n");
 }
 
-static void ecdhe_p256_shared_secret(const uint8_t priv[P256_SCALAR_LEN], const uint8_t peer_pub[P256_POINT_LEN], uint8_t secret[P256_SCALAR_LEN]) {
+static void ecdhe_p256_shared_secret(const uint8_t priv[P256_SCALAR_LEN],
+    const uint8_t peer_pub[P256_POINT_LEN], uint8_t secret[P256_SCALAR_LEN]) {
     fp256 px,py;
     fp256_from_bytes(&px,peer_pub+1);
     fp256_from_bytes(&py,peer_pub+33);
@@ -1498,7 +1552,10 @@ static uint64_t fp25519_add_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) 
 
 static uint64_t fp25519_sub_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     __int128 borrow=0;
-    for(int i=0;i<4;i++){borrow=(__int128)a->v[i]-b->v[i]+borrow;r->v[i]=(uint64_t)borrow;borrow>>=64;}
+    for(int i=0;i<4;i++){
+        borrow=(__int128)a->v[i]-b->v[i]+borrow;
+        r->v[i]=(uint64_t)borrow; borrow>>=64;
+    }
     return (borrow<0)?1:0;
 }
 
@@ -1603,7 +1660,8 @@ static void fp25519_to_le(uint8_t b[32], const fp25519 *a) {
 }
 
 /* X25519 Montgomery ladder (RFC 7748 §5) — x-coordinate only */
-static void x25519_scalar_mult(const uint8_t scalar[32], const uint8_t u_in[32], uint8_t u_out[32]) {
+static void x25519_scalar_mult(const uint8_t scalar[32],
+    const uint8_t u_in[32], uint8_t u_out[32]) {
     fp25519 u; fp25519_from_le(&u,u_in);
     /* Clamp scalar */
     uint8_t s[32]; memcpy(s,scalar,32);
@@ -1658,7 +1716,8 @@ static void x25519_keygen(uint8_t priv[X25519_KEY_LEN], uint8_t pub[X25519_KEY_L
     x25519_scalar_mult(priv,basepoint,pub);
 }
 
-static int x25519_shared_secret(const uint8_t priv[X25519_KEY_LEN], const uint8_t peer[X25519_KEY_LEN], uint8_t out[X25519_KEY_LEN]) {
+static int x25519_shared_secret(const uint8_t priv[X25519_KEY_LEN],
+    const uint8_t peer[X25519_KEY_LEN], uint8_t out[X25519_KEY_LEN]) {
     x25519_scalar_mult(priv,peer,out);
     /* Check for all-zeros result (low-order point) */
     uint8_t z=0; for(int i=0;i<32;i++) z|=out[i];
@@ -1676,12 +1735,17 @@ static uint32_t rotl32(uint32_t x, int n){return (x<<n)|(x>>(32-n));}
     a+=b;d^=a;d=rotl32(d,8);  \
     c+=d;b^=c;b=rotl32(b,7);
 
-static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter, uint8_t out[64]) {
+static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12],
+    uint32_t counter, uint8_t out[64]) {
     uint32_t s[16];
     s[0]=0x61707865; s[1]=0x3320646e; s[2]=0x79622d32; s[3]=0x6b206574;
-    for(int i=0;i<8;i++) s[4+i]=(uint32_t)key[4*i]|((uint32_t)key[4*i+1]<<8)|((uint32_t)key[4*i+2]<<16)|((uint32_t)key[4*i+3]<<24);
+    for(int i=0;i<8;i++)
+        s[4+i]=(uint32_t)key[4*i]|((uint32_t)key[4*i+1]<<8)
+              |((uint32_t)key[4*i+2]<<16)|((uint32_t)key[4*i+3]<<24);
     s[12]=counter;
-    for(int i=0;i<3;i++) s[13+i]=(uint32_t)nonce[4*i]|((uint32_t)nonce[4*i+1]<<8)|((uint32_t)nonce[4*i+2]<<16)|((uint32_t)nonce[4*i+3]<<24);
+    for(int i=0;i<3;i++)
+        s[13+i]=(uint32_t)nonce[4*i]|((uint32_t)nonce[4*i+1]<<8)
+               |((uint32_t)nonce[4*i+2]<<16)|((uint32_t)nonce[4*i+3]<<24);
     uint32_t w[16]; memcpy(w,s,64);
     for(int i=0;i<10;i++){
         QR(w[0],w[4],w[8],w[12])  QR(w[1],w[5],w[9],w[13])
@@ -1690,7 +1754,10 @@ static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12], uint3
         QR(w[2],w[7],w[8],w[13])  QR(w[3],w[4],w[9],w[14])
     }
     for(int i=0;i<16;i++) w[i]+=s[i];
-    for(int i=0;i<16;i++){out[4*i]=(uint8_t)w[i];out[4*i+1]=(uint8_t)(w[i]>>8);out[4*i+2]=(uint8_t)(w[i]>>16);out[4*i+3]=(uint8_t)(w[i]>>24);}
+    for(int i=0;i<16;i++){
+        out[4*i]=(uint8_t)w[i]; out[4*i+1]=(uint8_t)(w[i]>>8);
+        out[4*i+2]=(uint8_t)(w[i]>>16); out[4*i+3]=(uint8_t)(w[i]>>24);
+    }
 }
 
 static void chacha20_encrypt(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter,
@@ -1707,7 +1774,8 @@ static void chacha20_encrypt(const uint8_t key[32], const uint8_t nonce[12], uin
  * Poly1305 MAC (RFC 8439)
  * Prime: p = 2^130 - 5.  Accumulator in 3×64-bit limbs.
  * ================================================================ */
-static void poly1305_mac(const uint8_t key[32], const uint8_t *msg, size_t msg_len, uint8_t tag[16]) {
+static void poly1305_mac(const uint8_t key[32], const uint8_t *msg,
+    size_t msg_len, uint8_t tag[16]) {
     /* Clamp r */
     uint64_t r0=0,r1=0;
     for(int i=0;i<8;i++) r0|=(uint64_t)key[i]<<(8*i);
@@ -2568,31 +2636,38 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
     if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA384,sizeof(OID_ECDSA_SHA384))){
         if(key_type!=1) return 0;
         uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
-        if(pubkey_len==P384_POINT_LEN) return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
-        if(pubkey_len==P256_POINT_LEN) return ecdsa_p256_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==P384_POINT_LEN)
+            return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==P256_POINT_LEN)
+            return ecdsa_p256_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
         return 0;
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA256,sizeof(OID_ECDSA_SHA256))){
         if(key_type!=1) return 0;
         uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
-        if(pubkey_len==P256_POINT_LEN) return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
-        if(pubkey_len==P384_POINT_LEN) return ecdsa_p384_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==P256_POINT_LEN)
+            return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==P384_POINT_LEN)
+            return ecdsa_p384_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
         return 0;
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA256_RSA,sizeof(OID_SHA256_RSA))){
         if(key_type!=2) return 0;
         uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
-        return rsa_pkcs1_verify(h,SHA256_DIGEST_LEN,DI_SHA256,sizeof(DI_SHA256),sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+        return rsa_pkcs1_verify(h,SHA256_DIGEST_LEN,DI_SHA256,sizeof(DI_SHA256),
+            sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA384_RSA,sizeof(OID_SHA384_RSA))){
         if(key_type!=2) return 0;
         uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
-        return rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,DI_SHA384,sizeof(DI_SHA384),sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+        return rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,DI_SHA384,sizeof(DI_SHA384),
+            sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA512_RSA,sizeof(OID_SHA512_RSA))){
         if(key_type!=2) return 0;
         uint8_t h[64]; sha512_hash(tbs,tbs_len,h);
-        return rsa_pkcs1_verify(h,64,DI_SHA512,sizeof(DI_SHA512),sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+        return rsa_pkcs1_verify(h,64,DI_SHA512,sizeof(DI_SHA512),
+            sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
     }
     return 0;
 }
@@ -2788,7 +2863,8 @@ static int tcp_connect(const char *host, int port) {
 static void tls_send_record(int fd, uint8_t type, const uint8_t *data, size_t len) {
     uint8_t *buf = malloc(5+len);
     if(!buf) die("malloc failed");
-    buf[0]=type; buf[1]=(TLS_VERSION_12>>8); buf[2]=(TLS_VERSION_12&0xFF); PUT16(buf+3,(uint16_t)len);
+    buf[0]=type; buf[1]=(TLS_VERSION_12>>8); buf[2]=(TLS_VERSION_12&0xFF);
+    PUT16(buf+3,(uint16_t)len);
     memcpy(buf+5,data,len);
     write_all(fd,buf,5+len);
     free(buf);
@@ -2983,7 +3059,11 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     if(b+2>sh_end) die("ServerHello truncated at cipher suite");
     uint16_t cs=GET16(b); b+=2;
     *cipher_suite_out=cs;
-    if(cs!=0x1301 && cs!=0x1302 && cs!=0x1303 && cs!=0xCCA9 && cs!=0xCCA8 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 && cs!=0x009D && cs!=0x009C && cs!=0xC014 && cs!=0xC013 && cs!=0x0035 && cs!=0x002F && cs!=0xC00A && cs!=0xC009) {
+    if(cs!=0x1301 && cs!=0x1302 && cs!=0x1303 &&
+       cs!=0xCCA9 && cs!=0xCCA8 &&
+       cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 &&
+       cs!=0x009D && cs!=0x009C && cs!=0x0035 && cs!=0x002F &&
+       cs!=0xC014 && cs!=0xC013 && cs!=0xC00A && cs!=0xC009) {
         fprintf(stderr,"cipher suite 0x%04x\n",cs);
         die("unexpected cipher suite");
     }
@@ -3007,10 +3087,12 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
                 if(group==TLS_GROUP_X25519 && klen==X25519_KEY_LEN && elen>=4+X25519_KEY_LEN) {
                     memcpy(server_pub,b+4,X25519_KEY_LEN);
                     *pub_len=X25519_KEY_LEN;
-                } else if(group==TLS_GROUP_SECP256R1 && klen==P256_POINT_LEN && elen>=4+P256_POINT_LEN) {
+                } else if(group==TLS_GROUP_SECP256R1 && klen==P256_POINT_LEN
+                          && elen>=4+P256_POINT_LEN) {
                     memcpy(server_pub,b+4,P256_POINT_LEN);
                     *pub_len=P256_POINT_LEN;
-                } else if(group==TLS_GROUP_SECP384R1 && klen==P384_POINT_LEN && elen>=4+P384_POINT_LEN) {
+                } else if(group==TLS_GROUP_SECP384R1 && klen==P384_POINT_LEN
+                          && elen>=4+P384_POINT_LEN) {
                     memcpy(server_pub,b+4,P384_POINT_LEN);
                     *pub_len=P384_POINT_LEN;
                 }
@@ -3027,7 +3109,8 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
 }
 
 /* Construct TLS 1.3 per-record nonce: IV XOR sequence number */
-static void make_nonce(uint8_t nonce[AES_GCM_NONCE_LEN], const uint8_t iv[AES_GCM_NONCE_LEN], uint64_t seq) {
+static void make_nonce(uint8_t nonce[AES_GCM_NONCE_LEN],
+    const uint8_t iv[AES_GCM_NONCE_LEN], uint64_t seq) {
     memcpy(nonce,iv,AES_GCM_NONCE_LEN);
     for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
 }
@@ -3096,7 +3179,8 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
     if(is_chacha)
         chacha20_poly1305_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
     else
-        aes_gcm_encrypt_impl(key,is_aes256?AES256_KEY_LEN:AES128_KEY_LEN,nonce,aad,5,inner,ct_len,ct,tag);
+        aes_gcm_encrypt_impl(key,is_aes256?AES256_KEY_LEN:AES128_KEY_LEN,
+            nonce,aad,5,inner,ct_len,ct,tag);
     memcpy(ct+ct_len,tag,16);
 
     tls_send_record(fd,TLS_RT_APPDATA,ct,ct_len+16);
@@ -3407,8 +3491,11 @@ static void tls12_handshake(tls_conn *conn) {
     memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
     memcpy(x25519_pub, conn->x25519_pub, X25519_KEY_LEN);
 
-    int is_rsa_kex = (cipher_suite==0x009D || cipher_suite==0x009C || cipher_suite==0x0035 || cipher_suite==0x002F);
-    int is_cbc = (cipher_suite==0xC014 || cipher_suite==0xC013 || cipher_suite==0x0035 || cipher_suite==0x002F || cipher_suite==0xC00A || cipher_suite==0xC009);
+    int is_rsa_kex = (cipher_suite==0x009D || cipher_suite==0x009C
+                   || cipher_suite==0x0035 || cipher_suite==0x002F);
+    int is_cbc = (cipher_suite==0xC014 || cipher_suite==0xC013
+               || cipher_suite==0x0035 || cipher_suite==0x002F
+               || cipher_suite==0xC00A || cipher_suite==0xC009);
     int is_chacha = (cipher_suite==0xCCA8 || cipher_suite==0xCCA9);
     printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
            is_rsa_kex?" RSA-kex":"", is_cbc?" CBC":"", is_chacha?" ChaCha20":"");
@@ -3508,31 +3595,43 @@ static void tls12_handshake(tls_conn *conn) {
                     if(sig_algo==0x0403) { /* ecdsa + sha256 */
                         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(signed_data,signed_len,h);
                         if(leaf.key_type==1 && leaf.pubkey_len==P256_POINT_LEN)
-                            sig_ok=ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                            sig_ok=ecdsa_p256_verify(h,SHA256_DIGEST_LEN,
+                                sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
                         else if(leaf.key_type==1 && leaf.pubkey_len==P384_POINT_LEN)
-                            sig_ok=ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                            sig_ok=ecdsa_p384_verify(h,SHA384_DIGEST_LEN,
+                                sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
                     } else if(sig_algo==0x0503) { /* ecdsa + sha384 */
                         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(signed_data,signed_len,h);
                         if(leaf.key_type==1 && leaf.pubkey_len==P256_POINT_LEN)
-                            sig_ok=ecdsa_p256_verify(h,SHA384_DIGEST_LEN,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                            sig_ok=ecdsa_p256_verify(h,SHA384_DIGEST_LEN,
+                                sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
                         else if(leaf.key_type==1 && leaf.pubkey_len==P384_POINT_LEN)
-                            sig_ok=ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
+                            sig_ok=ecdsa_p384_verify(h,SHA384_DIGEST_LEN,
+                                sig_ptr,sig_len_val,leaf.pubkey,leaf.pubkey_len);
                     } else if(sig_algo==0x0401) { /* rsa_pkcs1_sha256 */
                         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(signed_data,signed_len,h);
                         if(leaf.key_type==2)
-                            sig_ok=rsa_pkcs1_verify(h,SHA256_DIGEST_LEN,DI_SHA256,sizeof(DI_SHA256),sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            sig_ok=rsa_pkcs1_verify(h,SHA256_DIGEST_LEN,
+                                DI_SHA256,sizeof(DI_SHA256),sig_ptr,sig_len_val,
+                                leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     } else if(sig_algo==0x0804) { /* rsa_pss_rsae_sha256 */
                         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(signed_data,signed_len,h);
                         if(leaf.key_type==2)
-                            sig_ok=rsa_pss_verify(h,SHA256_DIGEST_LEN,sha256_hash,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            sig_ok=rsa_pss_verify(h,SHA256_DIGEST_LEN,sha256_hash,
+                                sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,
+                                leaf.rsa_e,leaf.rsa_e_len);
                     } else if(sig_algo==0x0805) { /* rsa_pss_rsae_sha384 */
                         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(signed_data,signed_len,h);
                         if(leaf.key_type==2)
-                            sig_ok=rsa_pss_verify(h,SHA384_DIGEST_LEN,sha384_hash,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            sig_ok=rsa_pss_verify(h,SHA384_DIGEST_LEN,sha384_hash,
+                                sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,
+                                leaf.rsa_e,leaf.rsa_e_len);
                     } else if(sig_algo==0x0501) { /* rsa_pkcs1_sha384 */
                         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(signed_data,signed_len,h);
                         if(leaf.key_type==2)
-                            sig_ok=rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,DI_SHA384,sizeof(DI_SHA384),sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            sig_ok=rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,
+                                DI_SHA384,sizeof(DI_SHA384),sig_ptr,sig_len_val,
+                                leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     }
                     if(!sig_ok) die("ServerKeyExchange signature verification failed");
                     printf("    SKE signature verified (algo=0x%04x)\n",sig_algo);
@@ -3610,7 +3709,8 @@ static void tls12_handshake(tls_conn *conn) {
         tls_send_record(fd,TLS_RT_HANDSHAKE,cke,sizeof(cke));
         sha256_update(&transcript, cke, sizeof(cke));
         sha384_update(&transcript384, cke, sizeof(cke));
-        if(x25519_shared_secret(x25519_priv, ske_pubkey, ss12)<0) die("X25519 shared secret is zero");
+        if(x25519_shared_secret(x25519_priv, ske_pubkey, ss12)<0)
+            die("X25519 shared secret is zero");
         ss12_len=X25519_KEY_LEN;
         printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (X25519)\n");
     } else if(ske_curve==TLS_GROUP_SECP256R1) {
@@ -3639,7 +3739,9 @@ static void tls12_handshake(tls_conn *conn) {
     secure_zero(x25519_priv,sizeof(x25519_priv));
 
     /* TLS 1.2 key derivation */
-    int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D || cipher_suite==0xC014 || cipher_suite==0x0035 || cipher_suite==0xC00A);
+    int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030
+                  || cipher_suite==0x009D || cipher_suite==0xC014
+                  || cipher_suite==0x0035 || cipher_suite==0xC00A);
     /* PRF hash: 0x009D (GCM-SHA384) uses SHA-384, ChaCha20 suites use SHA-256 */
     int prf_is_sha384 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D);
     const hash_alg *alg = prf_is_sha384 ? &SHA384_ALG : &SHA256_ALG;
@@ -3704,7 +3806,8 @@ static void tls12_handshake(tls_conn *conn) {
         memcpy(fin_msg+4, verify_data, 12);
 
         if(is_cbc)
-            tls12_encrypt_and_send_cbc(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, key_len, c_mk, mac_key_len, mac_alg, 0);
+            tls12_encrypt_and_send_cbc(fd, TLS_RT_HANDSHAKE, fin_msg, 16,
+                c_wk, key_len, c_mk, mac_key_len, mac_alg, 0);
         else if(is_chacha)
             tls12_encrypt_and_send_chacha(fd, TLS_RT_HANDSHAKE, fin_msg, 16, c_wk, c_wiv, 0);
         else
@@ -3726,11 +3829,14 @@ static void tls12_handshake(tls_conn *conn) {
         uint8_t pt12[256]; size_t pt12_len;
         int dec_ok;
         if(is_cbc)
-            dec_ok=tls12_decrypt_record_cbc(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, key_len, s_mk, mac_key_len, mac_alg, 0, pt12, &pt12_len);
+            dec_ok=tls12_decrypt_record_cbc(rec, rec_len, TLS_RT_HANDSHAKE,
+                s_wk, key_len, s_mk, mac_key_len, mac_alg, 0, pt12, &pt12_len);
         else if(is_chacha)
-            dec_ok=tls12_decrypt_record_chacha(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, s_wiv, 0, pt12, &pt12_len);
+            dec_ok=tls12_decrypt_record_chacha(rec, rec_len,
+                TLS_RT_HANDSHAKE, s_wk, s_wiv, 0, pt12, &pt12_len);
         else
-            dec_ok=tls12_decrypt_record(rec, rec_len, TLS_RT_HANDSHAKE, s_wk, s_wiv, 0, pt12, &pt12_len, key_len);
+            dec_ok=tls12_decrypt_record(rec, rec_len, TLS_RT_HANDSHAKE,
+                s_wk, s_wiv, 0, pt12, &pt12_len, key_len);
         if(dec_ok<0) die("Failed to decrypt server Finished");
         if(pt12[0]!=0x14) die("expected Finished message type");
         if(pt12_len<4||GET24(pt12+1)!=12) die("Server Finished length mismatch");
@@ -3758,11 +3864,14 @@ static void tls12_handshake(tls_conn *conn) {
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
         if(is_cbc)
-            tls12_encrypt_and_send_cbc(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++);
+            tls12_encrypt_and_send_cbc(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,
+                c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++);
         else if(is_chacha)
-            tls12_encrypt_and_send_chacha(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++);
+            tls12_encrypt_and_send_chacha(fd,TLS_RT_APPDATA,
+                (uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++);
         else
-            tls12_encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_wk,c_wiv,c12_seq++,key_len);
+            tls12_encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,
+                c_wk,c_wiv,c12_seq++,key_len);
         printf("Sent HTTP GET %s\n\n",path);
     }
 
@@ -3776,11 +3885,14 @@ static void tls12_handshake(tls_conn *conn) {
             uint8_t pt12[REC_BUF_SIZE]; size_t pt12_len;
             int dec_ok2;
             if(is_cbc)
-                dec_ok2=tls12_decrypt_record_cbc(rec,rec_len,TLS_RT_APPDATA,s_wk,key_len,s_mk,mac_key_len,mac_alg,s12_seq++,pt12,&pt12_len);
+                dec_ok2=tls12_decrypt_record_cbc(rec,rec_len,TLS_RT_APPDATA,
+                    s_wk,key_len,s_mk,mac_key_len,mac_alg,s12_seq++,pt12,&pt12_len);
             else if(is_chacha)
-                dec_ok2=tls12_decrypt_record_chacha(rec,rec_len,TLS_RT_APPDATA,s_wk,s_wiv,s12_seq++,pt12,&pt12_len);
+                dec_ok2=tls12_decrypt_record_chacha(rec,rec_len,TLS_RT_APPDATA,
+                    s_wk,s_wiv,s12_seq++,pt12,&pt12_len);
             else
-                dec_ok2=tls12_decrypt_record(rec,rec_len,TLS_RT_APPDATA,s_wk,s_wiv,s12_seq++,pt12,&pt12_len,key_len);
+                dec_ok2=tls12_decrypt_record(rec,rec_len,TLS_RT_APPDATA,
+                    s_wk,s_wiv,s12_seq++,pt12,&pt12_len,key_len);
             if(dec_ok2<0) {
                 fprintf(stderr,"Decrypt failed at seq %llu\n",(unsigned long long)(s12_seq-1));
                 break;
@@ -3795,11 +3907,17 @@ static void tls12_handshake(tls_conn *conn) {
     }
     /* Send close_notify */
     if(is_cbc)
-        { uint8_t alert[2]={1,0}; tls12_encrypt_and_send_cbc(fd,TLS_RT_ALERT,alert,2,c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++); }
-    else if(is_chacha)
-        { uint8_t alert[2]={1,0}; tls12_encrypt_and_send_chacha(fd,TLS_RT_ALERT,alert,2,c_wk,c_wiv,c12_seq++); }
-    else
-        { uint8_t alert[2]={1,0}; tls12_encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_wk,c_wiv,c12_seq++,key_len); }
+    {   uint8_t alert[2]={1,0};
+        if(is_cbc)
+            tls12_encrypt_and_send_cbc(fd,TLS_RT_ALERT,alert,2,
+                c_wk,key_len,c_mk,mac_key_len,mac_alg,c12_seq++);
+        else if(is_chacha)
+            tls12_encrypt_and_send_chacha(fd,TLS_RT_ALERT,alert,2,
+                c_wk,c_wiv,c12_seq++);
+        else
+            tls12_encrypt_and_send(fd,TLS_RT_ALERT,alert,2,
+                c_wk,c_wiv,c12_seq++,key_len);
+    }
     printf("\n=== Done ===\n");
 
     free(cert12_msg);
@@ -3845,12 +3963,14 @@ static void tls13_handshake(tls_conn *conn) {
     if(server_pub_len==X25519_KEY_LEN) selected_group=TLS_GROUP_X25519;
     else if(server_pub_len==P256_POINT_LEN) selected_group=TLS_GROUP_SECP256R1;
     else selected_group=TLS_GROUP_SECP384R1;
-    printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",cipher_suite,selected_group);
+    printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",
+        cipher_suite,selected_group);
 
     /* Compute shared secret based on negotiated group */
     uint8_t shared[P384_SCALAR_LEN]; size_t shared_len;
     if(selected_group==TLS_GROUP_X25519) {
-        if(x25519_shared_secret(x25519_priv,server_pub,shared)<0) die("X25519 shared secret is zero");
+        if(x25519_shared_secret(x25519_priv,server_pub,shared)<0)
+            die("X25519 shared secret is zero");
         shared_len=X25519_KEY_LEN;
     } else if(selected_group==TLS_GROUP_SECP256R1) {
         uint8_t ss[P256_SCALAR_LEN];
@@ -3869,10 +3989,12 @@ static void tls13_handshake(tls_conn *conn) {
 
     /* Derive handshake keys */
     uint8_t early_secret[SHA384_DIGEST_LEN];
-    { uint8_t z[SHA384_DIGEST_LEN]={0}; hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret); }
+    { uint8_t z[SHA384_DIGEST_LEN]={0};
+      hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret); }
     uint8_t derived1[SHA384_DIGEST_LEN];
     { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
-      hkdf_expand_label_u(alg,early_secret,"derived",empty_hash,alg->digest_len,derived1,alg->digest_len); }
+      hkdf_expand_label_u(alg,early_secret,"derived",empty_hash,
+          alg->digest_len,derived1,alg->digest_len); }
     uint8_t hs_secret[SHA384_DIGEST_LEN];
     hkdf_extract_u(alg,derived1,alg->digest_len,shared,shared_len,hs_secret);
 
@@ -3884,11 +4006,14 @@ static void tls13_handshake(tls_conn *conn) {
     }
 
     uint8_t s_hs_traffic[SHA384_DIGEST_LEN], c_hs_traffic[SHA384_DIGEST_LEN];
-    hkdf_expand_label_u(alg,hs_secret,"s hs traffic",th1,alg->digest_len,s_hs_traffic,alg->digest_len);
-    hkdf_expand_label_u(alg,hs_secret,"c hs traffic",th1,alg->digest_len,c_hs_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,hs_secret,"s hs traffic",th1,
+        alg->digest_len,s_hs_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,hs_secret,"c hs traffic",th1,
+        alg->digest_len,c_hs_traffic,alg->digest_len);
 
     size_t kl = is_aes256 ? AES256_KEY_LEN : (is_chacha ? 32 : AES128_KEY_LEN);
-    uint8_t s_hs_key[AES256_KEY_LEN], s_hs_iv[AES_GCM_NONCE_LEN], c_hs_key[AES256_KEY_LEN], c_hs_iv[AES_GCM_NONCE_LEN];
+    uint8_t s_hs_key[AES256_KEY_LEN], s_hs_iv[AES_GCM_NONCE_LEN];
+    uint8_t c_hs_key[AES256_KEY_LEN], c_hs_iv[AES_GCM_NONCE_LEN];
     hkdf_expand_label_u(alg,s_hs_traffic,"key",NULL,0,s_hs_key,kl);
     hkdf_expand_label_u(alg,s_hs_traffic,"iv",NULL,0,s_hs_iv,AES_GCM_NONCE_LEN);
     hkdf_expand_label_u(alg,c_hs_traffic,"key",NULL,0,c_hs_key,kl);
@@ -3913,7 +4038,8 @@ static void tls13_handshake(tls_conn *conn) {
     while(!got_finished) {
         if(rtype!=TLS_RT_APPDATA) die("expected encrypted record");
         uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
-        int inner=decrypt_record(rec,rec_len,s_hs_key,s_hs_iv,s_hs_seq++,pt,&pt_len,is_aes256,is_chacha);
+        int inner=decrypt_record(rec,rec_len,s_hs_key,s_hs_iv,
+            s_hs_seq++,pt,&pt_len,is_aes256,is_chacha);
         if(inner!=TLS_RT_HANDSHAKE) die("expected handshake inside encrypted record");
 
         /* Append to handshake buffer */
@@ -3968,7 +4094,7 @@ static void tls13_handshake(tls_conn *conn) {
                     if(4+cv_sig_len>mlen) die("CertificateVerify sig length mismatch");
                     const uint8_t *cv_sig=cv+4;
 
-                    /* RFC 8446 §4.4.3: only these sig algos allowed in TLS 1.3 CertificateVerify */
+                    /* RFC 8446 §4.4.3: sig algos for CertificateVerify */
                     if(cv_algo!=0x0403 && cv_algo!=0x0503 &&
                        cv_algo!=0x0804 && cv_algo!=0x0805)
                         die("CertificateVerify uses sig algo not in offered list");
@@ -3983,7 +4109,7 @@ static void tls13_handshake(tls_conn *conn) {
 
                     /* Content to verify: 64 spaces || context string || 0x00 || transcript hash */
                     size_t cv_content_len = 64 + 33 + 1 + hash_len;
-                    uint8_t cv_content[64 + 33 + 1 + SHA384_DIGEST_LEN]; /* max: 64 + 33 + 1 + 48 = 146 */
+                    uint8_t cv_content[64+33+1+SHA384_DIGEST_LEN];
                     memset(cv_content,0x20,64);
                     memcpy(cv_content+64,"TLS 1.3, server CertificateVerify",33);
                     cv_content[97]=0x00;
@@ -4002,19 +4128,25 @@ static void tls13_handshake(tls_conn *conn) {
                     if(cv_algo==0x0403){ /* ecdsa_secp256r1_sha256 */
                         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==1 && leaf.pubkey_len==P256_POINT_LEN)
-                            cv_ok=ecdsa_p256_verify(h,SHA256_DIGEST_LEN,cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
+                            cv_ok=ecdsa_p256_verify(h,SHA256_DIGEST_LEN,
+                                cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
                     } else if(cv_algo==0x0503){ /* ecdsa_secp384r1_sha384 */
                         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==1 && leaf.pubkey_len==P384_POINT_LEN)
-                            cv_ok=ecdsa_p384_verify(h,SHA384_DIGEST_LEN,cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
+                            cv_ok=ecdsa_p384_verify(h,SHA384_DIGEST_LEN,
+                                cv_sig,cv_sig_len,leaf.pubkey,leaf.pubkey_len);
                     } else if(cv_algo==0x0804){ /* rsa_pss_rsae_sha256 */
                         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
-                            cv_ok=rsa_pss_verify(h,SHA256_DIGEST_LEN,sha256_hash,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            cv_ok=rsa_pss_verify(h,SHA256_DIGEST_LEN,sha256_hash,
+                                cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,
+                                leaf.rsa_e,leaf.rsa_e_len);
                     } else if(cv_algo==0x0805){ /* rsa_pss_rsae_sha384 */
                         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
-                            cv_ok=rsa_pss_verify(h,SHA384_DIGEST_LEN,sha384_hash,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            cv_ok=rsa_pss_verify(h,SHA384_DIGEST_LEN,sha384_hash,
+                                cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,
+                                leaf.rsa_e,leaf.rsa_e_len);
                     }
                     if(!cv_ok) die("CertificateVerify signature verification failed");
                     printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",cv_algo);
@@ -4039,7 +4171,8 @@ static void tls13_handshake(tls_conn *conn) {
                     }
                     uint8_t expected[SHA384_DIGEST_LEN];
                     hmac(alg,fin_key,alg->digest_len,th_before_fin,alg->digest_len,expected);
-                    if(!ct_memeq(expected,hs_buf+pos+4,hash_len)) die("Server Finished verify failed!");
+                    if(!ct_memeq(expected,hs_buf+pos+4,hash_len))
+                        die("Server Finished verify failed!");
                     printf("  Server Finished VERIFIED\n");
                     if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&transcript,hs_buf+pos,msg_total);
@@ -4076,15 +4209,20 @@ static void tls13_handshake(tls_conn *conn) {
 
     uint8_t derived2[SHA384_DIGEST_LEN];
     { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
-      hkdf_expand_label_u(alg,hs_secret,"derived",empty_hash,alg->digest_len,derived2,alg->digest_len); }
+      hkdf_expand_label_u(alg,hs_secret,"derived",empty_hash,
+          alg->digest_len,derived2,alg->digest_len); }
     uint8_t master_secret[SHA384_DIGEST_LEN];
-    { uint8_t z[SHA384_DIGEST_LEN]={0}; hkdf_extract_u(alg,derived2,alg->digest_len,z,alg->digest_len,master_secret); }
+    { uint8_t z[SHA384_DIGEST_LEN]={0};
+      hkdf_extract_u(alg,derived2,alg->digest_len,z,alg->digest_len,master_secret); }
 
     uint8_t s_ap_traffic[SHA384_DIGEST_LEN], c_ap_traffic[SHA384_DIGEST_LEN];
-    hkdf_expand_label_u(alg,master_secret,"s ap traffic",th_sf,alg->digest_len,s_ap_traffic,alg->digest_len);
-    hkdf_expand_label_u(alg,master_secret,"c ap traffic",th_sf,alg->digest_len,c_ap_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,master_secret,"s ap traffic",th_sf,
+        alg->digest_len,s_ap_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,master_secret,"c ap traffic",th_sf,
+        alg->digest_len,c_ap_traffic,alg->digest_len);
 
-    uint8_t s_ap_key[AES256_KEY_LEN], s_ap_iv[AES_GCM_NONCE_LEN], c_ap_key[AES256_KEY_LEN], c_ap_iv[AES_GCM_NONCE_LEN];
+    uint8_t s_ap_key[AES256_KEY_LEN], s_ap_iv[AES_GCM_NONCE_LEN];
+    uint8_t c_ap_key[AES256_KEY_LEN], c_ap_iv[AES_GCM_NONCE_LEN];
     hkdf_expand_label_u(alg,s_ap_traffic,"key",NULL,0,s_ap_key,kl);
     hkdf_expand_label_u(alg,s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
     hkdf_expand_label_u(alg,c_ap_traffic,"key",NULL,0,c_ap_key,kl);
@@ -4104,7 +4242,8 @@ static void tls13_handshake(tls_conn *conn) {
         cert_msg[1]=0; cert_msg[2]=0; cert_msg[3]=4; /* length = 4 */
         cert_msg[4]=0; /* certificate_request_context length = 0 */
         cert_msg[5]=0; cert_msg[6]=0; cert_msg[7]=0; /* certificate_list length = 0 */
-        encrypt_and_send(fd,TLS_RT_HANDSHAKE,cert_msg,8,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
+        encrypt_and_send(fd,TLS_RT_HANDSHAKE,cert_msg,8,
+            c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
         if(is_aes256) sha384_update(&transcript384,cert_msg,8);
         else sha256_update(&transcript,cert_msg,8);
         printf("Sent empty client Certificate\n");
@@ -4126,7 +4265,8 @@ static void tls13_handshake(tls_conn *conn) {
         uint8_t fin_msg[52]; fin_msg[0]=0x14;
         fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=(uint8_t)hash_len;
         memcpy(fin_msg+4,verify,hash_len);
-        encrypt_and_send(fd,TLS_RT_HANDSHAKE,fin_msg,4+hash_len,c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
+        encrypt_and_send(fd,TLS_RT_HANDSHAKE,fin_msg,4+hash_len,
+            c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
     }
     printf("Sent client Finished\n");
 
@@ -4137,7 +4277,8 @@ static void tls13_handshake(tls_conn *conn) {
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
-        encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
+        encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,
+            c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
         printf("Sent HTTP GET %s\n\n",path);
     }
 
@@ -4149,7 +4290,8 @@ static void tls13_handshake(tls_conn *conn) {
         if(rtype<0) break;
         if(rtype==TLS_RT_APPDATA) {
             uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
-            int inner=decrypt_record(rec,rec_len,s_ap_key,s_ap_iv,s_ap_seq++,pt,&pt_len,is_aes256,is_chacha);
+            int inner=decrypt_record(rec,rec_len,s_ap_key,s_ap_iv,
+                s_ap_seq++,pt,&pt_len,is_aes256,is_chacha);
             if(inner==TLS_RT_APPDATA) { /* application data */
                 fwrite(pt,1,pt_len,stdout);
             } else if(inner==TLS_RT_ALERT) { /* alert */
@@ -4164,23 +4306,28 @@ static void tls13_handshake(tls_conn *conn) {
                     /* Derive new server traffic secret */
                     {
                         uint8_t new_s[SHA384_DIGEST_LEN];
-                        hkdf_expand_label_u(alg,s_ap_traffic,"traffic upd",NULL,0,new_s,alg->digest_len);
+                        hkdf_expand_label_u(alg,s_ap_traffic,"traffic upd",
+                            NULL,0,new_s,alg->digest_len);
                         memcpy(s_ap_traffic,new_s,alg->digest_len);
                         hkdf_expand_label_u(alg,s_ap_traffic,"key",NULL,0,s_ap_key,kl);
-                        hkdf_expand_label_u(alg,s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
+                        hkdf_expand_label_u(alg,s_ap_traffic,"iv",
+                            NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
                     }
                     s_ap_seq=0;
                     if(request_update==1) {
                         /* Send KeyUpdate(update_not_requested) with current client keys */
                         uint8_t ku_msg[5]={24,0,0,1,0};
-                        encrypt_and_send(fd,TLS_RT_HANDSHAKE,ku_msg,5,c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
+                        encrypt_and_send(fd,TLS_RT_HANDSHAKE,ku_msg,5,
+                            c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
                         /* Derive new client traffic secret */
                         {
                             uint8_t new_c[SHA384_DIGEST_LEN];
-                            hkdf_expand_label_u(alg,c_ap_traffic,"traffic upd",NULL,0,new_c,alg->digest_len);
+                            hkdf_expand_label_u(alg,c_ap_traffic,"traffic upd",
+                                NULL,0,new_c,alg->digest_len);
                             memcpy(c_ap_traffic,new_c,alg->digest_len);
                             hkdf_expand_label_u(alg,c_ap_traffic,"key",NULL,0,c_ap_key,kl);
-                            hkdf_expand_label_u(alg,c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
+                            hkdf_expand_label_u(alg,c_ap_traffic,"iv",
+                                NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
                         }
                         c_ap_seq=0;
                     }
@@ -4194,7 +4341,9 @@ static void tls13_handshake(tls_conn *conn) {
         }
     }
     /* Send close_notify */
-    { uint8_t alert[2]={1,0}; encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_ap_key,c_ap_iv,c_ap_seq,is_aes256,is_chacha); }
+    { uint8_t alert[2]={1,0};
+      encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_ap_key,c_ap_iv,
+          c_ap_seq,is_aes256,is_chacha); }
     printf("\n=== Done ===\n");
     free(saved_cert_msg);
     secure_zero(p384_priv,sizeof(p384_priv));
@@ -4257,13 +4406,17 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* Read ServerHello */
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype=tls_read_record(fd,rec,&rec_len);
-    if(rtype==TLS_RT_ALERT && rec_len>=2) { fprintf(stderr,"Alert: level=%d desc=%d\n",rec[0],rec[1]); die("server sent alert"); }
+    if(rtype==TLS_RT_ALERT && rec_len>=2) {
+        fprintf(stderr,"Alert: level=%d desc=%d\n",rec[0],rec[1]);
+        die("server sent alert");
+    }
     if(rtype!=TLS_RT_HANDSHAKE) die("expected handshake record");
     if(rec[0]!=0x02) die("expected ServerHello");
     uint8_t server_pub[P384_POINT_LEN]; size_t server_pub_len=0;
     uint8_t server_random[32];
     uint16_t cipher_suite;
-    uint16_t version=parse_server_hello(rec,rec_len,server_pub,&server_pub_len,server_random,&cipher_suite);
+    uint16_t version=parse_server_hello(rec,rec_len,server_pub,
+        &server_pub_len,server_random,&cipher_suite);
     uint32_t sh_msg_len=4+GET24(rec+1);
     sha256_update(&transcript,rec,sh_msg_len);
     sha384_update(&transcript384,rec,sh_msg_len);
@@ -4298,7 +4451,8 @@ static void do_https_get(const char *host, int port, const char *path) {
                 }
             }
         }
-        if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_SECP256R1 && hrr_group!=TLS_GROUP_SECP384R1)
+        if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_SECP256R1
+           && hrr_group!=TLS_GROUP_SECP384R1)
             die("HRR selected unsupported group");
         printf("  HRR selected group 0x%04x\n",hrr_group);
 
@@ -4340,10 +4494,14 @@ static void do_https_get(const char *host, int port, const char *path) {
         if(rtype==TLS_RT_CCS) { /* ChangeCipherSpec, skip */
             rtype=tls_read_record(fd,rec,&rec_len);
         }
-        if(rtype==TLS_RT_ALERT && rec_len>=2) { fprintf(stderr,"Alert: level=%d desc=%d\n",rec[0],rec[1]); die("server sent alert after HRR"); }
+        if(rtype==TLS_RT_ALERT && rec_len>=2) {
+            fprintf(stderr,"Alert: level=%d desc=%d\n",rec[0],rec[1]);
+            die("server sent alert after HRR");
+        }
         if(rtype!=TLS_RT_HANDSHAKE) die("expected handshake record after HRR");
         if(rec[0]!=0x02) die("expected ServerHello after HRR");
-        version=parse_server_hello(rec,rec_len,server_pub,&server_pub_len,server_random,&cipher_suite);
+        version=parse_server_hello(rec,rec_len,server_pub,
+            &server_pub_len,server_random,&cipher_suite);
         if(version!=TLS_VERSION_13) die("expected TLS 1.3 after HRR");
         if(server_pub_len==0) die("no key_share in real ServerHello after HRR");
         sh_msg_len=4+GET24(rec+1);
