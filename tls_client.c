@@ -3055,6 +3055,7 @@ static void do_https_get(const char *host, int port, const char *path) {
             if(tls12_decrypt_record(rec, rec_len, 0x16, s_wk, s_wiv, 0, pt12, &pt12_len, key_len)<0)
                 die("Failed to decrypt server Finished");
             if(pt12[0]!=0x14) die("expected Finished message type");
+            if(pt12_len<4||GET24(pt12+1)!=12) die("Server Finished length mismatch");
 
             uint8_t th12_sf[48];
             size_t th12_sf_len;
@@ -3321,6 +3322,7 @@ static void do_https_get(const char *host, int port, const char *path) {
                 }
                 case 20: { /* Finished */
                     if(!got_cert_verify) die("Server Finished without CertificateVerify");
+                    if(mlen!=hash_len) die("Server Finished length mismatch");
                     printf("  Server Finished\n");
                     /* Verify server finished */
                     uint8_t fin_key[48];
