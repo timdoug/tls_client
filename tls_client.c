@@ -1637,6 +1637,108 @@ typedef struct {
     int version;                                    /* 0=v1, 1=v2, 2=v3 */
 } x509_cert;
 
+static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8_t *tbs_end) {
+    uint8_t tag; size_t len;
+    if(tp>=tbs_end||*tp!=0xA3) return 0;
+    const uint8_t *ext_outer=der_read_tl(tp,tbs_end,&tag,&len);
+    if(!ext_outer) return 0;
+    const uint8_t *exts_val=der_read_tl(ext_outer,ext_outer+len,&tag,&len);
+    if(!exts_val||tag!=0x30) return 0;
+    const uint8_t *ep=exts_val, *exts_end=exts_val+len;
+    #define MAX_EXT_OIDS 20
+    struct { const uint8_t *oid; size_t len; } seen_oids[MAX_EXT_OIDS];
+    int seen_count=0;
+    while(ep<exts_end){
+        const uint8_t *ext_seq=der_read_tl(ep,exts_end,&tag,&len);
+        if(!ext_seq||tag!=0x30) break;
+        const uint8_t *ext_end2=ext_seq+len;
+        ep=ext_end2;
+        const uint8_t *eoid=der_read_tl(ext_seq,ext_end2,&tag,&len);
+        if(!eoid||tag!=0x06) continue;
+        /* RFC 5280 §4.2: each extension OID must be unique */
+        for(int si=0;si<seen_count;si++){
+            if(seen_oids[si].len==len && memcmp(seen_oids[si].oid,eoid,len)==0)
+                return -1;
+        }
+        if(seen_count<MAX_EXT_OIDS){
+            seen_oids[seen_count].oid=eoid;
+            seen_oids[seen_count].len=len;
+            seen_count++;
+        }
+        if(oid_eq(eoid,len,OID_SAN,sizeof(OID_SAN))){
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){cert->san=oct;cert->san_len=len;}
+        } else if(oid_eq(eoid,len,OID_BASIC_CONSTRAINTS,sizeof(OID_BASIC_CONSTRAINTS))){
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){
+                const uint8_t *oct_end=oct+len;
+                const uint8_t *sq=der_read_tl(oct,oct_end,&tag,&len);
+                if(sq&&tag==0x30){
+                    const uint8_t *sq_end=sq+len;
+                    const uint8_t *bp=sq;
+                    if(bp<sq_end&&*bp==0x01){
+                        const uint8_t *bv=der_read_tl(bp,sq_end,&tag,&len);
+                        if(bv&&tag==0x01&&len==1&&bv[0]!=0)
+                            cert->is_ca=1;
+                        bp=bv+len;
+                    }
+                    if(bp<sq_end&&*bp==0x02){
+                        const uint8_t *pv=der_read_tl(bp,sq_end,&tag,&len);
+                        if(pv&&tag==0x02&&len>=1){
+                            int pl=0;
+                            for(size_t j=0;j<len;j++) pl=(pl<<8)|pv[j];
+                            cert->path_len=pl;
+                        }
+                    }
+                }
+            }
+        } else if(oid_eq(eoid,len,OID_KEY_USAGE,sizeof(OID_KEY_USAGE))){
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){
+                const uint8_t *bs=der_read_tl(oct,oct+len,&tag,&len);
+                if(bs&&tag==0x03&&len>=2){
+                    cert->has_key_usage=1;
+                    cert->key_usage=bs[1];
+                    if(len>=3) cert->key_usage|=((uint16_t)bs[2]<<8);
+                }
+            }
+        } else if(oid_eq(eoid,len,OID_EXT_KEY_USAGE,sizeof(OID_EXT_KEY_USAGE))){
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){
+                const uint8_t *sq=der_read_tl(oct,oct+len,&tag,&len);
+                if(sq&&tag==0x30){
+                    const uint8_t *sq_end=sq+len;
+                    cert->has_eku=1;
+                    while(sq<sq_end){
+                        const uint8_t *eo=der_read_tl(sq,sq_end,&tag,&len);
+                        if(!eo||tag!=0x06) break;
+                        if(oid_eq(eo,len,OID_SERVER_AUTH,sizeof(OID_SERVER_AUTH)))
+                            cert->eku_server_auth=1;
+                        sq=eo+len;
+                    }
+                }
+            }
+        } else {
+            /* RFC 5280 §4.2: reject unrecognized critical extensions */
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01){
+                const uint8_t *cv=der_read_tl(rest,ext_end2,&tag,&len);
+                if(cv&&tag==0x01&&len==1&&cv[0]!=0)
+                    return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     memset(cert,0,sizeof(*cert));
     cert->path_len=-1; /* unlimited by default */
@@ -1737,112 +1839,7 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     }
 
     /* Extensions [3] */
-    if(tp<tbs_end&&*tp==0xA3){
-        const uint8_t *ext_outer=der_read_tl(tp,tbs_end,&tag,&len);
-        if(ext_outer){
-            const uint8_t *exts_val=der_read_tl(ext_outer,ext_outer+len,&tag,&len);
-            if(exts_val&&tag==0x30){
-                const uint8_t *ep=exts_val, *exts_end=exts_val+len;
-                #define MAX_EXT_OIDS 20
-                struct { const uint8_t *oid; size_t len; } seen_oids[MAX_EXT_OIDS];
-                int seen_count=0;
-                while(ep<exts_end){
-                    const uint8_t *ext_seq=der_read_tl(ep,exts_end,&tag,&len);
-                    if(!ext_seq||tag!=0x30) break;
-                    const uint8_t *ext_end2=ext_seq+len;
-                    ep=ext_end2;
-                    const uint8_t *eoid=der_read_tl(ext_seq,ext_end2,&tag,&len);
-                    if(!eoid||tag!=0x06) continue;
-                    /* RFC 5280 §4.2: each extension OID must be unique */
-                    for(int si=0;si<seen_count;si++){
-                        if(seen_oids[si].len==len && memcmp(seen_oids[si].oid,eoid,len)==0)
-                            return -1;
-                    }
-                    if(seen_count<MAX_EXT_OIDS){
-                        seen_oids[seen_count].oid=eoid;
-                        seen_oids[seen_count].len=len;
-                        seen_count++;
-                    }
-                    if(oid_eq(eoid,len,OID_SAN,sizeof(OID_SAN))){
-                        const uint8_t *rest=eoid+len;
-                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-                        if(oct&&tag==0x04){cert->san=oct;cert->san_len=len;}
-                    } else if(oid_eq(eoid,len,OID_BASIC_CONSTRAINTS,sizeof(OID_BASIC_CONSTRAINTS))){
-                        const uint8_t *rest=eoid+len;
-                        /* skip optional critical BOOLEAN */
-                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-                        /* OCTET STRING wrapping */
-                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-                        if(oct&&tag==0x04){
-                            const uint8_t *oct_end=oct+len;
-                            /* SEQUENCE inside */
-                            const uint8_t *sq=der_read_tl(oct,oct_end,&tag,&len);
-                            if(sq&&tag==0x30){
-                                const uint8_t *sq_end=sq+len;
-                                /* first element: BOOLEAN CA flag if present */
-                                const uint8_t *bp=sq;
-                                if(bp<sq_end&&*bp==0x01){
-                                    const uint8_t *bv=der_read_tl(bp,sq_end,&tag,&len);
-                                    if(bv&&tag==0x01&&len==1&&bv[0]!=0)
-                                        cert->is_ca=1;
-                                    bp=bv+len;
-                                }
-                                /* optional pathLenConstraint INTEGER */
-                                if(bp<sq_end&&*bp==0x02){
-                                    const uint8_t *pv=der_read_tl(bp,sq_end,&tag,&len);
-                                    if(pv&&tag==0x02&&len>=1){
-                                        int pl=0;
-                                        for(size_t j=0;j<len;j++) pl=(pl<<8)|pv[j];
-                                        cert->path_len=pl;
-                                    }
-                                }
-                            }
-                        }
-                    } else if(oid_eq(eoid,len,OID_KEY_USAGE,sizeof(OID_KEY_USAGE))){
-                        const uint8_t *rest=eoid+len;
-                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-                        if(oct&&tag==0x04){
-                            /* BIT STRING inside OCTET STRING */
-                            const uint8_t *bs=der_read_tl(oct,oct+len,&tag,&len);
-                            if(bs&&tag==0x03&&len>=2){
-                                cert->has_key_usage=1;
-                                cert->key_usage=bs[1]; /* first content byte after unused-bits byte */
-                                if(len>=3) cert->key_usage|=((uint16_t)bs[2]<<8);
-                            }
-                        }
-                    } else if(oid_eq(eoid,len,OID_EXT_KEY_USAGE,sizeof(OID_EXT_KEY_USAGE))){
-                        const uint8_t *rest=eoid+len;
-                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-                        if(oct&&tag==0x04){
-                            const uint8_t *sq=der_read_tl(oct,oct+len,&tag,&len);
-                            if(sq&&tag==0x30){
-                                const uint8_t *sq_end=sq+len;
-                                cert->has_eku=1;
-                                while(sq<sq_end){
-                                    const uint8_t *eo=der_read_tl(sq,sq_end,&tag,&len);
-                                    if(!eo||tag!=0x06) break;
-                                    if(oid_eq(eo,len,OID_SERVER_AUTH,sizeof(OID_SERVER_AUTH)))
-                                        cert->eku_server_auth=1;
-                                    sq=eo+len;
-                                }
-                            }
-                        }
-                    } else {
-                        /* RFC 5280 §4.2: reject unrecognized critical extensions */
-                        const uint8_t *rest=eoid+len;
-                        if(rest<ext_end2&&*rest==0x01){
-                            const uint8_t *cv=der_read_tl(rest,ext_end2,&tag,&len);
-                            if(cv&&tag==0x01&&len==1&&cv[0]!=0)
-                                return -1; /* critical extension we cannot process */
-                        }
-                    }
-                }
-            }
-        }
-    }
+    if(parse_x509_extensions(cert,tp,tbs_end)<0) return -1;
 
     /* signatureAlgorithm (after TBS) */
     p=cert->tbs+cert->tbs_len;
