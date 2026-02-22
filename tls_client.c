@@ -1578,44 +1578,26 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
 }
 
 /* ================================================================
- * RSA PKCS#1 v1.5 Signature Verification
+ * RSA PKCS#1 v1.5 Signature Verification (unified)
  * ================================================================ */
-static int rsa_pkcs1_verify_sha256(const uint8_t hash[32],
-                                    const uint8_t *sig, size_t sig_len,
-                                    const uint8_t *modulus, size_t mod_len,
-                                    const uint8_t *exponent, size_t exp_len) {
-    bignum s_bn, n_bn, e_bn, m_bn;
-    bn_from_bytes(&s_bn,sig,sig_len);
-    bn_from_bytes(&n_bn,modulus,mod_len);
-    bn_from_bytes(&e_bn,exponent,exp_len);
+static const uint8_t DI_SHA256[]={
+    0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
+    0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20
+};
+static const uint8_t DI_SHA384[]={
+    0x30,0x41,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
+    0x65,0x03,0x04,0x02,0x02,0x05,0x00,0x04,0x30
+};
+static const uint8_t DI_SHA512[]={
+    0x30,0x51,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
+    0x65,0x03,0x04,0x02,0x03,0x05,0x00,0x04,0x40
+};
 
-    bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
-
-    uint8_t m[512];
-    if(mod_len>sizeof(m)) return 0;
-    bn_to_bytes(&m_bn,m,mod_len);
-
-    /* Verify PKCS#1 v1.5 in constant time: 00 01 [FF..FF] 00 [DigestInfo] [Hash]
-     * Build expected padding and compare entire buffer at once. */
-    static const uint8_t di256[]={
-        0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
-        0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20
-    };
-    if(mod_len < 2+8+1+sizeof(di256)+32) return 0; /* too short for valid padding */
-    uint8_t expected[512];
-    expected[0]=0x00; expected[1]=0x01;
-    size_t pad_len=mod_len-3-sizeof(di256)-32;
-    memset(expected+2,0xFF,pad_len);
-    expected[2+pad_len]=0x00;
-    memcpy(expected+3+pad_len,di256,sizeof(di256));
-    memcpy(expected+3+pad_len+sizeof(di256),hash,32);
-    return ct_memeq(m,expected,mod_len);
-}
-
-static int rsa_pkcs1_verify_sha384(const uint8_t hash[48],
-                                    const uint8_t *sig, size_t sig_len,
-                                    const uint8_t *modulus, size_t mod_len,
-                                    const uint8_t *exponent, size_t exp_len) {
+static int rsa_pkcs1_verify(const uint8_t *hash, size_t hash_len,
+                             const uint8_t *di, size_t di_len,
+                             const uint8_t *sig, size_t sig_len,
+                             const uint8_t *modulus, size_t mod_len,
+                             const uint8_t *exponent, size_t exp_len) {
     bignum s_bn, n_bn, e_bn, m_bn;
     bn_from_bytes(&s_bn,sig,sig_len);
     bn_from_bytes(&n_bn,modulus,mod_len);
@@ -1626,120 +1608,27 @@ static int rsa_pkcs1_verify_sha384(const uint8_t hash[48],
     if(mod_len>sizeof(m)) return 0;
     bn_to_bytes(&m_bn,m,mod_len);
 
-    /* Verify PKCS#1 v1.5 in constant time */
-    static const uint8_t di384[]={
-        0x30,0x41,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
-        0x65,0x03,0x04,0x02,0x02,0x05,0x00,0x04,0x30
-    };
-    if(mod_len < 2+8+1+sizeof(di384)+48) return 0;
+    if(mod_len < 2+8+1+di_len+hash_len) return 0;
     uint8_t expected[512];
     expected[0]=0x00; expected[1]=0x01;
-    size_t pad_len=mod_len-3-sizeof(di384)-48;
+    size_t pad_len=mod_len-3-di_len-hash_len;
     memset(expected+2,0xFF,pad_len);
     expected[2+pad_len]=0x00;
-    memcpy(expected+3+pad_len,di384,sizeof(di384));
-    memcpy(expected+3+pad_len+sizeof(di384),hash,48);
+    memcpy(expected+3+pad_len,di,di_len);
+    memcpy(expected+3+pad_len+di_len,hash,hash_len);
     return ct_memeq(m,expected,mod_len);
 }
 
-static int rsa_pkcs1_verify_sha512(const uint8_t hash[64],
-                                    const uint8_t *sig, size_t sig_len,
-                                    const uint8_t *modulus, size_t mod_len,
-                                    const uint8_t *exponent, size_t exp_len) {
-    bignum s_bn, n_bn, e_bn, m_bn;
-    bn_from_bytes(&s_bn,sig,sig_len);
-    bn_from_bytes(&n_bn,modulus,mod_len);
-    bn_from_bytes(&e_bn,exponent,exp_len);
-    bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
+/* ================================================================
+ * RSA-PSS Signature Verification (unified)
+ * ================================================================ */
+typedef void (*hash_fn_t)(const uint8_t*, size_t, uint8_t*);
 
-    uint8_t m[512];
-    if(mod_len>sizeof(m)) return 0;
-    bn_to_bytes(&m_bn,m,mod_len);
-
-    static const uint8_t di512[]={
-        0x30,0x51,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
-        0x65,0x03,0x04,0x02,0x03,0x05,0x00,0x04,0x40
-    };
-    if(mod_len < 2+8+1+sizeof(di512)+64) return 0;
-    uint8_t expected[512];
-    expected[0]=0x00; expected[1]=0x01;
-    size_t pad_len=mod_len-3-sizeof(di512)-64;
-    memset(expected+2,0xFF,pad_len);
-    expected[2+pad_len]=0x00;
-    memcpy(expected+3+pad_len,di512,sizeof(di512));
-    memcpy(expected+3+pad_len+sizeof(di512),hash,64);
-    return ct_memeq(m,expected,mod_len);
-}
-
-static int rsa_pss_verify_sha256(const uint8_t hash[32],
-                                  const uint8_t *sig, size_t sig_len,
-                                  const uint8_t *modulus, size_t mod_len,
-                                  const uint8_t *exponent, size_t exp_len) {
-    bignum s_bn, n_bn, e_bn, m_bn;
-    bn_from_bytes(&s_bn,sig,sig_len);
-    bn_from_bytes(&n_bn,modulus,mod_len);
-    bn_from_bytes(&e_bn,exponent,exp_len);
-    bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
-
-    uint8_t em[512];
-    if(mod_len>sizeof(em)) return 0;
-    bn_to_bytes(&m_bn,em,mod_len);
-
-    /* PSS verification: em = maskedDB || H || 0xBC */
-    size_t em_len=mod_len;
-    if(em[em_len-1]!=0xBC) return 0;
-
-    size_t h_len=32; /* SHA-256 */
-    size_t salt_len=32;
-    size_t db_len=em_len-h_len-1;
-    const uint8_t *masked_db=em;
-    const uint8_t *h=em+db_len;
-
-    /* MGF1-SHA256: dbMask = MGF1(H, db_len) */
-    uint8_t db_mask[512];
-    size_t done=0;
-    uint32_t counter=0;
-    while(done<db_len){
-        uint8_t cb[36];
-        memcpy(cb,h,32);
-        cb[32]=(counter>>24)&0xFF;
-        cb[33]=(counter>>16)&0xFF;
-        cb[34]=(counter>>8)&0xFF;
-        cb[35]=counter&0xFF;
-        uint8_t md[32]; sha256_hash(cb,36,md);
-        size_t use=db_len-done; if(use>32) use=32;
-        memcpy(db_mask+done,md,use);
-        done+=use; counter++;
-    }
-
-    /* DB = maskedDB XOR dbMask */
-    uint8_t db[512];
-    for(size_t i=0;i<db_len;i++) db[i]=masked_db[i]^db_mask[i];
-
-    /* Clear top bits (8*emLen - emBits) */
-    db[0]&=0x7F;
-
-    /* DB should be: 00...00 || 01 || salt — verify in constant time */
-    size_t pad_len=db_len-salt_len-1;
-    uint8_t pad_ok=0;
-    for(size_t i=0;i<pad_len;i++) pad_ok|=db[i];
-    pad_ok|=db[pad_len]^0x01;
-    const uint8_t *salt=db+pad_len+1;
-
-    /* M' = (8 zero bytes) || mHash || salt — always compute to avoid timing leak */
-    uint8_t mp[8+32+32];
-    memset(mp,0,8);
-    memcpy(mp+8,hash,32);
-    memcpy(mp+40,salt,salt_len);
-
-    uint8_t hp[32]; sha256_hash(mp,72,hp);
-    return ct_memeq(hp,h,32) & (pad_ok == 0);
-}
-
-static int rsa_pss_verify_sha384(const uint8_t hash[48],
-                                  const uint8_t *sig, size_t sig_len,
-                                  const uint8_t *modulus, size_t mod_len,
-                                  const uint8_t *exponent, size_t exp_len) {
+static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
+                           hash_fn_t hash_fn,
+                           const uint8_t *sig, size_t sig_len,
+                           const uint8_t *modulus, size_t mod_len,
+                           const uint8_t *exponent, size_t exp_len) {
     bignum s_bn, n_bn, e_bn, m_bn;
     bn_from_bytes(&s_bn,sig,sig_len);
     bn_from_bytes(&n_bn,modulus,mod_len);
@@ -1753,25 +1642,25 @@ static int rsa_pss_verify_sha384(const uint8_t hash[48],
     size_t em_len=mod_len;
     if(em[em_len-1]!=0xBC) return 0;
 
-    size_t h_len=48; /* SHA-384 */
-    size_t salt_len=48;
-    size_t db_len=em_len-h_len-1;
+    size_t salt_len=hash_len;
+    size_t db_len=em_len-hash_len-1;
     const uint8_t *masked_db=em;
     const uint8_t *h=em+db_len;
 
-    /* MGF1-SHA384 */
+    /* MGF1: dbMask = MGF1(H, db_len) */
     uint8_t db_mask[512];
     size_t done=0;
     uint32_t counter=0;
     while(done<db_len){
-        uint8_t cb[52];
-        memcpy(cb,h,48);
-        cb[48]=(counter>>24)&0xFF;
-        cb[49]=(counter>>16)&0xFF;
-        cb[50]=(counter>>8)&0xFF;
-        cb[51]=counter&0xFF;
-        uint8_t md[48]; sha384_hash(cb,52,md);
-        size_t use=db_len-done; if(use>48) use=48;
+        uint8_t cb[52]; /* max: 48 + 4 */
+        memcpy(cb,h,hash_len);
+        cb[hash_len]=(counter>>24)&0xFF;
+        cb[hash_len+1]=(counter>>16)&0xFF;
+        cb[hash_len+2]=(counter>>8)&0xFF;
+        cb[hash_len+3]=counter&0xFF;
+        uint8_t md[48];
+        hash_fn(cb,hash_len+4,md);
+        size_t use=db_len-done; if(use>hash_len) use=hash_len;
         memcpy(db_mask+done,md,use);
         done+=use; counter++;
     }
@@ -1786,14 +1675,14 @@ static int rsa_pss_verify_sha384(const uint8_t hash[48],
     pad_ok|=db[pad_len]^0x01;
     const uint8_t *salt=db+pad_len+1;
 
-    /* Always compute hash to avoid timing leak on padding validity */
-    uint8_t mp[8+48+48];
+    uint8_t mp[8+48+48]; /* max: 8 + 48 + 48 */
     memset(mp,0,8);
-    memcpy(mp+8,hash,48);
-    memcpy(mp+56,salt,salt_len);
+    memcpy(mp+8,hash,hash_len);
+    memcpy(mp+8+hash_len,salt,salt_len);
 
-    uint8_t hp[48]; sha384_hash(mp,104,hp);
-    return ct_memeq(hp,h,48) & (pad_ok == 0);
+    uint8_t hp[48];
+    hash_fn(mp,8+hash_len+salt_len,hp);
+    return ct_memeq(hp,h,hash_len) & (pad_ok == 0);
 }
 
 /* ================================================================
@@ -2199,17 +2088,17 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA256_RSA,sizeof(OID_SHA256_RSA))){
         if(key_type!=2) return 0;
         uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
-        return rsa_pkcs1_verify_sha256(h,sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+        return rsa_pkcs1_verify(h,SHA256_DIGEST_LEN,DI_SHA256,sizeof(DI_SHA256),sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA384_RSA,sizeof(OID_SHA384_RSA))){
         if(key_type!=2) return 0;
         uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
-        return rsa_pkcs1_verify_sha384(h,sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+        return rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,DI_SHA384,sizeof(DI_SHA384),sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA512_RSA,sizeof(OID_SHA512_RSA))){
         if(key_type!=2) return 0;
         uint8_t h[64]; sha512_hash(tbs,tbs_len,h);
-        return rsa_pkcs1_verify_sha512(h,sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+        return rsa_pkcs1_verify(h,64,DI_SHA512,sizeof(DI_SHA512),sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
     }
     return 0;
 }
@@ -2999,19 +2888,19 @@ static void do_https_get(const char *host, int port, const char *path) {
                         } else if(sig_algo==0x0401) { /* rsa_pkcs1_sha256 */
                             uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(signed_data,signed_len,h);
                             if(leaf.key_type==2)
-                                sig_ok=rsa_pkcs1_verify_sha256(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                                sig_ok=rsa_pkcs1_verify(h,SHA256_DIGEST_LEN,DI_SHA256,sizeof(DI_SHA256),sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                         } else if(sig_algo==0x0804) { /* rsa_pss_rsae_sha256 */
                             uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(signed_data,signed_len,h);
                             if(leaf.key_type==2)
-                                sig_ok=rsa_pss_verify_sha256(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                                sig_ok=rsa_pss_verify(h,SHA256_DIGEST_LEN,sha256_hash,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                         } else if(sig_algo==0x0805) { /* rsa_pss_rsae_sha384 */
                             uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(signed_data,signed_len,h);
                             if(leaf.key_type==2)
-                                sig_ok=rsa_pss_verify_sha384(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                                sig_ok=rsa_pss_verify(h,SHA384_DIGEST_LEN,sha384_hash,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                         } else if(sig_algo==0x0501) { /* rsa_pkcs1_sha384 */
                             uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(signed_data,signed_len,h);
                             if(leaf.key_type==2)
-                                sig_ok=rsa_pkcs1_verify_sha384(h,sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                                sig_ok=rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,DI_SHA384,sizeof(DI_SHA384),sig_ptr,sig_len_val,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                         }
                         if(!sig_ok) die("ServerKeyExchange signature verification failed");
                         printf("    SKE signature verified (algo=0x%04x)\n",sig_algo);
@@ -3398,11 +3287,11 @@ static void do_https_get(const char *host, int port, const char *path) {
                     } else if(cv_algo==0x0804){ /* rsa_pss_rsae_sha256 */
                         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
-                            cv_ok=rsa_pss_verify_sha256(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            cv_ok=rsa_pss_verify(h,SHA256_DIGEST_LEN,sha256_hash,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     } else if(cv_algo==0x0805){ /* rsa_pss_rsae_sha384 */
                         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(cv_content,cv_content_len,h);
                         if(leaf.key_type==2)
-                            cv_ok=rsa_pss_verify_sha384(h,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
+                            cv_ok=rsa_pss_verify(h,SHA384_DIGEST_LEN,sha384_hash,cv_sig,cv_sig_len,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len);
                     }
                     if(!cv_ok) die("CertificateVerify signature verification failed");
                     printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",cv_algo);
