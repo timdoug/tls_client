@@ -2435,7 +2435,8 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
     uint8_t hdr[5];
     if(read_exact(fd,hdr,5)<0) return -1;
     uint16_t len=GET16(hdr+3);
-    if(len>16384+256) die("record too large");
+    /* RFC 8446 §5.1: max 2^14+256 for TLS 1.3, RFC 5246 §6.2.3: 2^14+2048 for TLS 1.2 */
+    if(len>16384+2048) die("record too large");
     if(read_exact(fd,out,len)<0) return -1;
     *out_len=len;
     return hdr[0];
@@ -2665,6 +2666,7 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
     if(i==0) die("no content type in record");
     uint8_t inner_type=pt[i-1];
     *pt_len=i-1;
+    if(*pt_len>16384) die("decrypted record exceeds maximum plaintext size");
     return inner_type;
 }
 
