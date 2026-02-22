@@ -245,6 +245,232 @@ static void sha1_hash(const uint8_t *data, size_t len, uint8_t out[20]) {
 }
 
 /* ================================================================
+ * SHA-384 (SHA-512 truncated, different IVs, 64-bit words, 80 rounds)
+ * ================================================================ */
+static const uint64_t sha512_k[80] = {
+    0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL,0x59f111f1b605d019ULL,0x923f82a4af194f9bULL,0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL,0x12835b0145706fbeULL,0x243185be4ee4b28cULL,0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL,0x80deb1fe3b1696b1ULL,0x9bdc06a725c71235ULL,0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL,0xefbe4786384f25e3ULL,0x0fc19dc68b8cd5b5ULL,0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL,0x4a7484aa6ea6e483ULL,0x5cb0a9dcbd41fbd4ULL,0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL,0xa831c66d2db43210ULL,0xb00327c898fb213fULL,0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL,0xd5a79147930aa725ULL,0x06ca6351e003826fULL,0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL,0x2e1b21385c26c926ULL,0x4d2c6dfc5ac42aedULL,0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL,0x766a0abb3c77b2a8ULL,0x81c2c92e47edaee6ULL,0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL,0xa81a664bbc423001ULL,0xc24b8b70d0f89791ULL,0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL,0xd69906245565a910ULL,0xf40e35855771202aULL,0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL,0x1e376c085141ab53ULL,0x2748774cdf8eeb99ULL,0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL,0x4ed8aa4ae3418acbULL,0x5b9cca4f7763e373ULL,0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL,0x78a5636f43172f60ULL,0x84c87814a1f0ab72ULL,0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL,0xa4506cebde82bde9ULL,0xbef9a3f7b2c67915ULL,0xc67178f2e372532bULL,
+    0xca273eceea26619cULL,0xd186b8c721c0c207ULL,0xeada7dd6cde0eb1eULL,0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL,0x0a637dc5a2c898a6ULL,0x113f9804bef90daeULL,0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL
+};
+
+typedef struct { uint64_t h[8]; uint8_t buf[128]; size_t buf_len; uint64_t total; } sha384_ctx;
+
+#define ROTR64(x,n) (((x)>>(n))|((x)<<(64-(n))))
+#define S512_CH(x,y,z) (((x)&(y))^((~(x))&(z)))
+#define S512_MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
+#define S512_EP0(x) (ROTR64(x,28)^ROTR64(x,34)^ROTR64(x,39))
+#define S512_EP1(x) (ROTR64(x,14)^ROTR64(x,18)^ROTR64(x,41))
+#define S512_SIG0(x) (ROTR64(x,1)^ROTR64(x,8)^((x)>>7))
+#define S512_SIG1(x) (ROTR64(x,19)^ROTR64(x,61)^((x)>>6))
+
+static void sha384_transform(sha384_ctx *ctx, const uint8_t blk[128]) {
+    uint64_t w[80],a,b,c,d,e,f,g,h;
+    for(int i=0;i<16;i++){w[i]=0;for(int j=0;j<8;j++)w[i]=(w[i]<<8)|blk[8*i+j];}
+    for(int i=16;i<80;i++) w[i]=S512_SIG1(w[i-2])+w[i-7]+S512_SIG0(w[i-15])+w[i-16];
+    a=ctx->h[0];b=ctx->h[1];c=ctx->h[2];d=ctx->h[3];
+    e=ctx->h[4];f=ctx->h[5];g=ctx->h[6];h=ctx->h[7];
+    for(int i=0;i<80;i++){
+        uint64_t t1=h+S512_EP1(e)+S512_CH(e,f,g)+sha512_k[i]+w[i];
+        uint64_t t2=S512_EP0(a)+S512_MAJ(a,b,c);
+        h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
+    }
+    ctx->h[0]+=a;ctx->h[1]+=b;ctx->h[2]+=c;ctx->h[3]+=d;
+    ctx->h[4]+=e;ctx->h[5]+=f;ctx->h[6]+=g;ctx->h[7]+=h;
+}
+
+static void sha384_init(sha384_ctx *ctx) {
+    ctx->h[0]=0xcbbb9d5dc1059ed8ULL;ctx->h[1]=0x629a292a367cd507ULL;
+    ctx->h[2]=0x9159015a3070dd17ULL;ctx->h[3]=0x152fecd8f70e5939ULL;
+    ctx->h[4]=0x67332667ffc00b31ULL;ctx->h[5]=0x8eb44a8768581511ULL;
+    ctx->h[6]=0xdb0c2e0d64f98fa7ULL;ctx->h[7]=0x47b5481dbefa4fa4ULL;
+    ctx->buf_len=0; ctx->total=0;
+}
+
+static void sha384_update(sha384_ctx *ctx, const uint8_t *data, size_t len) {
+    ctx->total+=len;
+    while(len>0){
+        size_t space=128-ctx->buf_len, chunk=len<space?len:space;
+        memcpy(ctx->buf+ctx->buf_len,data,chunk);
+        ctx->buf_len+=chunk; data+=chunk; len-=chunk;
+        if(ctx->buf_len==128){sha384_transform(ctx,ctx->buf);ctx->buf_len=0;}
+    }
+}
+
+static void sha384_final(sha384_ctx *ctx, uint8_t out[48]) {
+    uint64_t bits=ctx->total*8;
+    uint8_t pad=0x80;
+    sha384_update(ctx,&pad,1);
+    pad=0;
+    while(ctx->buf_len!=112) sha384_update(ctx,&pad,1);
+    uint8_t lb[16]={0};
+    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
+    sha384_update(ctx,lb,16);
+    for(int i=0;i<6;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
+}
+
+static void sha384_hash(const uint8_t *data, size_t len, uint8_t out[48]) {
+    sha384_ctx c; sha384_init(&c); sha384_update(&c,data,len); sha384_final(&c,out);
+}
+
+/* Hash algorithm abstraction for unified HMAC/HKDF/PRF */
+typedef void (*hash_fn_t)(const uint8_t*, size_t, uint8_t*);
+typedef struct {
+    void (*init)(void*);
+    void (*update)(void*, const uint8_t*, size_t);
+    void (*final_fn)(void*, uint8_t*);
+    hash_fn_t hash;
+    size_t digest_len, block_size;
+} hash_alg;
+
+static void sha1_init_v(void *ctx){sha1_init((sha1_ctx*)ctx);}
+static void sha1_update_v(void *ctx,const uint8_t *d,size_t l){sha1_update((sha1_ctx*)ctx,d,l);}
+static void sha1_final_v(void *ctx,uint8_t *o){sha1_final((sha1_ctx*)ctx,o);}
+static void sha256_init_v(void *ctx){sha256_init((sha256_ctx*)ctx);}
+static void sha256_update_v(void *ctx,const uint8_t *d,size_t l){
+    sha256_update((sha256_ctx*)ctx,d,l);
+}
+static void sha256_final_v(void *ctx,uint8_t *o){sha256_final((sha256_ctx*)ctx,o);}
+static void sha384_init_v(void *ctx){sha384_init((sha384_ctx*)ctx);}
+static void sha384_update_v(void *ctx,const uint8_t *d,size_t l){
+    sha384_update((sha384_ctx*)ctx,d,l);
+}
+static void sha384_final_v(void *ctx,uint8_t *o){sha384_final((sha384_ctx*)ctx,o);}
+
+static const hash_alg SHA1_ALG={
+    sha1_init_v,sha1_update_v,sha1_final_v,sha1_hash,SHA1_DIGEST_LEN,64};
+static const hash_alg SHA256_ALG={
+    sha256_init_v,sha256_update_v,sha256_final_v,sha256_hash,SHA256_DIGEST_LEN,64};
+static const hash_alg SHA384_ALG={
+    sha384_init_v,sha384_update_v,sha384_final_v,sha384_hash,SHA384_DIGEST_LEN,128};
+
+static void hmac(const hash_alg *alg, const uint8_t *key, size_t klen,
+                  const uint8_t *msg, size_t mlen, uint8_t *out) {
+    uint8_t k[128]={0};
+    if(klen>alg->block_size) alg->hash(key,klen,k); else memcpy(k,key,klen);
+    uint8_t ip[128], op[128];
+    for(size_t i=0;i<alg->block_size;i++){ip[i]=k[i]^0x36;op[i]=k[i]^0x5c;}
+    union{sha256_ctx s2;sha384_ctx s3;}u;
+    alg->init(&u); alg->update(&u,ip,alg->block_size); alg->update(&u,msg,mlen);
+    uint8_t inner[48]; alg->final_fn(&u,inner);
+    alg->init(&u); alg->update(&u,op,alg->block_size); alg->update(&u,inner,alg->digest_len);
+    alg->final_fn(&u,out);
+}
+
+static void hkdf_extract_u(const hash_alg *alg, const uint8_t *salt, size_t slen,
+                             const uint8_t *ikm, size_t ilen, uint8_t *out) {
+    if(slen==0){uint8_t z[48]={0}; hmac(alg,z,alg->digest_len,ikm,ilen,out);}
+    else hmac(alg,salt,slen,ikm,ilen,out);
+}
+
+static void hkdf_expand_u(const hash_alg *alg, const uint8_t *prk,
+                            const uint8_t *info, size_t ilen, uint8_t *out, size_t olen) {
+    uint8_t t[48]; size_t tl=0, done=0; uint8_t ctr=1;
+    while(done<olen){
+        union{sha256_ctx s2;sha384_ctx s3;}u;
+        uint8_t ik[128]={0},ok[128]={0};
+        memcpy(ik,prk,alg->digest_len);
+        for(size_t i=0;i<alg->block_size;i++){
+            ik[i]^=0x36; ok[i]=((i<alg->digest_len)?prk[i]:0)^0x5c;
+        }
+        alg->init(&u); alg->update(&u,ik,alg->block_size);
+        if(tl>0) alg->update(&u,t,tl);
+        alg->update(&u,info,ilen);
+        alg->update(&u,&ctr,1);
+        uint8_t inner[48]; alg->final_fn(&u,inner);
+        union{sha256_ctx s2;sha384_ctx s3;}u2;
+        alg->init(&u2); alg->update(&u2,ok,alg->block_size); alg->update(&u2,inner,alg->digest_len);
+        alg->final_fn(&u2,t); tl=alg->digest_len;
+        size_t use=olen-done; if(use>alg->digest_len) use=alg->digest_len;
+        memcpy(out+done,t,use); done+=use; ctr++;
+    }
+}
+
+static void hkdf_expand_label_u(const hash_alg *alg, const uint8_t *secret, const char *label,
+                                  const uint8_t *ctx, size_t clen, uint8_t *out, size_t olen) {
+    uint8_t info[256]; size_t p=0;
+    size_t label_len=strlen(label);
+    if(2+1+6+label_len+1+clen>sizeof(info)) die("hkdf_expand_label: info overflow");
+    info[p++]=(olen>>8)&0xFF; info[p++]=olen&0xFF;
+    size_t ll=6+label_len;
+    info[p++]=ll&0xFF;
+    memcpy(info+p,"tls13 ",6); p+=6;
+    memcpy(info+p,label,label_len); p+=label_len;
+    info[p++]=clen&0xFF;
+    if(clen>0){memcpy(info+p,ctx,clen);p+=clen;}
+    hkdf_expand_u(alg,secret,info,p,out,olen);
+}
+
+static void tls12_prf_u(const hash_alg *alg, const uint8_t *secret, size_t secret_len,
+                          const char *label, const uint8_t *seed, size_t seed_len,
+                          uint8_t *out, size_t out_len) {
+    uint8_t lseed[256];
+    size_t label_len=strlen(label);
+    size_t ls_len=label_len+seed_len;
+    if(ls_len>sizeof(lseed)) die("tls12_prf: label+seed overflow");
+    memcpy(lseed,label,label_len);
+    memcpy(lseed+label_len,seed,seed_len);
+    uint8_t a[48];
+    hmac(alg,secret,secret_len,lseed,ls_len,a);
+    size_t done=0;
+    while(done<out_len){
+        uint8_t buf[48+256];
+        memcpy(buf,a,alg->digest_len);
+        memcpy(buf+alg->digest_len,lseed,ls_len);
+        uint8_t hmac_out[48];
+        hmac(alg,secret,secret_len,buf,alg->digest_len+ls_len,hmac_out);
+        size_t use=out_len-done; if(use>alg->digest_len) use=alg->digest_len;
+        memcpy(out+done,hmac_out,use); done+=use;
+        hmac(alg,secret,secret_len,a,alg->digest_len,a);
+    }
+}
+
+/* SHA-512: same algorithm as SHA-384, different IVs, full 64-byte output */
+typedef sha384_ctx sha512_ctx;
+#define sha512_transform sha384_transform
+#define sha512_update sha384_update
+
+static void sha512_init(sha512_ctx *ctx) {
+    ctx->h[0]=0x6a09e667f3bcc908ULL;ctx->h[1]=0xbb67ae8584caa73bULL;
+    ctx->h[2]=0x3c6ef372fe94f82bULL;ctx->h[3]=0xa54ff53a5f1d36f1ULL;
+    ctx->h[4]=0x510e527fade682d1ULL;ctx->h[5]=0x9b05688c2b3e6c1fULL;
+    ctx->h[6]=0x1f83d9abfb41bd6bULL;ctx->h[7]=0x5be0cd19137e2179ULL;
+    ctx->buf_len=0; ctx->total=0;
+}
+
+static void sha512_final(sha512_ctx *ctx, uint8_t out[64]) {
+    uint64_t bits=ctx->total*8;
+    uint8_t pad=0x80;
+    sha512_update(ctx,&pad,1);
+    pad=0;
+    while(ctx->buf_len!=112) sha512_update(ctx,&pad,1);
+    uint8_t lb[16]={0};
+    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
+    sha512_update(ctx,lb,16);
+    for(int i=0;i<8;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
+}
+
+static void sha512_hash(const uint8_t *data, size_t len, uint8_t out[64]) {
+    sha512_ctx c; sha512_init(&c); sha512_update(&c,data,len); sha512_final(&c,out);
+}
+
+/* ================================================================
  * AES (128/256)
  * ================================================================ */
 static const uint8_t aes_sbox[256] = {
@@ -514,6 +740,316 @@ static void aes_cbc_decrypt(const uint8_t *key, size_t key_len,
         for(int j=0;j<16;j++) pt[i+j]=blk[j]^prev[j];
         memcpy(prev,ct+i,16);
     }
+}
+
+/* ================================================================
+ * ChaCha20 Stream Cipher (RFC 8439)
+ * ================================================================ */
+static uint32_t rotl32(uint32_t x, int n){return (x<<n)|(x>>(32-n));}
+
+#define QR(a,b,c,d) \
+    a+=b;d^=a;d=rotl32(d,16); \
+    c+=d;b^=c;b=rotl32(b,12); \
+    a+=b;d^=a;d=rotl32(d,8);  \
+    c+=d;b^=c;b=rotl32(b,7);
+
+static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12],
+    uint32_t counter, uint8_t out[64]) {
+    uint32_t s[16];
+    s[0]=0x61707865; s[1]=0x3320646e; s[2]=0x79622d32; s[3]=0x6b206574;
+    for(int i=0;i<8;i++)
+        s[4+i]=(uint32_t)key[4*i]|((uint32_t)key[4*i+1]<<8)
+              |((uint32_t)key[4*i+2]<<16)|((uint32_t)key[4*i+3]<<24);
+    s[12]=counter;
+    for(int i=0;i<3;i++)
+        s[13+i]=(uint32_t)nonce[4*i]|((uint32_t)nonce[4*i+1]<<8)
+               |((uint32_t)nonce[4*i+2]<<16)|((uint32_t)nonce[4*i+3]<<24);
+    uint32_t w[16]; memcpy(w,s,64);
+    for(int i=0;i<10;i++){
+        QR(w[0],w[4],w[8],w[12])  QR(w[1],w[5],w[9],w[13])
+        QR(w[2],w[6],w[10],w[14]) QR(w[3],w[7],w[11],w[15])
+        QR(w[0],w[5],w[10],w[15]) QR(w[1],w[6],w[11],w[12])
+        QR(w[2],w[7],w[8],w[13])  QR(w[3],w[4],w[9],w[14])
+    }
+    for(int i=0;i<16;i++) w[i]+=s[i];
+    for(int i=0;i<16;i++){
+        out[4*i]=(uint8_t)w[i]; out[4*i+1]=(uint8_t)(w[i]>>8);
+        out[4*i+2]=(uint8_t)(w[i]>>16); out[4*i+3]=(uint8_t)(w[i]>>24);
+    }
+}
+
+static void chacha20_encrypt(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter,
+                              const uint8_t *in, size_t len, uint8_t *out) {
+    for(size_t off=0;off<len;off+=64){
+        uint8_t ks[64];
+        chacha20_block(key,nonce,counter++,ks);
+        size_t n=len-off; if(n>64) n=64;
+        for(size_t j=0;j<n;j++) out[off+j]=in[off+j]^ks[j];
+    }
+}
+
+/* ================================================================
+ * Poly1305 MAC (RFC 8439)
+ * Prime: p = 2^130 - 5.  Accumulator in 3 x 64-bit words (44/44/42-bit limbs).
+ * ================================================================ */
+static void poly1305_mac(const uint8_t key[32], const uint8_t *msg,
+    size_t msg_len, uint8_t tag[16]) {
+    /* Clamp r */
+    uint64_t r0=0,r1=0;
+    for(int i=0;i<8;i++) r0|=(uint64_t)key[i]<<(8*i);
+    for(int i=0;i<8;i++) r1|=(uint64_t)key[8+i]<<(8*i);
+    r0&=0x0FFFFFFC0FFFFFFF; r1&=0x0FFFFFFC0FFFFFFC;
+    /* r as 3 limbs of 44/44/42 bits for schoolbook multiply with __uint128_t */
+    uint64_t rr0 = r0 & 0xFFFFFFFFFFF;
+    uint64_t rr1 = ((r0>>44)|(r1<<20)) & 0xFFFFFFFFFFF;
+    uint64_t rr2 = (r1>>24) & 0x3FFFFFFFFFF;
+
+    uint64_t h0=0,h1=0,h2=0;
+    /* Precompute 20*r limbs for modular reduction (2^130 ≡ 5 mod p, ×4 for limb alignment) */
+    uint64_t s1=20*rr1, s2=20*rr2;
+
+    for(size_t i=0;i<msg_len;i+=16){
+        /* Read up to 16 bytes of message block */
+        uint8_t blk[17]={0};
+        size_t n=msg_len-i; if(n>16) n=16;
+        memcpy(blk,msg+i,n);
+        blk[n]=1; /* pad byte */
+        /* Parse block as little-endian 130-bit number */
+        uint64_t t0=0,t1=0,t2=0;
+        for(int j=0;j<8&&j<(int)(n+1);j++) t0|=(uint64_t)blk[j]<<(8*j);
+        for(int j=0;j<8&&(j+8)<(int)(n+1);j++) t1|=(uint64_t)blk[8+j]<<(8*j);
+        if(n>=16) t2=(uint64_t)blk[16];
+        /* Split into 44-bit limbs */
+        uint64_t b0 = t0 & 0xFFFFFFFFFFF;
+        uint64_t b1 = ((t0>>44)|(t1<<20)) & 0xFFFFFFFFFFF;
+        uint64_t b2 = ((t1>>24)|(t2<<40)) & 0x3FFFFFFFFFF;
+
+        h0+=b0; h1+=b1; h2+=b2;
+
+        /* h = h * r mod p using 44-bit limbs */
+        uint128_t d0=(uint128_t)h0*rr0 + (uint128_t)h1*s2 + (uint128_t)h2*s1;
+        uint128_t d1=(uint128_t)h0*rr1 + (uint128_t)h1*rr0 + (uint128_t)h2*s2;
+        uint128_t d2=(uint128_t)h0*rr2 + (uint128_t)h1*rr1 + (uint128_t)h2*rr0;
+
+        /* Partial reduction / carry propagation */
+        uint64_t c0=(uint64_t)(d0>>44); h0=(uint64_t)d0 & 0xFFFFFFFFFFF;
+        d1+=c0;
+        uint64_t c1=(uint64_t)(d1>>44); h1=(uint64_t)d1 & 0xFFFFFFFFFFF;
+        d2+=c1;
+        uint64_t c2=(uint64_t)(d2>>42); h2=(uint64_t)d2 & 0x3FFFFFFFFFF;
+        h0+=c2*5;
+        uint64_t c3=h0>>44; h0&=0xFFFFFFFFFFF;
+        h1+=c3;
+    }
+    /* Final reduction */
+    uint64_t c4=h1>>44; h1&=0xFFFFFFFFFFF;
+    h2+=c4;
+    uint64_t c5=h2>>42; h2&=0x3FFFFFFFFFF;
+    h0+=c5*5;
+    uint64_t c6=h0>>44; h0&=0xFFFFFFFFFFF;
+    h1+=c6;
+
+    /* Compute h - p; keep if h >= p */
+    uint64_t g0=h0+5; uint64_t cg=g0>>44; g0&=0xFFFFFFFFFFF;
+    uint64_t g1=h1+cg; cg=g1>>44; g1&=0xFFFFFFFFFFF;
+    uint64_t g2=h2+cg-(1ULL<<42);
+    uint64_t mask2=-(g2>>63); /* if g2 < 0 (underflow), mask=0xFFF..., keep h; else keep g */
+    h0=(h0&mask2)|(g0&~mask2);
+    h1=(h1&mask2)|(g1&~mask2);
+    h2=(h2&mask2)|(g2&~mask2);
+
+    /* Convert back to 128-bit number */
+    uint64_t lo=h0|(h1<<44);
+    uint64_t hi=(h1>>20)|(h2<<24);
+
+    /* Add s (second half of key) */
+    uint64_t s_lo=0,s_hi=0;
+    for(int i=0;i<8;i++) s_lo|=(uint64_t)key[16+i]<<(8*i);
+    for(int i=0;i<8;i++) s_hi|=(uint64_t)key[24+i]<<(8*i);
+    uint128_t sum=(uint128_t)lo+s_lo;
+    lo=(uint64_t)sum;
+    sum=(uint128_t)hi+s_hi+(uint64_t)(sum>>64);
+    hi=(uint64_t)sum;
+
+    /* Output little-endian */
+    for(int i=0;i<8;i++){tag[i]=(lo>>(8*i))&0xFF; tag[8+i]=(hi>>(8*i))&0xFF;}
+}
+
+/* ================================================================
+ * ChaCha20-Poly1305 AEAD (RFC 8439)
+ * ================================================================ */
+static void chacha20_poly1305_encrypt(const uint8_t key[32], const uint8_t nonce[12],
+                                        const uint8_t *aad, size_t al,
+                                        const uint8_t *pt, size_t pl,
+                                        uint8_t *ct, uint8_t tag[16]) {
+    /* 1. Generate Poly1305 one-time key */
+    uint8_t poly_key[64];
+    chacha20_block(key,nonce,0,poly_key);
+    /* 2. Encrypt plaintext with counter starting at 1 */
+    chacha20_encrypt(key,nonce,1,pt,pl,ct);
+    /* 3. Construct MAC input and compute tag */
+    size_t apad=(16-(al%16))%16;
+    size_t cpad=(16-(pl%16))%16;
+    size_t mac_len=al+apad+pl+cpad+16;
+    uint8_t *mac_data=malloc(mac_len);
+    if(!mac_data) die("malloc failed");
+    size_t mp=0;
+    memcpy(mac_data+mp,aad,al); mp+=al;
+    memset(mac_data+mp,0,apad); mp+=apad;
+    memcpy(mac_data+mp,ct,pl); mp+=pl;
+    memset(mac_data+mp,0,cpad); mp+=cpad;
+    for(int i=0;i<8;i++) mac_data[mp++]=(al>>(8*i))&0xFF;
+    for(int i=0;i<8;i++) mac_data[mp++]=(pl>>(8*i))&0xFF;
+    poly1305_mac(poly_key,mac_data,mac_len,tag);
+    free(mac_data);
+    secure_zero(poly_key,sizeof(poly_key));
+}
+
+static int chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[12],
+                                       const uint8_t *aad, size_t al,
+                                       const uint8_t *ct, size_t cl,
+                                       uint8_t *pt, const uint8_t exp_tag[16]) {
+    /* 1. Generate Poly1305 one-time key */
+    uint8_t poly_key[64];
+    chacha20_block(key,nonce,0,poly_key);
+    /* 2. Verify tag first */
+    size_t apad=(16-(al%16))%16;
+    size_t cpad=(16-(cl%16))%16;
+    size_t mac_len=al+apad+cl+cpad+16;
+    uint8_t *mac_data=malloc(mac_len);
+    if(!mac_data) die("malloc failed");
+    size_t mp=0;
+    memcpy(mac_data+mp,aad,al); mp+=al;
+    memset(mac_data+mp,0,apad); mp+=apad;
+    memcpy(mac_data+mp,ct,cl); mp+=cl;
+    memset(mac_data+mp,0,cpad); mp+=cpad;
+    for(int i=0;i<8;i++) mac_data[mp++]=(al>>(8*i))&0xFF;
+    for(int i=0;i<8;i++) mac_data[mp++]=(cl>>(8*i))&0xFF;
+    uint8_t tag[16];
+    poly1305_mac(poly_key,mac_data,mac_len,tag);
+    free(mac_data);
+    secure_zero(poly_key,sizeof(poly_key));
+    if(!ct_memeq(tag,exp_tag,16)) return -1;
+    /* 3. Decrypt */
+    chacha20_encrypt(key,nonce,1,ct,cl,pt);
+    return 0;
+}
+
+/* ================================================================
+ * Big-Number Arithmetic (for RSA and ECDSA mod-n operations)
+ * ================================================================ */
+#define BN_MAX_LIMBS 130  /* must hold product of two RSA-4096 numbers (128 limbs) */
+
+typedef struct { uint64_t v[BN_MAX_LIMBS]; int len; } bignum;
+
+static void bn_zero(bignum *r) { memset(r,0,sizeof(*r)); }
+
+static void bn_from_bytes(bignum *r, const uint8_t *buf, size_t blen) {
+    bn_zero(r);
+    r->len=(int)((blen+7)/8);
+    if(r->len>BN_MAX_LIMBS) r->len=BN_MAX_LIMBS;
+    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
+        r->v[i/8]|=(uint64_t)buf[blen-1-i]<<(8*(i%8));
+}
+
+static void bn_to_bytes(const bignum *a, uint8_t *buf, size_t blen) {
+    memset(buf,0,blen);
+    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
+        buf[blen-1-i]=(a->v[i/8]>>(8*(i%8)))&0xFF;
+}
+
+static int bn_cmp(const bignum *a, const bignum *b) {
+    int ml=a->len>b->len?a->len:b->len;
+    for(int i=ml-1;i>=0;i--){
+        uint64_t av=i<a->len?a->v[i]:0, bv=i<b->len?b->v[i]:0;
+        if(av>bv)return 1; if(av<bv)return -1;
+    }
+    return 0;
+}
+
+static void bn_sub(bignum *r, const bignum *a, const bignum *b) {
+    int ml=a->len>b->len?a->len:b->len;
+    __int128 borrow=0;
+    for(int i=0;i<ml;i++){
+        borrow=(__int128)(i<a->len?a->v[i]:0)-(i<b->len?b->v[i]:0)+borrow;
+        r->v[i]=(uint64_t)borrow; borrow>>=64;
+    }
+    r->len=ml;
+    while(r->len>0&&r->v[r->len-1]==0) r->len--;
+}
+
+static void bn_mul(bignum *r, const bignum *a, const bignum *b) {
+    bignum t; bn_zero(&t);
+    t.len=a->len+b->len;
+    if(t.len>BN_MAX_LIMBS) t.len=BN_MAX_LIMBS;
+    for(int i=0;i<a->len;i++){
+        uint64_t carry=0;
+        for(int j=0;j<b->len&&i+j<BN_MAX_LIMBS;j++){
+            uint128_t p=(uint128_t)a->v[i]*b->v[j]+t.v[i+j]+carry;
+            t.v[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+        }
+        if(i+b->len<BN_MAX_LIMBS) t.v[i+b->len]=carry;
+    }
+    while(t.len>0&&t.v[t.len-1]==0) t.len--;
+    *r=t;
+}
+
+static int bn_bits(const bignum *a) {
+    if(a->len==0) return 0;
+    int bits=(a->len-1)*64;
+    uint64_t top=a->v[a->len-1];
+    while(top){bits++;top>>=1;}
+    return bits;
+}
+
+static void bn_shl1(bignum *a) {
+    uint64_t carry=0;
+    for(int i=0;i<a->len;i++){
+        uint64_t nc=a->v[i]>>63;
+        a->v[i]=(a->v[i]<<1)|carry;
+        carry=nc;
+    }
+    if(carry&&a->len<BN_MAX_LIMBS) a->v[a->len++]=carry;
+}
+
+static void bn_mod(bignum *r, const bignum *a, const bignum *m) {
+    bignum rem; bn_zero(&rem);
+    int abits=bn_bits(a);
+    for(int i=abits-1;i>=0;i--){
+        bn_shl1(&rem);
+        if((a->v[i/64]>>(i%64))&1){rem.v[0]|=1;if(rem.len==0)rem.len=1;}
+        if(bn_cmp(&rem,m)>=0) bn_sub(&rem,&rem,m);
+    }
+    *r=rem;
+}
+
+static void bn_modmul(bignum *r, const bignum *a, const bignum *b, const bignum *m) {
+    bignum t; bn_mul(&t,a,b); bn_mod(r,&t,m);
+}
+
+/* Constant-time conditional copy: dst = src if bit==1, unchanged if bit==0 */
+static void bn_cmov(bignum *dst, const bignum *src, int bit) {
+    uint64_t mask = -(uint64_t)(bit&1); /* 0 or 0xFFFF... */
+    int max_len = dst->len > src->len ? dst->len : src->len;
+    for(int i=0;i<max_len;i++)
+        dst->v[i] = (dst->v[i] & ~mask) | (src->v[i] & mask);
+    dst->len = (dst->len & (int)~mask) | (src->len & (int)mask);
+}
+
+static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bignum *m) {
+    bignum result; bn_zero(&result); result.v[0]=1; result.len=1;
+    bignum b; bn_mod(&b,base,m);
+    /* Use fixed bit count based on modulus size to avoid leaking exponent length */
+    int total_bits = m->len * 64;
+    for(int i=0;i<total_bits;i++){
+        /* Always multiply, conditionally keep result */
+        bignum tmp;
+        bn_modmul(&tmp,&result,&b,m);
+        int bit = (i < exp->len*64) ? (int)((exp->v[i/64]>>(i%64))&1) : 0;
+        bn_cmov(&result,&tmp,bit);
+        if(i<total_bits-1) bn_modmul(&b,&b,&b,m);
+    }
+    *r=result;
 }
 
 /* ================================================================
@@ -813,437 +1349,6 @@ static void ecdhe_shared_secret(const uint8_t priv[P384_SCALAR_LEN],
     fp384 sx,sy; ec384_to_affine(&sx,&sy,&S);
     fp384_to_bytes(secret,&sx);
 }
-/* ================================================================
- * Base64 / PEM Decoder
- * ================================================================ */
-static int b64val(uint8_t c) {
-    if (c>='A'&&c<='Z') return c-'A';
-    if (c>='a'&&c<='z') return c-'a'+26;
-    if (c>='0'&&c<='9') return c-'0'+52;
-    if (c=='+') return 62;
-    if (c=='/') return 63;
-    return -1;
-}
-
-static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
-    const char *begin = strstr(pem, "-----BEGIN ");
-    if (!begin) return 0;
-    begin = memchr(begin, '\n', pem_len-(begin-pem));
-    if (!begin) return 0;
-    begin++;
-    const char *end = strstr(begin, "-----END ");
-    if (!end) return 0;
-    size_t out = 0;
-    uint32_t acc = 0; int bits = 0;
-    for (const char *p = begin; p < end; p++) {
-        int v = b64val((uint8_t)*p);
-        if (v < 0) continue;
-        acc = (acc << 6) | v; bits += 6;
-        if (bits >= 8) { bits -= 8; der[out++] = (acc >> bits) & 0xFF; }
-    }
-    return out;
-}
-
-/* ================================================================
- * ASN.1/DER Parser Helpers
- * ================================================================ */
-/* Read tag + length, return pointer to value. NULL on error. */
-static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
-                                    uint8_t *tag, size_t *len) {
-    if (p >= end) return NULL;
-    *tag = *p++;
-    if (p >= end) return NULL;
-    if (*p < 0x80) {
-        *len = *p++;
-    } else {
-        int nb = *p++ & 0x7F;
-        /* nb==0: reject BER indefinite length */
-        if (nb == 0 || nb > 3 || p + nb > end) return NULL;
-        *len = 0;
-        for (int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
-    }
-    if (p + *len > end) return NULL;
-    return p;
-}
-
-/* Skip one TLV element, return pointer past it */
-static const uint8_t *der_skip(const uint8_t *p, const uint8_t *end) {
-    uint8_t tag; size_t len;
-    const uint8_t *val = der_read_tl(p, end, &tag, &len);
-    if (!val) return NULL;
-    return val + len;
-}
-
-static int oid_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
-    return alen == blen && memcmp(a, b, alen) == 0;
-}
-
-/* Parse UTCTime (tag 0x17: YYMMDDHHMMSSZ) or GeneralizedTime (tag 0x18: YYYYMMDDHHMMSSZ) */
-static time_t der_parse_time(const uint8_t *p, const uint8_t *end) {
-    uint8_t tag; size_t len;
-    const uint8_t *val=der_read_tl(p,end,&tag,&len);
-    if(!val) return 0;
-    const char *s=(const char *)val;
-    struct tm t={0};
-    if(tag==0x17){ /* UTCTime */
-        int yy=(s[0]-'0')*10+(s[1]-'0');
-        t.tm_year=yy>=50?yy:yy+100;
-        s+=2;
-    } else if(tag==0x18){ /* GeneralizedTime */
-        t.tm_year=(s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0')-1900;
-        s+=4;
-    } else return 0;
-    t.tm_mon=(s[0]-'0')*10+(s[1]-'0')-1;
-    t.tm_mday=(s[2]-'0')*10+(s[3]-'0');
-    t.tm_hour=(s[4]-'0')*10+(s[5]-'0');
-    t.tm_min=(s[6]-'0')*10+(s[7]-'0');
-    t.tm_sec=(s[8]-'0')*10+(s[9]-'0');
-    return timegm(&t);
-}
-
-/* ================================================================
- * SHA-384 (SHA-512 truncated, different IVs, 64-bit words, 80 rounds)
- * ================================================================ */
-static const uint64_t sha512_k[80] = {
-    0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,
-    0x3956c25bf348b538ULL,0x59f111f1b605d019ULL,0x923f82a4af194f9bULL,0xab1c5ed5da6d8118ULL,
-    0xd807aa98a3030242ULL,0x12835b0145706fbeULL,0x243185be4ee4b28cULL,0x550c7dc3d5ffb4e2ULL,
-    0x72be5d74f27b896fULL,0x80deb1fe3b1696b1ULL,0x9bdc06a725c71235ULL,0xc19bf174cf692694ULL,
-    0xe49b69c19ef14ad2ULL,0xefbe4786384f25e3ULL,0x0fc19dc68b8cd5b5ULL,0x240ca1cc77ac9c65ULL,
-    0x2de92c6f592b0275ULL,0x4a7484aa6ea6e483ULL,0x5cb0a9dcbd41fbd4ULL,0x76f988da831153b5ULL,
-    0x983e5152ee66dfabULL,0xa831c66d2db43210ULL,0xb00327c898fb213fULL,0xbf597fc7beef0ee4ULL,
-    0xc6e00bf33da88fc2ULL,0xd5a79147930aa725ULL,0x06ca6351e003826fULL,0x142929670a0e6e70ULL,
-    0x27b70a8546d22ffcULL,0x2e1b21385c26c926ULL,0x4d2c6dfc5ac42aedULL,0x53380d139d95b3dfULL,
-    0x650a73548baf63deULL,0x766a0abb3c77b2a8ULL,0x81c2c92e47edaee6ULL,0x92722c851482353bULL,
-    0xa2bfe8a14cf10364ULL,0xa81a664bbc423001ULL,0xc24b8b70d0f89791ULL,0xc76c51a30654be30ULL,
-    0xd192e819d6ef5218ULL,0xd69906245565a910ULL,0xf40e35855771202aULL,0x106aa07032bbd1b8ULL,
-    0x19a4c116b8d2d0c8ULL,0x1e376c085141ab53ULL,0x2748774cdf8eeb99ULL,0x34b0bcb5e19b48a8ULL,
-    0x391c0cb3c5c95a63ULL,0x4ed8aa4ae3418acbULL,0x5b9cca4f7763e373ULL,0x682e6ff3d6b2b8a3ULL,
-    0x748f82ee5defb2fcULL,0x78a5636f43172f60ULL,0x84c87814a1f0ab72ULL,0x8cc702081a6439ecULL,
-    0x90befffa23631e28ULL,0xa4506cebde82bde9ULL,0xbef9a3f7b2c67915ULL,0xc67178f2e372532bULL,
-    0xca273eceea26619cULL,0xd186b8c721c0c207ULL,0xeada7dd6cde0eb1eULL,0xf57d4f7fee6ed178ULL,
-    0x06f067aa72176fbaULL,0x0a637dc5a2c898a6ULL,0x113f9804bef90daeULL,0x1b710b35131c471bULL,
-    0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,
-    0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL
-};
-
-typedef struct { uint64_t h[8]; uint8_t buf[128]; size_t buf_len; uint64_t total; } sha384_ctx;
-
-#define ROTR64(x,n) (((x)>>(n))|((x)<<(64-(n))))
-#define S512_CH(x,y,z) (((x)&(y))^((~(x))&(z)))
-#define S512_MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
-#define S512_EP0(x) (ROTR64(x,28)^ROTR64(x,34)^ROTR64(x,39))
-#define S512_EP1(x) (ROTR64(x,14)^ROTR64(x,18)^ROTR64(x,41))
-#define S512_SIG0(x) (ROTR64(x,1)^ROTR64(x,8)^((x)>>7))
-#define S512_SIG1(x) (ROTR64(x,19)^ROTR64(x,61)^((x)>>6))
-
-static void sha384_transform(sha384_ctx *ctx, const uint8_t blk[128]) {
-    uint64_t w[80],a,b,c,d,e,f,g,h;
-    for(int i=0;i<16;i++){w[i]=0;for(int j=0;j<8;j++)w[i]=(w[i]<<8)|blk[8*i+j];}
-    for(int i=16;i<80;i++) w[i]=S512_SIG1(w[i-2])+w[i-7]+S512_SIG0(w[i-15])+w[i-16];
-    a=ctx->h[0];b=ctx->h[1];c=ctx->h[2];d=ctx->h[3];
-    e=ctx->h[4];f=ctx->h[5];g=ctx->h[6];h=ctx->h[7];
-    for(int i=0;i<80;i++){
-        uint64_t t1=h+S512_EP1(e)+S512_CH(e,f,g)+sha512_k[i]+w[i];
-        uint64_t t2=S512_EP0(a)+S512_MAJ(a,b,c);
-        h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
-    }
-    ctx->h[0]+=a;ctx->h[1]+=b;ctx->h[2]+=c;ctx->h[3]+=d;
-    ctx->h[4]+=e;ctx->h[5]+=f;ctx->h[6]+=g;ctx->h[7]+=h;
-}
-
-static void sha384_init(sha384_ctx *ctx) {
-    ctx->h[0]=0xcbbb9d5dc1059ed8ULL;ctx->h[1]=0x629a292a367cd507ULL;
-    ctx->h[2]=0x9159015a3070dd17ULL;ctx->h[3]=0x152fecd8f70e5939ULL;
-    ctx->h[4]=0x67332667ffc00b31ULL;ctx->h[5]=0x8eb44a8768581511ULL;
-    ctx->h[6]=0xdb0c2e0d64f98fa7ULL;ctx->h[7]=0x47b5481dbefa4fa4ULL;
-    ctx->buf_len=0; ctx->total=0;
-}
-
-static void sha384_update(sha384_ctx *ctx, const uint8_t *data, size_t len) {
-    ctx->total+=len;
-    while(len>0){
-        size_t space=128-ctx->buf_len, chunk=len<space?len:space;
-        memcpy(ctx->buf+ctx->buf_len,data,chunk);
-        ctx->buf_len+=chunk; data+=chunk; len-=chunk;
-        if(ctx->buf_len==128){sha384_transform(ctx,ctx->buf);ctx->buf_len=0;}
-    }
-}
-
-static void sha384_final(sha384_ctx *ctx, uint8_t out[48]) {
-    uint64_t bits=ctx->total*8;
-    uint8_t pad=0x80;
-    sha384_update(ctx,&pad,1);
-    pad=0;
-    while(ctx->buf_len!=112) sha384_update(ctx,&pad,1);
-    uint8_t lb[16]={0};
-    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
-    sha384_update(ctx,lb,16);
-    for(int i=0;i<6;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
-}
-
-static void sha384_hash(const uint8_t *data, size_t len, uint8_t out[48]) {
-    sha384_ctx c; sha384_init(&c); sha384_update(&c,data,len); sha384_final(&c,out);
-}
-
-/* Hash algorithm abstraction for unified HMAC/HKDF/PRF */
-typedef void (*hash_fn_t)(const uint8_t*, size_t, uint8_t*);
-typedef struct {
-    void (*init)(void*);
-    void (*update)(void*, const uint8_t*, size_t);
-    void (*final_fn)(void*, uint8_t*);
-    hash_fn_t hash;
-    size_t digest_len, block_size;
-} hash_alg;
-
-static void sha1_init_v(void *ctx){sha1_init((sha1_ctx*)ctx);}
-static void sha1_update_v(void *ctx,const uint8_t *d,size_t l){sha1_update((sha1_ctx*)ctx,d,l);}
-static void sha1_final_v(void *ctx,uint8_t *o){sha1_final((sha1_ctx*)ctx,o);}
-static void sha256_init_v(void *ctx){sha256_init((sha256_ctx*)ctx);}
-static void sha256_update_v(void *ctx,const uint8_t *d,size_t l){
-    sha256_update((sha256_ctx*)ctx,d,l);
-}
-static void sha256_final_v(void *ctx,uint8_t *o){sha256_final((sha256_ctx*)ctx,o);}
-static void sha384_init_v(void *ctx){sha384_init((sha384_ctx*)ctx);}
-static void sha384_update_v(void *ctx,const uint8_t *d,size_t l){
-    sha384_update((sha384_ctx*)ctx,d,l);
-}
-static void sha384_final_v(void *ctx,uint8_t *o){sha384_final((sha384_ctx*)ctx,o);}
-
-static const hash_alg SHA1_ALG={
-    sha1_init_v,sha1_update_v,sha1_final_v,sha1_hash,SHA1_DIGEST_LEN,64};
-static const hash_alg SHA256_ALG={
-    sha256_init_v,sha256_update_v,sha256_final_v,sha256_hash,SHA256_DIGEST_LEN,64};
-static const hash_alg SHA384_ALG={
-    sha384_init_v,sha384_update_v,sha384_final_v,sha384_hash,SHA384_DIGEST_LEN,128};
-
-static void hmac(const hash_alg *alg, const uint8_t *key, size_t klen,
-                  const uint8_t *msg, size_t mlen, uint8_t *out) {
-    uint8_t k[128]={0};
-    if(klen>alg->block_size) alg->hash(key,klen,k); else memcpy(k,key,klen);
-    uint8_t ip[128], op[128];
-    for(size_t i=0;i<alg->block_size;i++){ip[i]=k[i]^0x36;op[i]=k[i]^0x5c;}
-    union{sha256_ctx s2;sha384_ctx s3;}u;
-    alg->init(&u); alg->update(&u,ip,alg->block_size); alg->update(&u,msg,mlen);
-    uint8_t inner[48]; alg->final_fn(&u,inner);
-    alg->init(&u); alg->update(&u,op,alg->block_size); alg->update(&u,inner,alg->digest_len);
-    alg->final_fn(&u,out);
-}
-
-static void hkdf_extract_u(const hash_alg *alg, const uint8_t *salt, size_t slen,
-                             const uint8_t *ikm, size_t ilen, uint8_t *out) {
-    if(slen==0){uint8_t z[48]={0}; hmac(alg,z,alg->digest_len,ikm,ilen,out);}
-    else hmac(alg,salt,slen,ikm,ilen,out);
-}
-
-static void hkdf_expand_u(const hash_alg *alg, const uint8_t *prk,
-                            const uint8_t *info, size_t ilen, uint8_t *out, size_t olen) {
-    uint8_t t[48]; size_t tl=0, done=0; uint8_t ctr=1;
-    while(done<olen){
-        union{sha256_ctx s2;sha384_ctx s3;}u;
-        uint8_t ik[128]={0},ok[128]={0};
-        memcpy(ik,prk,alg->digest_len);
-        for(size_t i=0;i<alg->block_size;i++){
-            ik[i]^=0x36; ok[i]=((i<alg->digest_len)?prk[i]:0)^0x5c;
-        }
-        alg->init(&u); alg->update(&u,ik,alg->block_size);
-        if(tl>0) alg->update(&u,t,tl);
-        alg->update(&u,info,ilen);
-        alg->update(&u,&ctr,1);
-        uint8_t inner[48]; alg->final_fn(&u,inner);
-        union{sha256_ctx s2;sha384_ctx s3;}u2;
-        alg->init(&u2); alg->update(&u2,ok,alg->block_size); alg->update(&u2,inner,alg->digest_len);
-        alg->final_fn(&u2,t); tl=alg->digest_len;
-        size_t use=olen-done; if(use>alg->digest_len) use=alg->digest_len;
-        memcpy(out+done,t,use); done+=use; ctr++;
-    }
-}
-
-static void hkdf_expand_label_u(const hash_alg *alg, const uint8_t *secret, const char *label,
-                                  const uint8_t *ctx, size_t clen, uint8_t *out, size_t olen) {
-    uint8_t info[256]; size_t p=0;
-    size_t label_len=strlen(label);
-    if(2+1+6+label_len+1+clen>sizeof(info)) die("hkdf_expand_label: info overflow");
-    info[p++]=(olen>>8)&0xFF; info[p++]=olen&0xFF;
-    size_t ll=6+label_len;
-    info[p++]=ll&0xFF;
-    memcpy(info+p,"tls13 ",6); p+=6;
-    memcpy(info+p,label,label_len); p+=label_len;
-    info[p++]=clen&0xFF;
-    if(clen>0){memcpy(info+p,ctx,clen);p+=clen;}
-    hkdf_expand_u(alg,secret,info,p,out,olen);
-}
-
-static void tls12_prf_u(const hash_alg *alg, const uint8_t *secret, size_t secret_len,
-                          const char *label, const uint8_t *seed, size_t seed_len,
-                          uint8_t *out, size_t out_len) {
-    uint8_t lseed[256];
-    size_t label_len=strlen(label);
-    size_t ls_len=label_len+seed_len;
-    if(ls_len>sizeof(lseed)) die("tls12_prf: label+seed overflow");
-    memcpy(lseed,label,label_len);
-    memcpy(lseed+label_len,seed,seed_len);
-    uint8_t a[48];
-    hmac(alg,secret,secret_len,lseed,ls_len,a);
-    size_t done=0;
-    while(done<out_len){
-        uint8_t buf[48+256];
-        memcpy(buf,a,alg->digest_len);
-        memcpy(buf+alg->digest_len,lseed,ls_len);
-        uint8_t hmac_out[48];
-        hmac(alg,secret,secret_len,buf,alg->digest_len+ls_len,hmac_out);
-        size_t use=out_len-done; if(use>alg->digest_len) use=alg->digest_len;
-        memcpy(out+done,hmac_out,use); done+=use;
-        hmac(alg,secret,secret_len,a,alg->digest_len,a);
-    }
-}
-
-/* SHA-512: same algorithm as SHA-384, different IVs, full 64-byte output */
-typedef sha384_ctx sha512_ctx;
-#define sha512_transform sha384_transform
-#define sha512_update sha384_update
-
-static void sha512_init(sha512_ctx *ctx) {
-    ctx->h[0]=0x6a09e667f3bcc908ULL;ctx->h[1]=0xbb67ae8584caa73bULL;
-    ctx->h[2]=0x3c6ef372fe94f82bULL;ctx->h[3]=0xa54ff53a5f1d36f1ULL;
-    ctx->h[4]=0x510e527fade682d1ULL;ctx->h[5]=0x9b05688c2b3e6c1fULL;
-    ctx->h[6]=0x1f83d9abfb41bd6bULL;ctx->h[7]=0x5be0cd19137e2179ULL;
-    ctx->buf_len=0; ctx->total=0;
-}
-
-static void sha512_final(sha512_ctx *ctx, uint8_t out[64]) {
-    uint64_t bits=ctx->total*8;
-    uint8_t pad=0x80;
-    sha512_update(ctx,&pad,1);
-    pad=0;
-    while(ctx->buf_len!=112) sha512_update(ctx,&pad,1);
-    uint8_t lb[16]={0};
-    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
-    sha512_update(ctx,lb,16);
-    for(int i=0;i<8;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
-}
-
-static void sha512_hash(const uint8_t *data, size_t len, uint8_t out[64]) {
-    sha512_ctx c; sha512_init(&c); sha512_update(&c,data,len); sha512_final(&c,out);
-}
-
-/* ================================================================
- * Big-Number Arithmetic (for RSA and ECDSA mod-n operations)
- * ================================================================ */
-#define BN_MAX_LIMBS 130  /* must hold product of two RSA-4096 numbers (128 limbs) */
-
-typedef struct { uint64_t v[BN_MAX_LIMBS]; int len; } bignum;
-
-static void bn_zero(bignum *r) { memset(r,0,sizeof(*r)); }
-
-static void bn_from_bytes(bignum *r, const uint8_t *buf, size_t blen) {
-    bn_zero(r);
-    r->len=(int)((blen+7)/8);
-    if(r->len>BN_MAX_LIMBS) r->len=BN_MAX_LIMBS;
-    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
-        r->v[i/8]|=(uint64_t)buf[blen-1-i]<<(8*(i%8));
-}
-
-static void bn_to_bytes(const bignum *a, uint8_t *buf, size_t blen) {
-    memset(buf,0,blen);
-    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
-        buf[blen-1-i]=(a->v[i/8]>>(8*(i%8)))&0xFF;
-}
-
-static int bn_cmp(const bignum *a, const bignum *b) {
-    int ml=a->len>b->len?a->len:b->len;
-    for(int i=ml-1;i>=0;i--){
-        uint64_t av=i<a->len?a->v[i]:0, bv=i<b->len?b->v[i]:0;
-        if(av>bv)return 1; if(av<bv)return -1;
-    }
-    return 0;
-}
-
-static void bn_sub(bignum *r, const bignum *a, const bignum *b) {
-    int ml=a->len>b->len?a->len:b->len;
-    __int128 borrow=0;
-    for(int i=0;i<ml;i++){
-        borrow=(__int128)(i<a->len?a->v[i]:0)-(i<b->len?b->v[i]:0)+borrow;
-        r->v[i]=(uint64_t)borrow; borrow>>=64;
-    }
-    r->len=ml;
-    while(r->len>0&&r->v[r->len-1]==0) r->len--;
-}
-
-static void bn_mul(bignum *r, const bignum *a, const bignum *b) {
-    bignum t; bn_zero(&t);
-    t.len=a->len+b->len;
-    if(t.len>BN_MAX_LIMBS) t.len=BN_MAX_LIMBS;
-    for(int i=0;i<a->len;i++){
-        uint64_t carry=0;
-        for(int j=0;j<b->len&&i+j<BN_MAX_LIMBS;j++){
-            uint128_t p=(uint128_t)a->v[i]*b->v[j]+t.v[i+j]+carry;
-            t.v[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
-        }
-        if(i+b->len<BN_MAX_LIMBS) t.v[i+b->len]=carry;
-    }
-    while(t.len>0&&t.v[t.len-1]==0) t.len--;
-    *r=t;
-}
-
-static int bn_bits(const bignum *a) {
-    if(a->len==0) return 0;
-    int bits=(a->len-1)*64;
-    uint64_t top=a->v[a->len-1];
-    while(top){bits++;top>>=1;}
-    return bits;
-}
-
-static void bn_shl1(bignum *a) {
-    uint64_t carry=0;
-    for(int i=0;i<a->len;i++){
-        uint64_t nc=a->v[i]>>63;
-        a->v[i]=(a->v[i]<<1)|carry;
-        carry=nc;
-    }
-    if(carry&&a->len<BN_MAX_LIMBS) a->v[a->len++]=carry;
-}
-
-static void bn_mod(bignum *r, const bignum *a, const bignum *m) {
-    bignum rem; bn_zero(&rem);
-    int abits=bn_bits(a);
-    for(int i=abits-1;i>=0;i--){
-        bn_shl1(&rem);
-        if((a->v[i/64]>>(i%64))&1){rem.v[0]|=1;if(rem.len==0)rem.len=1;}
-        if(bn_cmp(&rem,m)>=0) bn_sub(&rem,&rem,m);
-    }
-    *r=rem;
-}
-
-static void bn_modmul(bignum *r, const bignum *a, const bignum *b, const bignum *m) {
-    bignum t; bn_mul(&t,a,b); bn_mod(r,&t,m);
-}
-
-/* Constant-time conditional copy: dst = src if bit==1, unchanged if bit==0 */
-static void bn_cmov(bignum *dst, const bignum *src, int bit) {
-    uint64_t mask = -(uint64_t)(bit&1); /* 0 or 0xFFFF... */
-    int max_len = dst->len > src->len ? dst->len : src->len;
-    for(int i=0;i<max_len;i++)
-        dst->v[i] = (dst->v[i] & ~mask) | (src->v[i] & mask);
-    dst->len = (dst->len & (int)~mask) | (src->len & (int)mask);
-}
-
-static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bignum *m) {
-    bignum result; bn_zero(&result); result.v[0]=1; result.len=1;
-    bignum b; bn_mod(&b,base,m);
-    /* Use fixed bit count based on modulus size to avoid leaking exponent length */
-    int total_bits = m->len * 64;
-    for(int i=0;i<total_bits;i++){
-        /* Always multiply, conditionally keep result */
-        bignum tmp;
-        bn_modmul(&tmp,&result,&b,m);
-        int bit = (i < exp->len*64) ? (int)((exp->v[i/64]>>(i%64))&1) : 0;
-        bn_cmov(&result,&tmp,bit);
-        if(i<total_bits-1) bn_modmul(&b,&b,&b,m);
-    }
-    *r=result;
-}
-
 /* ================================================================
  * P-256 Field Arithmetic (mod p, p = 2^256 - 2^224 + 2^192 + 2^96 - 1)
  * Constant-time fixed-width 4x64-bit limbs, modeled on fp384.
@@ -1726,211 +1831,93 @@ static int x25519_shared_secret(const uint8_t priv[X25519_KEY_LEN],
 }
 
 /* ================================================================
- * ChaCha20 Stream Cipher (RFC 8439)
+ * Base64 / PEM Decoder
  * ================================================================ */
-static uint32_t rotl32(uint32_t x, int n){return (x<<n)|(x>>(32-n));}
-
-#define QR(a,b,c,d) \
-    a+=b;d^=a;d=rotl32(d,16); \
-    c+=d;b^=c;b=rotl32(b,12); \
-    a+=b;d^=a;d=rotl32(d,8);  \
-    c+=d;b^=c;b=rotl32(b,7);
-
-static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12],
-    uint32_t counter, uint8_t out[64]) {
-    uint32_t s[16];
-    s[0]=0x61707865; s[1]=0x3320646e; s[2]=0x79622d32; s[3]=0x6b206574;
-    for(int i=0;i<8;i++)
-        s[4+i]=(uint32_t)key[4*i]|((uint32_t)key[4*i+1]<<8)
-              |((uint32_t)key[4*i+2]<<16)|((uint32_t)key[4*i+3]<<24);
-    s[12]=counter;
-    for(int i=0;i<3;i++)
-        s[13+i]=(uint32_t)nonce[4*i]|((uint32_t)nonce[4*i+1]<<8)
-               |((uint32_t)nonce[4*i+2]<<16)|((uint32_t)nonce[4*i+3]<<24);
-    uint32_t w[16]; memcpy(w,s,64);
-    for(int i=0;i<10;i++){
-        QR(w[0],w[4],w[8],w[12])  QR(w[1],w[5],w[9],w[13])
-        QR(w[2],w[6],w[10],w[14]) QR(w[3],w[7],w[11],w[15])
-        QR(w[0],w[5],w[10],w[15]) QR(w[1],w[6],w[11],w[12])
-        QR(w[2],w[7],w[8],w[13])  QR(w[3],w[4],w[9],w[14])
-    }
-    for(int i=0;i<16;i++) w[i]+=s[i];
-    for(int i=0;i<16;i++){
-        out[4*i]=(uint8_t)w[i]; out[4*i+1]=(uint8_t)(w[i]>>8);
-        out[4*i+2]=(uint8_t)(w[i]>>16); out[4*i+3]=(uint8_t)(w[i]>>24);
-    }
+static int b64val(uint8_t c) {
+    if (c>='A'&&c<='Z') return c-'A';
+    if (c>='a'&&c<='z') return c-'a'+26;
+    if (c>='0'&&c<='9') return c-'0'+52;
+    if (c=='+') return 62;
+    if (c=='/') return 63;
+    return -1;
 }
 
-static void chacha20_encrypt(const uint8_t key[32], const uint8_t nonce[12], uint32_t counter,
-                              const uint8_t *in, size_t len, uint8_t *out) {
-    for(size_t off=0;off<len;off+=64){
-        uint8_t ks[64];
-        chacha20_block(key,nonce,counter++,ks);
-        size_t n=len-off; if(n>64) n=64;
-        for(size_t j=0;j<n;j++) out[off+j]=in[off+j]^ks[j];
+static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
+    const char *begin = strstr(pem, "-----BEGIN ");
+    if (!begin) return 0;
+    begin = memchr(begin, '\n', pem_len-(begin-pem));
+    if (!begin) return 0;
+    begin++;
+    const char *end = strstr(begin, "-----END ");
+    if (!end) return 0;
+    size_t out = 0;
+    uint32_t acc = 0; int bits = 0;
+    for (const char *p = begin; p < end; p++) {
+        int v = b64val((uint8_t)*p);
+        if (v < 0) continue;
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; der[out++] = (acc >> bits) & 0xFF; }
     }
+    return out;
 }
 
 /* ================================================================
- * Poly1305 MAC (RFC 8439)
- * Prime: p = 2^130 - 5.  Accumulator in 3 x 64-bit words (44/44/42-bit limbs).
+ * ASN.1/DER Parser Helpers
  * ================================================================ */
-static void poly1305_mac(const uint8_t key[32], const uint8_t *msg,
-    size_t msg_len, uint8_t tag[16]) {
-    /* Clamp r */
-    uint64_t r0=0,r1=0;
-    for(int i=0;i<8;i++) r0|=(uint64_t)key[i]<<(8*i);
-    for(int i=0;i<8;i++) r1|=(uint64_t)key[8+i]<<(8*i);
-    r0&=0x0FFFFFFC0FFFFFFF; r1&=0x0FFFFFFC0FFFFFFC;
-    /* r as 3 limbs of 44/44/42 bits for schoolbook multiply with __uint128_t */
-    uint64_t rr0 = r0 & 0xFFFFFFFFFFF;
-    uint64_t rr1 = ((r0>>44)|(r1<<20)) & 0xFFFFFFFFFFF;
-    uint64_t rr2 = (r1>>24) & 0x3FFFFFFFFFF;
-
-    uint64_t h0=0,h1=0,h2=0;
-    /* Precompute 20*r limbs for modular reduction (2^130 ≡ 5 mod p, ×4 for limb alignment) */
-    uint64_t s1=20*rr1, s2=20*rr2;
-
-    for(size_t i=0;i<msg_len;i+=16){
-        /* Read up to 16 bytes of message block */
-        uint8_t blk[17]={0};
-        size_t n=msg_len-i; if(n>16) n=16;
-        memcpy(blk,msg+i,n);
-        blk[n]=1; /* pad byte */
-        /* Parse block as little-endian 130-bit number */
-        uint64_t t0=0,t1=0,t2=0;
-        for(int j=0;j<8&&j<(int)(n+1);j++) t0|=(uint64_t)blk[j]<<(8*j);
-        for(int j=0;j<8&&(j+8)<(int)(n+1);j++) t1|=(uint64_t)blk[8+j]<<(8*j);
-        if(n>=16) t2=(uint64_t)blk[16];
-        /* Split into 44-bit limbs */
-        uint64_t b0 = t0 & 0xFFFFFFFFFFF;
-        uint64_t b1 = ((t0>>44)|(t1<<20)) & 0xFFFFFFFFFFF;
-        uint64_t b2 = ((t1>>24)|(t2<<40)) & 0x3FFFFFFFFFF;
-
-        h0+=b0; h1+=b1; h2+=b2;
-
-        /* h = h * r mod p using 44-bit limbs */
-        uint128_t d0=(uint128_t)h0*rr0 + (uint128_t)h1*s2 + (uint128_t)h2*s1;
-        uint128_t d1=(uint128_t)h0*rr1 + (uint128_t)h1*rr0 + (uint128_t)h2*s2;
-        uint128_t d2=(uint128_t)h0*rr2 + (uint128_t)h1*rr1 + (uint128_t)h2*rr0;
-
-        /* Partial reduction / carry propagation */
-        uint64_t c0=(uint64_t)(d0>>44); h0=(uint64_t)d0 & 0xFFFFFFFFFFF;
-        d1+=c0;
-        uint64_t c1=(uint64_t)(d1>>44); h1=(uint64_t)d1 & 0xFFFFFFFFFFF;
-        d2+=c1;
-        uint64_t c2=(uint64_t)(d2>>42); h2=(uint64_t)d2 & 0x3FFFFFFFFFF;
-        h0+=c2*5;
-        uint64_t c3=h0>>44; h0&=0xFFFFFFFFFFF;
-        h1+=c3;
+/* Read tag + length, return pointer to value. NULL on error. */
+static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
+                                    uint8_t *tag, size_t *len) {
+    if (p >= end) return NULL;
+    *tag = *p++;
+    if (p >= end) return NULL;
+    if (*p < 0x80) {
+        *len = *p++;
+    } else {
+        int nb = *p++ & 0x7F;
+        /* nb==0: reject BER indefinite length */
+        if (nb == 0 || nb > 3 || p + nb > end) return NULL;
+        *len = 0;
+        for (int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
     }
-    /* Final reduction */
-    uint64_t c4=h1>>44; h1&=0xFFFFFFFFFFF;
-    h2+=c4;
-    uint64_t c5=h2>>42; h2&=0x3FFFFFFFFFF;
-    h0+=c5*5;
-    uint64_t c6=h0>>44; h0&=0xFFFFFFFFFFF;
-    h1+=c6;
-
-    /* Compute h - p; keep if h >= p */
-    uint64_t g0=h0+5; uint64_t cg=g0>>44; g0&=0xFFFFFFFFFFF;
-    uint64_t g1=h1+cg; cg=g1>>44; g1&=0xFFFFFFFFFFF;
-    uint64_t g2=h2+cg-(1ULL<<42);
-    uint64_t mask2=-(g2>>63); /* if g2 < 0 (underflow), mask=0xFFF..., keep h; else keep g */
-    h0=(h0&mask2)|(g0&~mask2);
-    h1=(h1&mask2)|(g1&~mask2);
-    h2=(h2&mask2)|(g2&~mask2);
-
-    /* Convert back to 128-bit number */
-    uint64_t lo=h0|(h1<<44);
-    uint64_t hi=(h1>>20)|(h2<<24);
-
-    /* Add s (second half of key) */
-    uint64_t s_lo=0,s_hi=0;
-    for(int i=0;i<8;i++) s_lo|=(uint64_t)key[16+i]<<(8*i);
-    for(int i=0;i<8;i++) s_hi|=(uint64_t)key[24+i]<<(8*i);
-    uint128_t sum=(uint128_t)lo+s_lo;
-    lo=(uint64_t)sum;
-    sum=(uint128_t)hi+s_hi+(uint64_t)(sum>>64);
-    hi=(uint64_t)sum;
-
-    /* Output little-endian */
-    for(int i=0;i<8;i++){tag[i]=(lo>>(8*i))&0xFF; tag[8+i]=(hi>>(8*i))&0xFF;}
+    if (p + *len > end) return NULL;
+    return p;
 }
 
-/* ================================================================
- * ChaCha20-Poly1305 AEAD (RFC 8439)
- * ================================================================ */
-static void chacha20_poly1305_encrypt(const uint8_t key[32], const uint8_t nonce[12],
-                                        const uint8_t *aad, size_t al,
-                                        const uint8_t *pt, size_t pl,
-                                        uint8_t *ct, uint8_t tag[16]) {
-    /* 1. Generate Poly1305 one-time key */
-    uint8_t poly_key[64];
-    chacha20_block(key,nonce,0,poly_key);
-    /* 2. Encrypt plaintext with counter starting at 1 */
-    chacha20_encrypt(key,nonce,1,pt,pl,ct);
-    /* 3. Construct MAC input and compute tag */
-    size_t apad=(16-(al%16))%16;
-    size_t cpad=(16-(pl%16))%16;
-    size_t mac_len=al+apad+pl+cpad+16;
-    uint8_t *mac_data=malloc(mac_len);
-    if(!mac_data) die("malloc failed");
-    size_t mp=0;
-    memcpy(mac_data+mp,aad,al); mp+=al;
-    memset(mac_data+mp,0,apad); mp+=apad;
-    memcpy(mac_data+mp,ct,pl); mp+=pl;
-    memset(mac_data+mp,0,cpad); mp+=cpad;
-    for(int i=0;i<8;i++) mac_data[mp++]=(al>>(8*i))&0xFF;
-    for(int i=0;i<8;i++) mac_data[mp++]=(pl>>(8*i))&0xFF;
-    poly1305_mac(poly_key,mac_data,mac_len,tag);
-    free(mac_data);
-    secure_zero(poly_key,sizeof(poly_key));
+/* Skip one TLV element, return pointer past it */
+static const uint8_t *der_skip(const uint8_t *p, const uint8_t *end) {
+    uint8_t tag; size_t len;
+    const uint8_t *val = der_read_tl(p, end, &tag, &len);
+    if (!val) return NULL;
+    return val + len;
 }
 
-static int chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[12],
-                                       const uint8_t *aad, size_t al,
-                                       const uint8_t *ct, size_t cl,
-                                       uint8_t *pt, const uint8_t exp_tag[16]) {
-    /* 1. Generate Poly1305 one-time key */
-    uint8_t poly_key[64];
-    chacha20_block(key,nonce,0,poly_key);
-    /* 2. Verify tag first */
-    size_t apad=(16-(al%16))%16;
-    size_t cpad=(16-(cl%16))%16;
-    size_t mac_len=al+apad+cl+cpad+16;
-    uint8_t *mac_data=malloc(mac_len);
-    if(!mac_data) die("malloc failed");
-    size_t mp=0;
-    memcpy(mac_data+mp,aad,al); mp+=al;
-    memset(mac_data+mp,0,apad); mp+=apad;
-    memcpy(mac_data+mp,ct,cl); mp+=cl;
-    memset(mac_data+mp,0,cpad); mp+=cpad;
-    for(int i=0;i<8;i++) mac_data[mp++]=(al>>(8*i))&0xFF;
-    for(int i=0;i<8;i++) mac_data[mp++]=(cl>>(8*i))&0xFF;
-    uint8_t tag[16];
-    poly1305_mac(poly_key,mac_data,mac_len,tag);
-    free(mac_data);
-    secure_zero(poly_key,sizeof(poly_key));
-    if(!ct_memeq(tag,exp_tag,16)) return -1;
-    /* 3. Decrypt */
-    chacha20_encrypt(key,nonce,1,ct,cl,pt);
-    return 0;
+static int oid_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+    return alen == blen && memcmp(a, b, alen) == 0;
 }
 
-/* OID constants */
-static const uint8_t OID_ECDSA_SHA384[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
-static const uint8_t OID_ECDSA_SHA256[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
-static const uint8_t OID_SHA256_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
-static const uint8_t OID_SHA384_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0C};
-static const uint8_t OID_SHA512_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0D};
-static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
-static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
-static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
-static const uint8_t OID_BASIC_CONSTRAINTS[] = {0x55,0x1D,0x13};
-static const uint8_t OID_KEY_USAGE[]    = {0x55,0x1D,0x0F};
-static const uint8_t OID_EXT_KEY_USAGE[]= {0x55,0x1D,0x25};
-static const uint8_t OID_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
+/* Parse UTCTime (tag 0x17: YYMMDDHHMMSSZ) or GeneralizedTime (tag 0x18: YYYYMMDDHHMMSSZ) */
+static time_t der_parse_time(const uint8_t *p, const uint8_t *end) {
+    uint8_t tag; size_t len;
+    const uint8_t *val=der_read_tl(p,end,&tag,&len);
+    if(!val) return 0;
+    const char *s=(const char *)val;
+    struct tm t={0};
+    if(tag==0x17){ /* UTCTime */
+        int yy=(s[0]-'0')*10+(s[1]-'0');
+        t.tm_year=yy>=50?yy:yy+100;
+        s+=2;
+    } else if(tag==0x18){ /* GeneralizedTime */
+        t.tm_year=(s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0')-1900;
+        s+=4;
+    } else return 0;
+    t.tm_mon=(s[0]-'0')*10+(s[1]-'0')-1;
+    t.tm_mday=(s[2]-'0')*10+(s[3]-'0');
+    t.tm_hour=(s[4]-'0')*10+(s[5]-'0');
+    t.tm_min=(s[6]-'0')*10+(s[7]-'0');
+    t.tm_sec=(s[8]-'0')*10+(s[9]-'0');
+    return timegm(&t);
+}
+
 
 /* HelloRetryRequest sentinel random (RFC 8446 §4.1.3) */
 static const uint8_t HRR_RANDOM[32] = {
@@ -2251,6 +2238,19 @@ static int rsa_encrypt(const uint8_t *pt, size_t pt_len,
     return 0;
 }
 
+/* OID constants */
+static const uint8_t OID_ECDSA_SHA384[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
+static const uint8_t OID_ECDSA_SHA256[] = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
+static const uint8_t OID_SHA256_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B};
+static const uint8_t OID_SHA384_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0C};
+static const uint8_t OID_SHA512_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0D};
+static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
+static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
+static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
+static const uint8_t OID_BASIC_CONSTRAINTS[] = {0x55,0x1D,0x13};
+static const uint8_t OID_KEY_USAGE[]    = {0x55,0x1D,0x0F};
+static const uint8_t OID_EXT_KEY_USAGE[]= {0x55,0x1D,0x25};
+static const uint8_t OID_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
 /* ================================================================
  * X.509 Certificate Parser
  * ================================================================ */
