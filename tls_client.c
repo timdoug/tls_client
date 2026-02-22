@@ -1412,6 +1412,9 @@ static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
 static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
 static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
 static const uint8_t OID_BASIC_CONSTRAINTS[] = {0x55,0x1D,0x13};
+static const uint8_t OID_KEY_USAGE[]    = {0x55,0x1D,0x0F};
+static const uint8_t OID_EXT_KEY_USAGE[]= {0x55,0x1D,0x25};
+static const uint8_t OID_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
 
 /* HelloRetryRequest sentinel random (RFC 8446 §4.1.3) */
 static const uint8_t HRR_RANDOM[32] = {
@@ -1832,6 +1835,10 @@ typedef struct {
     time_t not_before, not_after;                  /* validity period */
     int is_ca;                                      /* basicConstraints CA flag */
     int path_len;                                   /* pathLenConstraint (-1 = unlimited) */
+    uint16_t key_usage;                             /* keyUsage bit flags (0 = not present) */
+    int has_key_usage;                              /* whether keyUsage extension was present */
+    int has_eku;                                    /* whether EKU extension was present */
+    int eku_server_auth;                            /* EKU contains serverAuth */
 } x509_cert;
 
 static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
@@ -1977,6 +1984,37 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
                                         for(size_t j=0;j<len;j++) pl=(pl<<8)|pv[j];
                                         cert->path_len=pl;
                                     }
+                                }
+                            }
+                        }
+                    } else if(oid_eq(eoid,len,OID_KEY_USAGE,sizeof(OID_KEY_USAGE))){
+                        const uint8_t *rest=eoid+len;
+                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+                        if(oct&&tag==0x04){
+                            /* BIT STRING inside OCTET STRING */
+                            const uint8_t *bs=der_read_tl(oct,oct+len,&tag,&len);
+                            if(bs&&tag==0x03&&len>=2){
+                                cert->has_key_usage=1;
+                                cert->key_usage=bs[1]; /* first content byte after unused-bits byte */
+                                if(len>=3) cert->key_usage|=((uint16_t)bs[2]<<8);
+                            }
+                        }
+                    } else if(oid_eq(eoid,len,OID_EXT_KEY_USAGE,sizeof(OID_EXT_KEY_USAGE))){
+                        const uint8_t *rest=eoid+len;
+                        if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+                        const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+                        if(oct&&tag==0x04){
+                            const uint8_t *sq=der_read_tl(oct,oct+len,&tag,&len);
+                            if(sq&&tag==0x30){
+                                const uint8_t *sq_end=sq+len;
+                                cert->has_eku=1;
+                                while(sq<sq_end){
+                                    const uint8_t *eo=der_read_tl(sq,sq_end,&tag,&len);
+                                    if(!eo||tag!=0x06) break;
+                                    if(oid_eq(eo,len,OID_SERVER_AUTH,sizeof(OID_SERVER_AUTH)))
+                                        cert->eku_server_auth=1;
+                                    sq=eo+len;
                                 }
                             }
                         }
@@ -2235,6 +2273,17 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     }
     printf("    Hostname verified: %s\n",hostname);
 
+    /* Leaf: if EKU present, must include serverAuth */
+    if(certs[0].has_eku && !certs[0].eku_server_auth){
+        fprintf(stderr,"Leaf certificate EKU does not include serverAuth\n");
+        return -1;
+    }
+    /* Leaf: if keyUsage present, must include digitalSignature (bit 0) */
+    if(certs[0].has_key_usage && !(certs[0].key_usage & 0x80)){
+        fprintf(stderr,"Leaf certificate keyUsage missing digitalSignature\n");
+        return -1;
+    }
+
     /* Check validity period for all chain certs */
     time_t now=time(NULL);
     for(int i=0;i<chain_count;i++){
@@ -2307,6 +2356,11 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         /* Enforce pathLenConstraint: i certs below this CA (0=leaf only) */
         if(certs[i+1].path_len>=0 && i>certs[i+1].path_len){
             fprintf(stderr,"Certificate %d exceeds pathLenConstraint %d\n",i+1,certs[i+1].path_len);
+            return -1;
+        }
+        /* Intermediate: if keyUsage present, must include keyCertSign (bit 5) */
+        if(certs[i+1].has_key_usage && !(certs[i+1].key_usage & 0x04)){
+            fprintf(stderr,"CA certificate %d keyUsage missing keyCertSign\n",i+1);
             return -1;
         }
     }
