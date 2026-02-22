@@ -2450,8 +2450,8 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     buf[p++]=32;
     random_bytes(buf+p,32); p+=32;
 
-    /* Cipher suites: TLS 1.3 + TLS 1.2 ECDHE-GCM + RSA-GCM + ECDHE-CBC + SCSV */
-    buf[p++]=0x00; buf[p++]=0x12; /* 18 bytes = 9 suites */
+    /* Cipher suites: TLS 1.3 + TLS 1.2 GCM + CBC + SCSV */
+    buf[p++]=0x00; buf[p++]=0x1E; /* 30 bytes = 15 suites */
     buf[p++]=0x13; buf[p++]=0x01; /* TLS_AES_128_GCM_SHA256 */
     buf[p++]=0x13; buf[p++]=0x02; /* TLS_AES_256_GCM_SHA384 */
     buf[p++]=0xC0; buf[p++]=0x2B; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
@@ -2459,7 +2459,13 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     buf[p++]=0xC0; buf[p++]=0x2C; /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
     buf[p++]=0xC0; buf[p++]=0x30; /* TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 */
     buf[p++]=0x00; buf[p++]=0x9D; /* TLS_RSA_WITH_AES_256_GCM_SHA384 */
+    buf[p++]=0x00; buf[p++]=0x9C; /* TLS_RSA_WITH_AES_128_GCM_SHA256 */
     buf[p++]=0xC0; buf[p++]=0x14; /* TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA */
+    buf[p++]=0xC0; buf[p++]=0x13; /* TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA */
+    buf[p++]=0xC0; buf[p++]=0x0A; /* TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA */
+    buf[p++]=0xC0; buf[p++]=0x09; /* TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA */
+    buf[p++]=0x00; buf[p++]=0x35; /* TLS_RSA_WITH_AES_256_CBC_SHA */
+    buf[p++]=0x00; buf[p++]=0x2F; /* TLS_RSA_WITH_AES_128_CBC_SHA */
     buf[p++]=0x00; buf[p++]=0xFF; /* TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746) */
 
     /* Compression */
@@ -2581,7 +2587,7 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     if(b+2>sh_end) die("ServerHello truncated at cipher suite");
     uint16_t cs=GET16(b); b+=2;
     *cipher_suite_out=cs;
-    if(cs!=0x1301 && cs!=0x1302 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 && cs!=0x009D && cs!=0xC014) {
+    if(cs!=0x1301 && cs!=0x1302 && cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 && cs!=0x009D && cs!=0x009C && cs!=0xC014 && cs!=0xC013 && cs!=0x0035 && cs!=0x002F && cs!=0xC00A && cs!=0xC009) {
         fprintf(stderr,"cipher suite 0x%04x\n",cs);
         die("unexpected cipher suite");
     }
@@ -2925,8 +2931,8 @@ static void tls12_handshake(tls_conn *conn) {
     sha256_ctx transcript = conn->transcript;
     sha384_ctx transcript384 = conn->transcript384;
 
-    int is_rsa_kex = (cipher_suite == 0x009D);
-    int is_cbc = (cipher_suite == 0xC014);
+    int is_rsa_kex = (cipher_suite==0x009D || cipher_suite==0x009C || cipher_suite==0x0035 || cipher_suite==0x002F);
+    int is_cbc = (cipher_suite==0xC014 || cipher_suite==0xC013 || cipher_suite==0x0035 || cipher_suite==0x002F || cipher_suite==0xC00A || cipher_suite==0xC009);
     printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s)\n",cipher_suite,
            is_rsa_kex?" RSA-kex":"", is_cbc?" CBC":"");
 
@@ -3143,7 +3149,7 @@ static void tls12_handshake(tls_conn *conn) {
     secure_zero(p384_priv,sizeof(p384_priv));
 
     /* TLS 1.2 key derivation */
-    int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D || cipher_suite==0xC014);
+    int is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D || cipher_suite==0xC014 || cipher_suite==0x0035 || cipher_suite==0xC00A);
     /* PRF hash: 0x009D (GCM-SHA384) uses SHA-384, 0xC014 (CBC-SHA) uses SHA-256 (default TLS 1.2 PRF) */
     int prf_is_sha384 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D);
     const hash_alg *alg = prf_is_sha384 ? &SHA384_ALG : &SHA256_ALG;
