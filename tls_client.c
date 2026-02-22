@@ -2669,6 +2669,12 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     return version;
 }
 
+/* Construct TLS 1.3 per-record nonce: IV XOR sequence number */
+static void make_nonce(uint8_t nonce[AES_GCM_NONCE_LEN], const uint8_t iv[AES_GCM_NONCE_LEN], uint64_t seq) {
+    memcpy(nonce,iv,AES_GCM_NONCE_LEN);
+    for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
+}
+
 /* Decrypt a TLS 1.3 encrypted record.
    Returns inner content type, plaintext in pt, pt_len set. */
 static int decrypt_record(const uint8_t *rec, size_t rec_len,
@@ -2680,9 +2686,8 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
     size_t ct_len=rec_len-AES_GCM_TAG_LEN;
     const uint8_t *tag=rec+ct_len;
 
-    /* Construct nonce */
-    uint8_t nonce[AES_GCM_NONCE_LEN]; memcpy(nonce,iv,AES_GCM_NONCE_LEN);
-    for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
+    uint8_t nonce[AES_GCM_NONCE_LEN];
+    make_nonce(nonce,iv,seq);
 
     /* AAD = record header */
     uint8_t aad[5]={TLS_RT_APPDATA,(TLS_VERSION_12>>8),(TLS_VERSION_12&0xFF),0,0};
@@ -2718,8 +2723,8 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
     memcpy(inner,data,len);
     inner[len]=inner_type;
 
-    uint8_t nonce[AES_GCM_NONCE_LEN]; memcpy(nonce,iv,AES_GCM_NONCE_LEN);
-    for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
+    uint8_t nonce[AES_GCM_NONCE_LEN];
+    make_nonce(nonce,iv,seq);
 
     size_t ct_len=len+1;
     uint8_t *ct=malloc(ct_len+AES_GCM_TAG_LEN);
