@@ -2530,6 +2530,7 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
                            const uint8_t *key, const uint8_t iv[12],
                            uint64_t seq, uint8_t *pt, size_t *pt_len,
                            int is_aes256) {
+    if(seq==UINT64_MAX) die("sequence number overflow");
     if(rec_len<17) die("encrypted record too short");
     size_t ct_len=rec_len-16;
     const uint8_t *tag=rec+ct_len;
@@ -2563,6 +2564,7 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
                               const uint8_t *data, size_t len,
                               const uint8_t *key, const uint8_t iv[12],
                               uint64_t seq, int is_aes256) {
+    if(seq==UINT64_MAX) die("sequence number overflow");
     /* Build inner plaintext: data + content_type */
     if(len>16384) die("TLS 1.3 record too large to encrypt");
     uint8_t *inner = malloc(len+1);
@@ -2602,6 +2604,7 @@ static void tls12_encrypt_and_send(int fd, uint8_t content_type,
                                      const uint8_t *write_key,
                                      const uint8_t write_iv[4],
                                      uint64_t seq, size_t key_len) {
+    if(seq==UINT64_MAX) die("sequence number overflow");
     uint8_t nonce[12];
     memcpy(nonce, write_iv, 4);
     for(int i=7;i>=0;i--) nonce[4+(7-i)]=(seq>>(8*i))&0xFF;
@@ -2639,6 +2642,7 @@ static int tls12_decrypt_record(const uint8_t *rec, size_t rec_len,
                                   const uint8_t read_iv[4],
                                   uint64_t seq,
                                   uint8_t *pt, size_t *pt_len, size_t key_len) {
+    if(seq==UINT64_MAX) return -1;
     if(rec_len < 8+16) return -1;
 
     uint8_t nonce[12];
