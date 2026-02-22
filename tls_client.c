@@ -2758,6 +2758,135 @@ static int tls12_decrypt_record(const uint8_t *rec, size_t rec_len,
 }
 
 /* ================================================================
+ * TLS 1.2 CBC Record Encrypt / Decrypt (MAC-then-encrypt, RFC 5246 §6.2.3.2)
+ * Record body: [IV(16)][ciphertext]
+ * Plaintext before encryption: [data][MAC][padding][padding_length]
+ * ================================================================ */
+static void tls12_encrypt_and_send_cbc(int fd, uint8_t content_type,
+                                         const uint8_t *data, size_t len,
+                                         const uint8_t *write_key, size_t key_len,
+                                         const uint8_t *mac_key, size_t mac_key_len,
+                                         const hash_alg *mac_alg, uint64_t seq) {
+    /* Compute MAC: HMAC(mac_key, seq||type||version||length||data) */
+    size_t mac_len=mac_alg->digest_len;
+    uint8_t mac_input_hdr[13];
+    for(int i=7;i>=0;i--) mac_input_hdr[7-i]=(seq>>(8*i))&0xFF;
+    mac_input_hdr[8]=content_type;
+    mac_input_hdr[9]=(TLS_VERSION_12>>8); mac_input_hdr[10]=(TLS_VERSION_12&0xFF);
+    PUT16(mac_input_hdr+11,(uint16_t)len);
+
+    /* HMAC with incremental update for header+data */
+    uint8_t mac_out[48];
+    {
+        uint8_t k[128]={0};
+        if(mac_key_len>mac_alg->block_size) mac_alg->hash(mac_key,mac_key_len,k);
+        else memcpy(k,mac_key,mac_key_len);
+        uint8_t ip[128],op[128];
+        for(size_t i=0;i<mac_alg->block_size;i++){ip[i]=k[i]^0x36;op[i]=k[i]^0x5c;}
+        union{sha1_ctx s1;sha256_ctx s2;sha384_ctx s3;}u;
+        mac_alg->init(&u); mac_alg->update(&u,ip,mac_alg->block_size);
+        mac_alg->update(&u,mac_input_hdr,13);
+        mac_alg->update(&u,data,len);
+        uint8_t inner[48]; mac_alg->final_fn(&u,inner);
+        mac_alg->init(&u); mac_alg->update(&u,op,mac_alg->block_size);
+        mac_alg->update(&u,inner,mac_alg->digest_len);
+        mac_alg->final_fn(&u,mac_out);
+    }
+
+    /* Build plaintext: data || MAC || padding || padding_length */
+    size_t unpadded=len+mac_len;
+    uint8_t pad_len=(uint8_t)(16-1-(unpadded%16)); /* 0..15 */
+    size_t padded_len=unpadded+pad_len+1;
+    uint8_t *plain=malloc(padded_len);
+    if(!plain) die("malloc failed");
+    memcpy(plain,data,len);
+    memcpy(plain+len,mac_out,mac_len);
+    memset(plain+unpadded,pad_len,pad_len+1);
+
+    /* Generate random IV and encrypt */
+    uint8_t iv[16];
+    random_bytes(iv,16);
+    uint8_t *ct_body=malloc(padded_len);
+    if(!ct_body) die("malloc failed");
+    aes_cbc_encrypt(write_key,key_len,iv,plain,padded_len,ct_body);
+    free(plain);
+
+    /* Send record: [IV][ciphertext] */
+    size_t rec_len=16+padded_len;
+    uint8_t *rec=malloc(rec_len);
+    if(!rec) die("malloc failed");
+    memcpy(rec,iv,16);
+    memcpy(rec+16,ct_body,padded_len);
+    tls_send_record(fd,content_type,rec,rec_len);
+    free(ct_body);
+    free(rec);
+}
+
+static int tls12_decrypt_record_cbc(const uint8_t *rec, size_t rec_len,
+                                      uint8_t content_type,
+                                      const uint8_t *read_key, size_t key_len,
+                                      const uint8_t *mac_key, size_t mac_key_len,
+                                      const hash_alg *mac_alg, uint64_t seq,
+                                      uint8_t *pt, size_t *pt_len) {
+    if(rec_len<32) return -1; /* need at least IV(16) + one block(16) */
+    const uint8_t *iv=rec;
+    const uint8_t *ct=rec+16;
+    size_t ct_len=rec_len-16;
+    if(ct_len%16!=0) return -1;
+
+    /* Decrypt */
+    uint8_t *plain=malloc(ct_len);
+    if(!plain) die("malloc failed");
+    aes_cbc_decrypt(read_key,key_len,iv,ct,ct_len,plain);
+
+    /* Check and strip padding (constant-time) */
+    uint8_t pad_val=plain[ct_len-1];
+    if(pad_val>=ct_len){free(plain);return -1;}
+    uint8_t pad_ok=0;
+    for(size_t i=0;i<(size_t)(pad_val+1);i++)
+        pad_ok|=plain[ct_len-1-i]^pad_val;
+
+    size_t mac_len=mac_alg->digest_len;
+    size_t content_len=ct_len-pad_val-1-mac_len;
+    /* Avoid underflow: if padding+mac exceeds plaintext, reject */
+    if(pad_val+1+mac_len>ct_len){free(plain);return -1;}
+
+    /* Extract MAC and compute expected MAC */
+    const uint8_t *received_mac=plain+content_len;
+
+    uint8_t mac_input_hdr[13];
+    for(int i=7;i>=0;i--) mac_input_hdr[7-i]=(seq>>(8*i))&0xFF;
+    mac_input_hdr[8]=content_type;
+    mac_input_hdr[9]=(TLS_VERSION_12>>8); mac_input_hdr[10]=(TLS_VERSION_12&0xFF);
+    PUT16(mac_input_hdr+11,(uint16_t)content_len);
+
+    uint8_t expected_mac[48];
+    {
+        uint8_t k[128]={0};
+        if(mac_key_len>mac_alg->block_size) mac_alg->hash(mac_key,mac_key_len,k);
+        else memcpy(k,mac_key,mac_key_len);
+        uint8_t ip[128],op[128];
+        for(size_t i=0;i<mac_alg->block_size;i++){ip[i]=k[i]^0x36;op[i]=k[i]^0x5c;}
+        union{sha1_ctx s1;sha256_ctx s2;sha384_ctx s3;}u;
+        mac_alg->init(&u); mac_alg->update(&u,ip,mac_alg->block_size);
+        mac_alg->update(&u,mac_input_hdr,13);
+        mac_alg->update(&u,plain,content_len);
+        uint8_t inner[48]; mac_alg->final_fn(&u,inner);
+        mac_alg->init(&u); mac_alg->update(&u,op,mac_alg->block_size);
+        mac_alg->update(&u,inner,mac_alg->digest_len);
+        mac_alg->final_fn(&u,expected_mac);
+    }
+
+    int mac_ok=ct_memeq(expected_mac,received_mac,mac_len);
+    if(!mac_ok||pad_ok!=0){free(plain);return -1;}
+
+    memcpy(pt,plain,content_len);
+    *pt_len=content_len;
+    free(plain);
+    return 0;
+}
+
+/* ================================================================
  * Connection context for TLS handshake dispatch
  * ================================================================ */
 typedef struct {
