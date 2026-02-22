@@ -1831,10 +1831,12 @@ typedef struct {
     const uint8_t *san; size_t san_len;            /* SAN extension value */
     time_t not_before, not_after;                  /* validity period */
     int is_ca;                                      /* basicConstraints CA flag */
+    int path_len;                                   /* pathLenConstraint (-1 = unlimited) */
 } x509_cert;
 
 static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     memset(cert,0,sizeof(*cert));
+    cert->path_len=-1; /* unlimited by default */
     const uint8_t *p=der, *end=der+der_len;
     uint8_t tag; size_t len;
 
@@ -1957,12 +1959,24 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
                             const uint8_t *oct_end=oct+len;
                             /* SEQUENCE inside */
                             const uint8_t *sq=der_read_tl(oct,oct_end,&tag,&len);
-                            if(sq&&tag==0x30&&len>0){
+                            if(sq&&tag==0x30){
+                                const uint8_t *sq_end=sq+len;
                                 /* first element: BOOLEAN CA flag if present */
-                                if(*sq==0x01){
-                                    const uint8_t *bv=der_read_tl(sq,sq+len,&tag,&len);
+                                const uint8_t *bp=sq;
+                                if(bp<sq_end&&*bp==0x01){
+                                    const uint8_t *bv=der_read_tl(bp,sq_end,&tag,&len);
                                     if(bv&&tag==0x01&&len==1&&bv[0]!=0)
                                         cert->is_ca=1;
+                                    bp=bv+len;
+                                }
+                                /* optional pathLenConstraint INTEGER */
+                                if(bp<sq_end&&*bp==0x02){
+                                    const uint8_t *pv=der_read_tl(bp,sq_end,&tag,&len);
+                                    if(pv&&tag==0x02&&len>=1){
+                                        int pl=0;
+                                        for(size_t j=0;j<len;j++) pl=(pl<<8)|pv[j];
+                                        cert->path_len=pl;
+                                    }
                                 }
                             }
                         }
@@ -2288,6 +2302,11 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         /* Intermediate cert must have CA:TRUE basicConstraints */
         if(!certs[i+1].is_ca){
             fprintf(stderr,"Certificate %d used as CA but lacks basicConstraints CA:TRUE\n",i+1);
+            return -1;
+        }
+        /* Enforce pathLenConstraint: i certs below this CA (0=leaf only) */
+        if(certs[i+1].path_len>=0 && i>certs[i+1].path_len){
+            fprintf(stderr,"Certificate %d exceeds pathLenConstraint %d\n",i+1,certs[i+1].path_len);
             return -1;
         }
     }
