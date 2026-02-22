@@ -1839,6 +1839,7 @@ typedef struct {
     int has_key_usage;                              /* whether keyUsage extension was present */
     int has_eku;                                    /* whether EKU extension was present */
     int eku_server_auth;                            /* EKU contains serverAuth */
+    int version;                                    /* 0=v1, 1=v2, 2=v3 */
 } x509_cert;
 
 static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
@@ -1861,11 +1862,14 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     const uint8_t *tbs_end=tbs_val+len;
     const uint8_t *tp=tbs_val;
 
-    /* [0] version */
+    /* [0] version — default v1 (0) if absent */
     if(tp<tbs_end&&*tp==0xA0){
-        tp=der_read_tl(tp,tbs_end,&tag,&len);
-        if(!tp) return -1;
-        tp+=len;
+        const uint8_t *v_outer=der_read_tl(tp,tbs_end,&tag,&len);
+        if(!v_outer) return -1;
+        const uint8_t *v_end=v_outer+len;
+        const uint8_t *vp=der_read_tl(v_outer,v_end,&tag,&len);
+        if(vp&&tag==0x02&&len==1) cert->version=vp[0];
+        tp=v_end;
     }
     /* serialNumber */
     tp=der_skip(tp,tbs_end); if(!tp) return -1;
@@ -2348,6 +2352,11 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             return -1;
         }
         printf("    Certificate %d signature verified\n",i);
+        /* Intermediate must be v3 (only v3 has extensions) */
+        if(certs[i+1].version!=2){
+            fprintf(stderr,"Certificate %d is not v3, cannot be CA\n",i+1);
+            return -1;
+        }
         /* Intermediate cert must have CA:TRUE basicConstraints */
         if(!certs[i+1].is_ca){
             fprintf(stderr,"Certificate %d used as CA but lacks basicConstraints CA:TRUE\n",i+1);
