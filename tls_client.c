@@ -245,7 +245,8 @@ static void sha1_hash(const uint8_t *data, size_t len, uint8_t out[20]) {
 }
 
 /* ================================================================
- * SHA-384 (SHA-512 truncated, different IVs, 64-bit words, 80 rounds)
+ * SHA-512 / SHA-384 (64-bit words, 128-byte blocks, 80 rounds)
+ * SHA-384 is SHA-512 with different IVs and output truncated to 48 bytes.
  * ================================================================ */
 static const uint64_t sha512_k[80] = {
     0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,
@@ -270,7 +271,8 @@ static const uint64_t sha512_k[80] = {
     0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL
 };
 
-typedef struct { uint64_t h[8]; uint8_t buf[128]; size_t buf_len; uint64_t total; } sha384_ctx;
+typedef struct { uint64_t h[8]; uint8_t buf[128]; size_t buf_len; uint64_t total; } sha512_ctx;
+typedef sha512_ctx sha384_ctx; /* SHA-384 uses same internal state */
 
 #define ROTR64(x,n) (((x)>>(n))|((x)<<(64-(n))))
 #define S512_CH(x,y,z) (((x)&(y))^((~(x))&(z)))
@@ -280,7 +282,7 @@ typedef struct { uint64_t h[8]; uint8_t buf[128]; size_t buf_len; uint64_t total
 #define S512_SIG0(x) (ROTR64(x,1)^ROTR64(x,8)^((x)>>7))
 #define S512_SIG1(x) (ROTR64(x,19)^ROTR64(x,61)^((x)>>6))
 
-static void sha384_transform(sha384_ctx *ctx, const uint8_t blk[128]) {
+static void sha512_transform(sha512_ctx *ctx, const uint8_t blk[128]) {
     uint64_t w[80],a,b,c,d,e,f,g,h;
     for(int i=0;i<16;i++){w[i]=0;for(int j=0;j<8;j++)w[i]=(w[i]<<8)|blk[8*i+j];}
     for(int i=16;i<80;i++) w[i]=S512_SIG1(w[i-2])+w[i-7]+S512_SIG0(w[i-15])+w[i-16];
@@ -295,22 +297,49 @@ static void sha384_transform(sha384_ctx *ctx, const uint8_t blk[128]) {
     ctx->h[4]+=e;ctx->h[5]+=f;ctx->h[6]+=g;ctx->h[7]+=h;
 }
 
+static void sha512_update(sha512_ctx *ctx, const uint8_t *data, size_t len) {
+    ctx->total+=len;
+    while(len>0){
+        size_t space=128-ctx->buf_len, chunk=len<space?len:space;
+        memcpy(ctx->buf+ctx->buf_len,data,chunk);
+        ctx->buf_len+=chunk; data+=chunk; len-=chunk;
+        if(ctx->buf_len==128){sha512_transform(ctx,ctx->buf);ctx->buf_len=0;}
+    }
+}
+#define sha384_update sha512_update
+
+/* SHA-512: full 64-byte output */
+static void sha512_init(sha512_ctx *ctx) {
+    ctx->h[0]=0x6a09e667f3bcc908ULL;ctx->h[1]=0xbb67ae8584caa73bULL;
+    ctx->h[2]=0x3c6ef372fe94f82bULL;ctx->h[3]=0xa54ff53a5f1d36f1ULL;
+    ctx->h[4]=0x510e527fade682d1ULL;ctx->h[5]=0x9b05688c2b3e6c1fULL;
+    ctx->h[6]=0x1f83d9abfb41bd6bULL;ctx->h[7]=0x5be0cd19137e2179ULL;
+    ctx->buf_len=0; ctx->total=0;
+}
+
+static void sha512_final(sha512_ctx *ctx, uint8_t out[64]) {
+    uint64_t bits=ctx->total*8;
+    uint8_t pad=0x80;
+    sha512_update(ctx,&pad,1);
+    pad=0;
+    while(ctx->buf_len!=112) sha512_update(ctx,&pad,1);
+    uint8_t lb[16]={0};
+    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
+    sha512_update(ctx,lb,16);
+    for(int i=0;i<8;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
+}
+
+static void sha512_hash(const uint8_t *data, size_t len, uint8_t out[64]) {
+    sha512_ctx c; sha512_init(&c); sha512_update(&c,data,len); sha512_final(&c,out);
+}
+
+/* SHA-384: different IVs, output truncated to 48 bytes */
 static void sha384_init(sha384_ctx *ctx) {
     ctx->h[0]=0xcbbb9d5dc1059ed8ULL;ctx->h[1]=0x629a292a367cd507ULL;
     ctx->h[2]=0x9159015a3070dd17ULL;ctx->h[3]=0x152fecd8f70e5939ULL;
     ctx->h[4]=0x67332667ffc00b31ULL;ctx->h[5]=0x8eb44a8768581511ULL;
     ctx->h[6]=0xdb0c2e0d64f98fa7ULL;ctx->h[7]=0x47b5481dbefa4fa4ULL;
     ctx->buf_len=0; ctx->total=0;
-}
-
-static void sha384_update(sha384_ctx *ctx, const uint8_t *data, size_t len) {
-    ctx->total+=len;
-    while(len>0){
-        size_t space=128-ctx->buf_len, chunk=len<space?len:space;
-        memcpy(ctx->buf+ctx->buf_len,data,chunk);
-        ctx->buf_len+=chunk; data+=chunk; len-=chunk;
-        if(ctx->buf_len==128){sha384_transform(ctx,ctx->buf);ctx->buf_len=0;}
-    }
 }
 
 static void sha384_final(sha384_ctx *ctx, uint8_t out[48]) {
@@ -439,35 +468,6 @@ static void tls12_prf_u(const hash_alg *alg, const uint8_t *secret, size_t secre
         memcpy(out+done,hmac_out,use); done+=use;
         hmac(alg,secret,secret_len,a,alg->digest_len,a);
     }
-}
-
-/* SHA-512: same algorithm as SHA-384, different IVs, full 64-byte output */
-typedef sha384_ctx sha512_ctx;
-#define sha512_transform sha384_transform
-#define sha512_update sha384_update
-
-static void sha512_init(sha512_ctx *ctx) {
-    ctx->h[0]=0x6a09e667f3bcc908ULL;ctx->h[1]=0xbb67ae8584caa73bULL;
-    ctx->h[2]=0x3c6ef372fe94f82bULL;ctx->h[3]=0xa54ff53a5f1d36f1ULL;
-    ctx->h[4]=0x510e527fade682d1ULL;ctx->h[5]=0x9b05688c2b3e6c1fULL;
-    ctx->h[6]=0x1f83d9abfb41bd6bULL;ctx->h[7]=0x5be0cd19137e2179ULL;
-    ctx->buf_len=0; ctx->total=0;
-}
-
-static void sha512_final(sha512_ctx *ctx, uint8_t out[64]) {
-    uint64_t bits=ctx->total*8;
-    uint8_t pad=0x80;
-    sha512_update(ctx,&pad,1);
-    pad=0;
-    while(ctx->buf_len!=112) sha512_update(ctx,&pad,1);
-    uint8_t lb[16]={0};
-    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
-    sha512_update(ctx,lb,16);
-    for(int i=0;i<8;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
-}
-
-static void sha512_hash(const uint8_t *data, size_t len, uint8_t out[64]) {
-    sha512_ctx c; sha512_init(&c); sha512_update(&c,data,len); sha512_final(&c,out);
 }
 
 /* ================================================================
