@@ -1291,6 +1291,14 @@ static const fp384 P384_GY={{
     0x7A431D7C90EA0E5F, 0x0A60B1CE1D7E819D, 0xE9DA3113B5F0B8C0,
     0xF8F41DBD289A147C, 0x5D9E98BF9292DC29, 0x3617DE4A96262C6F}};
 
+static const uint8_t P384_ORDER[48] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xC7,0x63,0x4D,0x81,0xF4,0x37,0x2D,0xDF,
+    0x58,0x1A,0x0D,0xB2,0x48,0xB0,0xA7,0x7A,
+    0xEC,0xEC,0x19,0x6A,0xCC,0xC5,0x29,0x73
+};
+
 /* Check if affine point (x,y) is on curve: y^2 = x^3 - 3x + b */
 static int ec384_on_curve(const fp384 *x, const fp384 *y) {
     fp384 y2, x3, t, three={{3,0,0,0,0,0}};
@@ -1398,19 +1406,12 @@ static void ec384_scalar_mul(ec384 *r, const ec384 *p, const uint8_t scalar[48])
 }
 
 /* ECDHE P-384: generate keypair, compute shared secret */
-static void ecdhe_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_POINT_LEN]) {
-    static const uint8_t P384_N[48] = {
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xC7,0x63,0x4D,0x81,0xF4,0x37,0x2D,0xDF,
-        0x58,0x1A,0x0D,0xB2,0x48,0xB0,0xA7,0x7A,
-        0xEC,0xEC,0x19,0x6A,0xCC,0xC5,0x29,0x73
-    };
+static void ecdhe_p384_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_POINT_LEN]) {
     random_bytes(priv,P384_SCALAR_LEN);
     /* Reduce scalar mod n to ensure it's in valid range [1, n-1] */
     bignum k, n384;
     bn_from_bytes(&k,priv,P384_SCALAR_LEN);
-    bn_from_bytes(&n384,P384_N,48);
+    bn_from_bytes(&n384,P384_ORDER,48);
     bn_mod(&k,&k,&n384);
     if(bn_is_zero(&k)) { k.v[0]=1; k.len=1; } /* avoid zero scalar */
     bn_to_bytes(&k,priv,P384_SCALAR_LEN);
@@ -1432,7 +1433,7 @@ static void ecdhe_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_POINT_L
     }
 }
 
-static void ecdhe_shared_secret(const uint8_t priv[P384_SCALAR_LEN],
+static void ecdhe_p384_shared_secret(const uint8_t priv[P384_SCALAR_LEN],
     const uint8_t peer_pub[P384_POINT_LEN], uint8_t secret[P384_SCALAR_LEN]) {
     fp384 px,py;
     fp384_from_bytes(&px,peer_pub+1);
@@ -1467,6 +1468,12 @@ static const fp256 P256_GY = {{
     0xCBB6406837BF51F5, 0x2BCE33576B315ECE,
     0x8EE7EB4A7C0F9E16, 0x4FE342E2FE1A7F9B
 }};
+
+static const uint8_t P256_ORDER[32] = {
+    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xBC,0xE6,0xFA,0xAD,0xA7,0x17,0x9E,0x84,
+    0xF3,0xB9,0xCA,0xC2,0xFC,0x63,0x25,0x51
+};
 
 static int fp256_cmp(const fp256 *a, const fp256 *b) {
     for(int i=3;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
@@ -1706,16 +1713,11 @@ static void ec256_scalar_mul_vartime(ec256 *r, const ec256 *p, const uint8_t sca
 
 /* ECDHE P-256 keygen */
 static void ecdhe_p256_keygen(uint8_t priv[P256_SCALAR_LEN], uint8_t pub[P256_POINT_LEN]) {
-    static const uint8_t P256_N[32] = {
-        0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xBC,0xE6,0xFA,0xAD,0xA7,0x17,0x9E,0x84,
-        0xF3,0xB9,0xCA,0xC2,0xFC,0x63,0x25,0x51
-    };
     random_bytes(priv,P256_SCALAR_LEN);
     /* Reduce scalar mod n to ensure it's in valid range [1, n-1] */
     bignum k256, n256;
     bn_from_bytes(&k256,priv,P256_SCALAR_LEN);
-    bn_from_bytes(&n256,P256_N,32);
+    bn_from_bytes(&n256,P256_ORDER,32);
     bn_mod(&k256,&k256,&n256);
     if(bn_is_zero(&k256)) { k256.v[0]=1; k256.len=1; }
     bn_to_bytes(&k256,priv,P256_SCALAR_LEN);
@@ -2031,24 +2033,8 @@ static const uint8_t HRR_RANDOM[32] = {
     0xC2,0xA2,0x11,0x16,0x7A,0xBB,0x8C,0x5E,0x07,0x9E,0x09,0xE2,0xC8,0xA8,0x33,0x9C
 };
 
-/* P-256 curve order n (big-endian) */
-static const uint8_t P256_ORDER[32] = {
-    0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,
-    0xFF,0xFF,0xFF,0xFF,0xBC,0xE6,0xFA,0xAD,0xA7,0x17,0x9E,0x84,
-    0xF3,0xB9,0xCA,0xC2,0xFC,0x63,0x25,0x51
-};
-
-/* P-384 curve order n (big-endian) */
-static const uint8_t P384_ORDER[48] = {
-    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-    0xC7,0x63,0x4D,0x81,0xF4,0x37,0x2D,0xDF,
-    0x58,0x1A,0x0D,0xB2,0x48,0xB0,0xA7,0x7A,
-    0xEC,0xEC,0x19,0x6A,0xCC,0xC5,0x29,0x73
-};
-
 /* ================================================================
- * ECDSA-P384 Signature Verification
+ * ECDSA Signature Verification
  * ================================================================ */
 /* Variable-time scalar mul (safe for public verification inputs) */
 static void ec384_scalar_mul_vartime(ec384 *r, const ec384 *p, const uint8_t scalar[48]) {
@@ -2139,7 +2125,7 @@ static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
     return bn_cmp(&rx_bn,&r_bn)==0;
 }
 
-/* ECDSA-P256 signature verification using bignum EC ops */
+/* ECDSA-P256 signature verification */
 static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
                               const uint8_t *sig_der, size_t sig_len,
                               const uint8_t *pubkey, size_t pk_len) {
@@ -3963,7 +3949,7 @@ static void tls12_handshake(tls_conn *conn) {
         tls_send_record(fd,TLS_RT_HANDSHAKE,cke,sizeof(cke));
         sha256_update(&transcript, cke, sizeof(cke));
         sha384_update(&transcript384, cke, sizeof(cke));
-        ecdhe_shared_secret(p384_priv, ske_pubkey, ss12);
+        ecdhe_p384_shared_secret(p384_priv, ske_pubkey, ss12);
         ss12_len=P384_SCALAR_LEN;
         printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (P-384)\n");
     }
@@ -4156,7 +4142,7 @@ static void tls13_handshake(tls_conn *conn) {
         shared_len=P256_SCALAR_LEN;
         secure_zero(ss,sizeof(ss));
     } else {
-        ecdhe_shared_secret(p384_priv,server_pub,shared);
+        ecdhe_p384_shared_secret(p384_priv,server_pub,shared);
         shared_len=P384_SCALAR_LEN;
     }
     secure_zero(p256_priv,sizeof(p256_priv));
@@ -4611,7 +4597,7 @@ static void do_https_get(const char *host, int port, const char *path) {
 
     /* Generate ECDHE keypairs for all groups */
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
-    ecdhe_keygen(p384_priv,p384_pub);
+    ecdhe_p384_keygen(p384_priv,p384_pub);
     uint8_t p256_priv[P256_SCALAR_LEN], p256_pub[P256_POINT_LEN];
     ecdhe_p256_keygen(p256_priv,p256_pub);
     uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub_key[X25519_KEY_LEN];
