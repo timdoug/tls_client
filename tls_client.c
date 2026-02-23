@@ -1035,21 +1035,96 @@ static void bn_cmov(bignum *dst, const bignum *src, int bit) {
         dst->v[i] = (dst->v[i] & ~mask) | (src->v[i] & mask);
     dst->len = (dst->len & (int)~mask) | (src->len & (int)mask);
 }
+typedef struct {
+    uint64_t m_inv;   /* -m^(-1) mod 2^64 */
+    int n;            /* number of limbs in m */
+    bignum rr;        /* R^2 mod m, for converting to Montgomery form */
+} bn_mont_ctx;
+
+static void bn_mont_init(bn_mont_ctx *ctx, const bignum *m) {
+    ctx->n = m->len;
+    /* Compute m_inv = -m[0]^(-1) mod 2^64 via Newton's method */
+    uint64_t m0 = m->v[0];
+    uint64_t x = 1;
+    for (int i = 0; i < 6; i++)
+        x = x * (2 - m0 * x); /* doubles correct bits each iteration: 1->2->4->8->16->32->64 */
+    ctx->m_inv = -x; /* negate: m_inv * m[0] ≡ -1 (mod 2^64) */
+    /* Compute R mod m where R = 2^(n*64) */
+    bignum R; bn_zero(&R);
+    R.v[ctx->n] = 1; R.len = ctx->n + 1;
+    bignum R_mod_m; bn_mod(&R_mod_m, &R, m);
+    /* Compute R^2 mod m */
+    bn_modmul(&ctx->rr, &R_mod_m, &R_mod_m, m);
+}
+
+static void bn_mont_mul(bignum *r, const bignum *a, const bignum *b,
+                        const bignum *m, const bn_mont_ctx *ctx) {
+    int n = ctx->n;
+    uint64_t t[BN_MAX_LIMBS + 2];
+    memset(t, 0, (n + 2) * sizeof(uint64_t));
+    for (int i = 0; i < n; i++) {
+        uint64_t ai = (i < a->len) ? a->v[i] : 0;
+        /* t += a[i] * b */
+        uint64_t carry = 0;
+        for (int j = 0; j < n; j++) {
+            uint128_t p = (uint128_t)ai * ((j < b->len) ? b->v[j] : 0) + t[j] + carry;
+            t[j] = (uint64_t)p; carry = (uint64_t)(p >> 64);
+        }
+        uint128_t s = (uint128_t)t[n] + carry;
+        t[n] = (uint64_t)s; t[n + 1] = (uint64_t)(s >> 64);
+        /* u = t[0] * m_inv mod 2^64 */
+        uint64_t u = t[0] * ctx->m_inv;
+        /* t += u * m, cancels bottom limb */
+        carry = 0;
+        for (int j = 0; j < n; j++) {
+            uint128_t p = (uint128_t)u * m->v[j] + t[j] + carry;
+            t[j] = (uint64_t)p; carry = (uint64_t)(p >> 64);
+        }
+        s = (uint128_t)t[n] + carry;
+        t[n] = (uint64_t)s; t[n + 1] += (uint64_t)(s >> 64);
+        /* shift right 64 bits (drop zeroed bottom limb) */
+        for (int j = 0; j <= n; j++) t[j] = t[j + 1];
+        t[n + 1] = 0;
+    }
+    bignum result; bn_zero(&result);
+    for (int i = 0; i <= n; i++) result.v[i] = t[i];
+    result.len = n + 1;
+    while (result.len > 0 && result.v[result.len - 1] == 0) result.len--;
+    if (bn_cmp(&result, m) >= 0) bn_sub(r, &result, m);
+    else *r = result;
+}
 
 static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bignum *m) {
-    bignum result; bn_zero(&result); result.v[0]=1; result.len=1;
-    bignum b; bn_mod(&b,base,m);
-    /* Use fixed bit count based on modulus size to avoid leaking exponent length */
-    int total_bits = m->len * 64;
-    for(int i=0;i<total_bits;i++){
-        /* Always multiply, conditionally keep result */
-        bignum tmp;
-        bn_modmul(&tmp,&result,&b,m);
-        int bit = (i < exp->len*64) ? (int)((exp->v[i/64]>>(i%64))&1) : 0;
-        bn_cmov(&result,&tmp,bit);
-        if(i<total_bits-1) bn_modmul(&b,&b,&b,m);
+    bn_mont_ctx ctx; bn_mont_init(&ctx, m);
+    bignum base_red; bn_mod(&base_red, base, m);
+    /* Convert base to Montgomery form: bm = base * R mod m */
+    bignum bm; bn_mont_mul(&bm, &base_red, &ctx.rr, m, &ctx);
+    /* Build table: table[0] = R mod m (Montgomery 1), table[i] = base^i * R mod m */
+    bignum table[16];
+    bignum one; bn_zero(&one); one.v[0] = 1; one.len = 1;
+    bn_mont_mul(&table[0], &one, &ctx.rr, m, &ctx);
+    table[1] = bm;
+    for (int i = 2; i < 16; i++)
+        bn_mont_mul(&table[i], &table[i - 1], &bm, m, &ctx);
+    bignum result = table[0];
+    /* Process exponent MSB to LSB in 4-bit windows, fixed count to avoid leaking length */
+    int total_windows = m->len * 16; /* m->len * 64 / 4 */
+    for (int w = total_windows - 1; w >= 0; w--) {
+        /* Square 4 times */
+        for (int s = 0; s < 4; s++)
+            bn_mont_mul(&result, &result, &result, m, &ctx);
+        /* Extract 4-bit window (always aligned to nibble, never spans limbs) */
+        int bit_pos = w * 4;
+        int window = (bit_pos / 64 < exp->len)
+            ? (int)((exp->v[bit_pos / 64] >> (bit_pos % 64)) & 0xF) : 0;
+        /* Constant-time table lookup */
+        bignum sel = table[0];
+        for (int i = 1; i < 16; i++)
+            bn_cmov(&sel, &table[i], i == window);
+        bn_mont_mul(&result, &result, &sel, m, &ctx);
     }
-    *r=result;
+    /* Convert out of Montgomery form */
+    bn_mont_mul(r, &result, &one, m, &ctx);
 }
 
 /* ================================================================
