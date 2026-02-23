@@ -2291,6 +2291,8 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
     if(em[em_len-1]!=0xBC) return 0;
 
     size_t salt_len=hash_len;
+    /* RFC 8017 §9.1.2: emLen must be at least hLen + sLen + 2 */
+    if(em_len < hash_len + salt_len + 2) return 0;
     size_t db_len=em_len-hash_len-1;
     const uint8_t *masked_db=em;
     const uint8_t *h=em+db_len;
@@ -4666,6 +4668,14 @@ static void do_https_get(const char *host, int port, const char *path) {
             saved_session_id,p256_pub,p384_pub,x25519_pub_key,host,server_pub,&server_pub_len,
             server_random,&version,&transcript,&transcript384,&sh_leftover);
         sh_msg_len=4+GET24(rec+1); /* rec now holds real ServerHello */
+    }
+
+    /* RFC 8446 §4.1.3: detect MITM downgrade from TLS 1.3 to 1.2/1.1 */
+    if(version!=TLS_VERSION_13) {
+        static const uint8_t DG12[8]={0x44,0x4F,0x57,0x4E,0x47,0x52,0x44,0x01};
+        static const uint8_t DG11[8]={0x44,0x4F,0x57,0x4E,0x47,0x52,0x44,0x00};
+        if(memcmp(server_random+24,DG12,8)==0 || memcmp(server_random+24,DG11,8)==0)
+            die("TLS downgrade attack detected (server_random sentinel)");
     }
 
     /* Verify TLS 1.3 ServerHello has key_share */
