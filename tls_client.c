@@ -2651,6 +2651,7 @@ static int verify_hostname(const x509_cert *cert, const char *hostname) {
 
     if(cert->san&&cert->san_len>0){
         const uint8_t *p=cert->san, *end=cert->san+cert->san_len;
+        int has_dns_name=0;
         p=der_read_tl(p,end,&tag,&len);
         if(p&&tag==0x30){
             end=p+len;
@@ -2658,13 +2659,15 @@ static int verify_hostname(const x509_cert *cert, const char *hostname) {
                 const uint8_t *val=der_read_tl(p,end,&tag,&len);
                 if(!val) break;
                 if(tag==0x82){ /* dNSName */
+                    has_dns_name=1;
                     if(dns_name_eq(val,len,hostname,hn_len)) return 1;
                     if(wildcard_match(val,len,hostname)) return 1;
                 }
                 p=val+len;
             }
         }
-        return 0;
+        /* RFC 6125 §6.4.4: if SAN has dNSName entries, don't fall back to CN */
+        if(has_dns_name) return 0;
     }
     /* CN fallback */
     static const uint8_t OID_CN[]={0x55,0x04,0x03};
@@ -3007,12 +3010,15 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
 
 /* Build ClientHello for TLS 1.2/1.3.
    only_group: 0 = emit all key shares (initial CH),
-               specific group = emit only that group's key share (after HRR) */
+               specific group = emit only that group's key share (after HRR)
+   session_id: NULL = generate new (initial CH), non-NULL = reuse (HRR per RFC 8446 §4.1.2) */
 static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT_LEN],
                                   const uint8_t p384_pub[P384_POINT_LEN],
                                   const uint8_t x25519_pub[X25519_KEY_LEN],
                                   const char *host,
-                                  uint8_t client_random[32], uint16_t only_group) {
+                                  uint8_t client_random[32],
+                                  const uint8_t *session_id,
+                                  uint16_t only_group) {
     size_t p=0;
     /* Handshake header - fill length later */
     buf[p++]=0x01; /* ClientHello */
@@ -3021,14 +3027,22 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     /* Legacy version TLS 1.2 */
     buf[p++]=(TLS_VERSION_12>>8); buf[p++]=(TLS_VERSION_12&0xFF);
 
-    /* Random */
-    random_bytes(buf+p,32);
-    memcpy(client_random,buf+p,32);
+    /* Random: generate fresh for initial CH, reuse for HRR (RFC 8446 §4.1.2) */
+    if(only_group) {
+        memcpy(buf+p,client_random,32);
+    } else {
+        random_bytes(buf+p,32);
+        memcpy(client_random,buf+p,32);
+    }
     p+=32;
 
-    /* Session ID (32 bytes for compat) */
+    /* Session ID: generate fresh for initial CH, reuse for HRR (RFC 8446 §4.1.2) */
     buf[p++]=32;
-    random_bytes(buf+p,32); p+=32;
+    if(session_id)
+        memcpy(buf+p,session_id,32);
+    else
+        random_bytes(buf+p,32);
+    p+=32;
 
     /* Cipher suites: TLS 1.3 + TLS 1.2 GCM + ChaCha20-Poly1305 + CBC + SCSV */
     buf[p++]=0x00; buf[p++]=0x24; /* 36 bytes = 18 suites */
@@ -4489,6 +4503,7 @@ static void tls13_handshake(tls_conn *conn) {
 static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
                                uint16_t *cipher_suite,
                                const uint8_t client_random[32],
+                               const uint8_t *session_id,
                                const uint8_t p256_pub[P256_POINT_LEN],
                                const uint8_t p384_pub[P384_POINT_LEN],
                                const uint8_t x25519_pub[X25519_KEY_LEN],
@@ -4549,12 +4564,11 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
         sha256_update(transcript,rec,sh_msg_len);
     }
 
-    /* Build and send new ClientHello with only the requested group */
+    /* Build and send new ClientHello with only the requested group.
+       Reuse client_random and session_id per RFC 8446 §4.1.2. */
     uint8_t ch[CH_BUF_SIZE];
-    /* build_client_hello takes a mutable client_random for initial generation,
-       but on HRR we reuse the existing one, so cast away const */
     size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,host,
-        (uint8_t*)(uintptr_t)client_random,hrr_group);
+        (uint8_t*)(uintptr_t)client_random,session_id,hrr_group);
     if(hrr_aes256)
         sha384_update(transcript384,ch,ch_len);
     else
@@ -4605,7 +4619,9 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* Build & send ClientHello */
     uint8_t ch[CH_BUF_SIZE];
     uint8_t client_random[32];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,host,client_random,0);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,host,client_random,NULL,0);
+    /* Save session_id from ClientHello for HRR reuse (RFC 8446 §4.1.2) */
+    const uint8_t *saved_session_id=ch+6+32+1; /* past: type(1)+len(3)+version(2)+random(32)+sid_len(1) */
     /* For the record layer, first ClientHello uses version 0x0301.
        Send header+body in one write to avoid middlebox issues with TCP fragmentation. */
     {
@@ -4647,7 +4663,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* HelloRetryRequest handling */
     if(memcmp(server_random,HRR_RANDOM,32)==0) {
         handle_hello_retry(fd,rec,&rec_len,&cipher_suite,client_random,
-            p256_pub,p384_pub,x25519_pub_key,host,server_pub,&server_pub_len,
+            saved_session_id,p256_pub,p384_pub,x25519_pub_key,host,server_pub,&server_pub_len,
             server_random,&version,&transcript,&transcript384,&sh_leftover);
         sh_msg_len=4+GET24(rec+1); /* rec now holds real ServerHello */
     }
