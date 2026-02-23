@@ -944,6 +944,11 @@ typedef struct { uint64_t v[BN_MAX_LIMBS]; int len; } bignum;
 
 static void bn_zero(bignum *r) { memset(r,0,sizeof(*r)); }
 
+static int bn_is_zero(const bignum *a) {
+    for(int i=0;i<a->len;i++) if(a->v[i]) return 0;
+    return 1;
+}
+
 static void bn_from_bytes(bignum *r, const uint8_t *buf, size_t blen) {
     bn_zero(r);
     r->len=(int)((blen+7)/8);
@@ -1394,7 +1399,21 @@ static void ec384_scalar_mul(ec384 *r, const ec384 *p, const uint8_t scalar[48])
 
 /* ECDHE P-384: generate keypair, compute shared secret */
 static void ecdhe_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_POINT_LEN]) {
+    static const uint8_t P384_N[48] = {
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xC7,0x63,0x4D,0x81,0xF4,0x37,0x2D,0xDF,
+        0x58,0x1A,0x0D,0xB2,0x48,0xB0,0xA7,0x7A,
+        0xEC,0xEC,0x19,0x6A,0xCC,0xC5,0x29,0x73
+    };
     random_bytes(priv,P384_SCALAR_LEN);
+    /* Reduce scalar mod n to ensure it's in valid range [1, n-1] */
+    bignum k, n384;
+    bn_from_bytes(&k,priv,P384_SCALAR_LEN);
+    bn_from_bytes(&n384,P384_N,48);
+    bn_mod(&k,&k,&n384);
+    if(bn_is_zero(&k)) { k.v[0]=1; k.len=1; } /* avoid zero scalar */
+    bn_to_bytes(&k,priv,P384_SCALAR_LEN);
     priv[0] |= 0x80; /* Set top bit so Montgomery ladder never hits infinity */
     ec384 G; G.x=P384_GX; G.y=P384_GY; G.z=FP384_ONE;
     ec384 Q; ec384_scalar_mul(&Q,&G,priv);
@@ -1687,7 +1706,19 @@ static void ec256_scalar_mul_vartime(ec256 *r, const ec256 *p, const uint8_t sca
 
 /* ECDHE P-256 keygen */
 static void ecdhe_p256_keygen(uint8_t priv[P256_SCALAR_LEN], uint8_t pub[P256_POINT_LEN]) {
+    static const uint8_t P256_N[32] = {
+        0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xBC,0xE6,0xFA,0xAD,0xA7,0x17,0x9E,0x84,
+        0xF3,0xB9,0xCA,0xC2,0xFC,0x63,0x25,0x51
+    };
     random_bytes(priv,P256_SCALAR_LEN);
+    /* Reduce scalar mod n to ensure it's in valid range [1, n-1] */
+    bignum k256, n256;
+    bn_from_bytes(&k256,priv,P256_SCALAR_LEN);
+    bn_from_bytes(&n256,P256_N,32);
+    bn_mod(&k256,&k256,&n256);
+    if(bn_is_zero(&k256)) { k256.v[0]=1; k256.len=1; }
+    bn_to_bytes(&k256,priv,P256_SCALAR_LEN);
     priv[0]|=0x80;
     ec256 G; G.x=P256_GX; G.y=P256_GY; G.z=FP256_ONE;
     ec256 Q; ec256_scalar_mul(&Q,&G,priv);
@@ -2062,6 +2093,11 @@ static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
     bn_from_bytes(&r_bn,rp,rlen);
     bn_from_bytes(&s_bn,sp,slen);
     bn_from_bytes(&n,P384_ORDER,48);
+
+    /* SEC 1 §4.1.4: verify r,s ∈ [1, n-1] */
+    if(bn_is_zero(&r_bn) || bn_cmp(&r_bn,&n)>=0) return 0;
+    if(bn_is_zero(&s_bn) || bn_cmp(&s_bn,&n)>=0) return 0;
+
     bn_from_bytes(&hash_bn,hash,hash_len>48?48:hash_len);
 
     /* w = s^(-1) mod n via Fermat: s^(n-2) mod n */
@@ -2132,6 +2168,11 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
     bn_from_bytes(&r_bn,rp,rlen);
     bn_from_bytes(&s_bn,sp,slen);
     bn_from_bytes(&n,P256_ORDER,32);
+
+    /* SEC 1 §4.1.4: verify r,s ∈ [1, n-1] */
+    if(bn_is_zero(&r_bn) || bn_cmp(&r_bn,&n)>=0) return 0;
+    if(bn_is_zero(&s_bn) || bn_cmp(&s_bn,&n)>=0) return 0;
+
     bn_from_bytes(&hash_bn,hash,hash_len>32?32:hash_len);
 
     /* w = s^(-1) mod n via Fermat: s^(n-2) mod n */
@@ -2202,6 +2243,10 @@ static int rsa_pkcs1_verify(const uint8_t *hash, size_t hash_len,
     bn_from_bytes(&s_bn,sig,sig_len);
     bn_from_bytes(&n_bn,modulus,mod_len);
     bn_from_bytes(&e_bn,exponent,exp_len);
+
+    /* Validate RSA public exponent: e >= 3, e is odd */
+    if(bn_is_zero(&e_bn) || e_bn.len<1 || e_bn.v[0]<3 || !(e_bn.v[0]&1)) return 0;
+
     bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
 
     uint8_t m[512];
@@ -2232,6 +2277,10 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
     bn_from_bytes(&s_bn,sig,sig_len);
     bn_from_bytes(&n_bn,modulus,mod_len);
     bn_from_bytes(&e_bn,exponent,exp_len);
+
+    /* Validate RSA public exponent: e >= 3, e is odd */
+    if(bn_is_zero(&e_bn) || e_bn.len<1 || e_bn.v[0]<3 || !(e_bn.v[0]&1)) return 0;
+
     bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
 
     uint8_t em[512];
@@ -2714,8 +2763,6 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
         uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
         if(pubkey_len==P384_POINT_LEN)
             return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
-        if(pubkey_len==P256_POINT_LEN)
-            return ecdsa_p256_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
         return 0;
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA256,sizeof(OID_ECDSA_SHA256))){
@@ -2723,8 +2770,6 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
         uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
         if(pubkey_len==P256_POINT_LEN)
             return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
-        if(pubkey_len==P384_POINT_LEN)
-            return ecdsa_p384_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
         return 0;
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA256_RSA,sizeof(OID_SHA256_RSA))){
@@ -2951,8 +2996,10 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
     uint8_t hdr[5];
     if(read_exact(fd,hdr,5)<0) return -1;
     uint16_t len=GET16(hdr+3);
-    /* RFC 8446 §5.1: max 2^14+256 for TLS 1.3, RFC 5246 §6.2.3: 2^14+2048 for TLS 1.2 */
-    if(len>16384+2048) die("record too large");
+    /* RFC 5246 §6.2.3: max 2^14+2048 for TLS 1.2; RFC 8446 §5.2: max 2^14+256 for TLS 1.3.
+       Enforce the stricter TLS 1.3 limit (16640). TLS 1.2 CBC records with compression
+       could exceed this but compression is not supported, so 16640 is safe for both. */
+    if(len>16384+256) die("record too large");
     if(read_exact(fd,out,len)<0) return -1;
     *out_len=len;
     return hdr[0];
@@ -3414,17 +3461,22 @@ static int tls12_decrypt_record_cbc(const uint8_t *rec, size_t rec_len,
     if(!plain) die("malloc failed");
     aes_cbc_decrypt(read_key,key_len,iv,ct,ct_len,plain);
 
-    /* Check and strip padding (constant-time) */
+    /* Check and strip padding — constant-time: no early returns before MAC check */
     uint8_t pad_val=plain[ct_len-1];
-    if(pad_val>=ct_len){free(plain);return -1;}
     uint8_t pad_ok=0;
-    for(size_t i=0;i<(size_t)(pad_val+1);i++)
+    /* Flag invalid padding length, and clamp loop to prevent buffer underflow */
+    pad_ok |= (uint8_t)((pad_val >= ct_len) ? 0xFF : 0);
+    size_t check_len = (pad_val < ct_len) ? (size_t)(pad_val+1) : 0;
+    for(size_t i=0;i<check_len;i++)
         pad_ok|=plain[ct_len-1-i]^pad_val;
 
     size_t mac_len=mac_alg->digest_len;
-    size_t content_len=ct_len-pad_val-1-mac_len;
-    /* Avoid underflow: if padding+mac exceeds plaintext, reject */
-    if(pad_val+1+mac_len>ct_len){free(plain);return -1;}
+    /* If pad_val+1+mac_len > ct_len, set error flag but don't return early.
+       Use a safe content_len that won't underflow regardless. */
+    uint8_t len_ok = (pad_val+1+mac_len <= ct_len) ? 1 : 0;
+    pad_ok |= (uint8_t)(len_ok ? 0 : 0xFF);
+    /* Use safe content_len: if invalid, use 0 to avoid underflow; MAC will fail anyway */
+    size_t content_len = len_ok ? ct_len-pad_val-1-mac_len : 0;
 
     /* Extract MAC and compute expected MAC */
     const uint8_t *received_mac=plain+content_len;
@@ -3563,16 +3615,12 @@ static int tls12_recv_decrypt(const uint8_t *rec, size_t rec_len, uint8_t ct,
 static int verify_sig_algo(uint16_t algo, const uint8_t *data, size_t data_len,
                            const uint8_t *sig, size_t sig_len,
                            const x509_cert *leaf) {
-    if(algo==0x0403) { /* ecdsa_secp256r1_sha256 */
+    if(algo==0x0403) { /* ecdsa_secp256r1_sha256: curve=P-256, hash=SHA-256 */
         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(data,data_len,h);
         if(leaf->key_type==1 && leaf->pubkey_len==P256_POINT_LEN)
             return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
-        if(leaf->key_type==1 && leaf->pubkey_len==P384_POINT_LEN)
-            return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
-    } else if(algo==0x0503) { /* ecdsa_secp384r1_sha384 */
+    } else if(algo==0x0503) { /* ecdsa_secp384r1_sha384: curve=P-384, hash=SHA-384 */
         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(data,data_len,h);
-        if(leaf->key_type==1 && leaf->pubkey_len==P256_POINT_LEN)
-            return ecdsa_p256_verify(h,SHA384_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
         if(leaf->key_type==1 && leaf->pubkey_len==P384_POINT_LEN)
             return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
     } else if(algo==0x0401) { /* rsa_pkcs1_sha256 */
