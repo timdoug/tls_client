@@ -3214,9 +3214,13 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
                              const uint8_t *pubkey, size_t pubkey_len,
                              const uint8_t *rsa_n, size_t rsa_n_len,
                              const uint8_t *rsa_e, size_t rsa_e_len) {
+    /* For ECDSA the OID specifies only the hash; the curve is determined
+       by the signing key, not the algorithm identifier. */
     if(oid_eq(sig_alg,sig_alg_len,OID_ECDSA_SHA384,sizeof(OID_ECDSA_SHA384))){
         if(key_type!=1) return 0;
         uint8_t h[48]; sha384_hash(tbs,tbs_len,h);
+        if(pubkey_len==P256_POINT_LEN)
+            return ecdsa_p256_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
         if(pubkey_len==P384_POINT_LEN)
             return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
         return 0;
@@ -3226,6 +3230,8 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
         uint8_t h[32]; sha256_hash(tbs,tbs_len,h);
         if(pubkey_len==P256_POINT_LEN)
             return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
+        if(pubkey_len==P384_POINT_LEN)
+            return ecdsa_p384_verify(h,SHA256_DIGEST_LEN,sig,sig_len,pubkey,pubkey_len);
         return 0;
     }
     if(oid_eq(sig_alg,sig_alg_len,OID_SHA256_RSA,sizeof(OID_SHA256_RSA))){
@@ -4093,14 +4099,28 @@ static int tls12_recv_decrypt(const uint8_t *rec, size_t rec_len, uint8_t ct,
 static int verify_sig_algo(uint16_t algo, const uint8_t *data, size_t data_len,
                            const uint8_t *sig, size_t sig_len,
                            const x509_cert *leaf) {
-    if(algo==TLS_SIG_ECDSA_SECP256R1_SHA256) {
-        uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(data,data_len,h);
-        if(leaf->key_type==1 && leaf->pubkey_len==P256_POINT_LEN)
-            return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
-    } else if(algo==TLS_SIG_ECDSA_SECP384R1_SHA384) {
-        uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(data,data_len,h);
-        if(leaf->key_type==1 && leaf->pubkey_len==P384_POINT_LEN)
-            return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
+    /* In TLS 1.2 the SignatureAndHashAlgorithm field encodes hash and
+       signature type independently (RFC 5246 §7.4.1.4.1).  For ECDSA the
+       curve is determined by the certificate key, not the algorithm ID.
+       We therefore pick the hash from the algorithm and the ECDSA curve
+       from the leaf key. */
+    if(algo==TLS_SIG_ECDSA_SECP256R1_SHA256 ||
+       algo==TLS_SIG_ECDSA_SECP384R1_SHA384) {
+        if(leaf->key_type!=1) return 0;
+        int use_384_hash = (algo==TLS_SIG_ECDSA_SECP384R1_SHA384);
+        if(use_384_hash) {
+            uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(data,data_len,h);
+            if(leaf->pubkey_len==P256_POINT_LEN)
+                return ecdsa_p256_verify(h,SHA384_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
+            if(leaf->pubkey_len==P384_POINT_LEN)
+                return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
+        } else {
+            uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(data,data_len,h);
+            if(leaf->pubkey_len==P256_POINT_LEN)
+                return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
+            if(leaf->pubkey_len==P384_POINT_LEN)
+                return ecdsa_p384_verify(h,SHA256_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
+        }
     } else if(algo==TLS_SIG_RSA_PKCS1_SHA256) {
         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(data,data_len,h);
         if(leaf->key_type==2)
