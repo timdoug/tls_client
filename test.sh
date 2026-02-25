@@ -186,6 +186,7 @@ pass_tests=(
     "https://proton.me/|Proton"
     "https://example.com/|example.com"
     "https://httpbin.org/get|httpbin"
+    "https://incomplete-chain.badssl.com/|incomplete chain (AIA fetched)"
 )
 
 # ================================================================
@@ -200,7 +201,6 @@ xfail_tests=(
     "https://untrusted-root.badssl.com/|untrusted root CA|Certificate verification failed"
     "https://no-common-name.badssl.com/|no common name|Certificate verification failed"
     "https://no-subject.badssl.com/|no subject|Certificate verification failed"
-    "https://incomplete-chain.badssl.com/|incomplete chain|Certificate verification failed"
     "https://sha384.badssl.com/|SHA-384 cert (expired)|Certificate verification failed"
     "https://sha512.badssl.com/|SHA-512 cert (expired)|Certificate verification failed"
     "https://1000-sans.badssl.com/|1000 SANs (expired)|Certificate verification failed"

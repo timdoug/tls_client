@@ -221,6 +221,9 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define HS_BUF_SIZE   65536
 #define REQ_BUF_SIZE  512
 
+/* Socket read timeouts (seconds) */
+#define AIA_READ_TIMEOUT_S   5
+
 _Noreturn static void die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
 
 static void random_bytes(uint8_t *buf, size_t len) {
@@ -2828,6 +2831,8 @@ static const uint8_t OID_BASIC_CONSTRAINTS[] = {0x55,0x1D,0x13};
 static const uint8_t OID_KEY_USAGE[]    = {0x55,0x1D,0x0F};
 static const uint8_t OID_EXT_KEY_USAGE[]= {0x55,0x1D,0x25};
 static const uint8_t OID_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
+static const uint8_t OID_AIA[]         = {0x2B,0x06,0x01,0x05,0x05,0x07,0x01,0x01};
+static const uint8_t OID_CA_ISSUERS[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x30,0x02};
 /* ================================================================
  * X.509 Certificate Parser
  * ================================================================ */
@@ -2841,6 +2846,7 @@ typedef struct {
     const uint8_t *rsa_n; size_t rsa_n_len;        /* RSA modulus */
     const uint8_t *rsa_e; size_t rsa_e_len;        /* RSA exponent */
     const uint8_t *san; size_t san_len;            /* SAN extension value */
+    const uint8_t *aia_url; size_t aia_url_len;    /* caIssuers HTTP URL */
     time_t not_before, not_after;                  /* validity period */
     int key_type;                                   /* 1=EC, 2=RSA */
     int is_ca;                                      /* basicConstraints CA flag */
@@ -2938,6 +2944,35 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
                         if(oid_eq(eo,len,OID_SERVER_AUTH,sizeof(OID_SERVER_AUTH)))
                             cert->eku_server_auth=1;
                         sq=eo+len;
+                    }
+                }
+            }
+        } else if(oid_eq(eoid,len,OID_AIA,sizeof(OID_AIA))){
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){
+                const uint8_t *sq=der_read_tl(oct,oct+len,&tag,&len);
+                if(sq&&tag==0x30){
+                    const uint8_t *sq_end=sq+len;
+                    while(sq<sq_end){
+                        const uint8_t *ad=der_read_tl(sq,sq_end,&tag,&len);
+                        if(!ad||tag!=0x30) break;
+                        const uint8_t *ad_end=ad+len;
+                        sq=ad_end;
+                        const uint8_t *moid=der_read_tl(ad,ad_end,&tag,&len);
+                        if(!moid||tag!=0x06) continue;
+                        if(!oid_eq(moid,len,OID_CA_ISSUERS,sizeof(OID_CA_ISSUERS)))
+                            continue;
+                        const uint8_t *loc=moid+len;
+                        if(loc<ad_end&&*loc==0x86){
+                            const uint8_t *url=der_read_tl(loc,ad_end,&tag,&len);
+                            if(url&&tag==0x86&&len>7&&
+                               memcmp(url,"http://",7)==0){
+                                cert->aia_url=url;
+                                cert->aia_url_len=len;
+                            }
+                        }
                     }
                 }
             }
@@ -3274,6 +3309,83 @@ static int validate_leaf_cert(const x509_cert *leaf, const char *hostname) {
 }
 
 /* ================================================================
+ * AIA (Authority Information Access) Fetcher
+ * ================================================================ */
+static int http_fetch_der(const uint8_t *url, size_t url_len,
+                           const uint8_t **out, size_t *out_len) {
+    static uint8_t aia_buf[8192];
+    /* Parse URL: skip "http://" prefix, extract host and path */
+    if(url_len<=7) return -1;
+    const uint8_t *hp=url+7;
+    size_t hp_len=url_len-7;
+    /* Find path separator */
+    size_t host_len=hp_len;
+    const uint8_t *path=(const uint8_t *)"/";
+    size_t path_len=1;
+    for(size_t i=0;i<hp_len;i++){
+        if(hp[i]=='/'){
+            host_len=i;
+            path=hp+i;
+            path_len=hp_len-i;
+            break;
+        }
+    }
+    if(host_len==0||host_len>=256) return -1;
+    char host[256];
+    memcpy(host,hp,host_len);
+    host[host_len]='\0';
+
+    /* Connect to HTTP server */
+    struct addrinfo hints={0}, *res;
+    hints.ai_family=AF_UNSPEC;
+    hints.ai_socktype=SOCK_STREAM;
+    if(getaddrinfo(host,"80",&hints,&res)!=0) return -1;
+    int fd=socket(res->ai_family,res->ai_socktype,res->ai_protocol);
+    if(fd<0){ freeaddrinfo(res); return -1; }
+    struct timeval tv={AIA_READ_TIMEOUT_S,0};
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+    if(connect(fd,res->ai_addr,res->ai_addrlen)<0){
+        freeaddrinfo(res); close(fd); return -1;
+    }
+    freeaddrinfo(res);
+
+    /* Send HTTP/1.0 GET request */
+    char req[512];
+    int rlen=snprintf(req,sizeof(req),
+        "GET %.*s HTTP/1.0\r\nHost: %s\r\n\r\n",
+        (int)path_len,path,host);
+    if(rlen<0||rlen>=(int)sizeof(req)){ close(fd); return -1; }
+    if(write_all(fd,(const uint8_t *)req,(size_t)rlen)<0){ close(fd); return -1; }
+
+    /* Read entire response */
+    size_t total=0;
+    while(total<sizeof(aia_buf)){
+        ssize_t n=read(fd,aia_buf+total,sizeof(aia_buf)-total);
+        if(n<=0) break;
+        total+=(size_t)n;
+    }
+    close(fd);
+    if(total==0) return -1;
+
+    /* Skip HTTP headers: find \r\n\r\n */
+    uint8_t *body=NULL;
+    for(size_t i=0;i+3<total;i++){
+        if(aia_buf[i]=='\r'&&aia_buf[i+1]=='\n'&&
+           aia_buf[i+2]=='\r'&&aia_buf[i+3]=='\n'){
+            body=aia_buf+i+4;
+            break;
+        }
+    }
+    if(!body) return -1;
+    size_t body_len=total-(size_t)(body-aia_buf);
+    if(body_len==0) return -1;
+
+    *out=(const uint8_t *)body;
+    *out_len=body_len;
+    return 0;
+}
+
+/* ================================================================
  * Certificate Chain Validation
  * ================================================================ */
 static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
@@ -3291,7 +3403,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     const uint8_t *end=p+list_len;
     if(end>msg_end) end=msg_end;
 
-    #define MAX_CHAIN 4
+    #define MAX_CHAIN 5
     const uint8_t *chain_der[MAX_CHAIN];
     size_t chain_len[MAX_CHAIN];
     int chain_count=0;
@@ -3349,6 +3461,8 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     /* Walk chain from leaf upward: at each cert, try trust store first,
      * then find issuer among remaining chain certs. Handles out-of-order
      * chains and cross-signed certs. */
+    #define MAX_AIA_FETCHES 1
+    int aia_fetches=0;
     for(int i=0;i<chain_count;i++){
         /* Try trust store for this cert */
         for(int j=0;j<trust_store_count;j++){
@@ -3374,6 +3488,36 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                memcmp(certs[i].issuer,certs[j].subject,certs[i].issuer_len)==0){
                 found=j;
                 break;
+            }
+        }
+        if(found<0&&certs[i].aia_url&&chain_count<MAX_CHAIN&&aia_fetches<MAX_AIA_FETCHES){
+            printf("    AIA: fetching issuer for cert %d from %.*s\n",
+                   i,(int)certs[i].aia_url_len,certs[i].aia_url);
+            const uint8_t *fetched=NULL; size_t fetched_len=0;
+            if(http_fetch_der(certs[i].aia_url,certs[i].aia_url_len,
+                              &fetched,&fetched_len)==0){
+                x509_cert fc;
+                if(x509_parse(&fc,fetched,fetched_len)==0){
+                    time_t now2=time(NULL);
+                    if(now2>=fc.not_before&&now2<=fc.not_after&&
+                       !(fc.key_type==2&&fc.rsa_n_len<256)){
+                        chain_der[chain_count]=fetched;
+                        chain_len[chain_count]=fetched_len;
+                        certs[chain_count]=fc;
+                        chain_count++;
+                        aia_fetches++;
+                        printf("    AIA: fetched intermediate certificate\n");
+                        /* Retry issuer search with the new cert */
+                        for(int j=i+1;j<chain_count;j++){
+                            if(certs[i].issuer_len==certs[j].subject_len&&
+                               memcmp(certs[i].issuer,certs[j].subject,
+                                      certs[i].issuer_len)==0){
+                                found=j;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
         if(found<0){
