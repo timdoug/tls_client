@@ -24,7 +24,56 @@
 #include <time.h>
 #include <dirent.h>
 
-typedef unsigned __int128 uint128_t;
+/* Portable 64×64→128 multiply via 32-bit half-products (C11 compliant) */
+static inline void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo) {
+    uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
+    uint64_t b_lo = (uint32_t)b, b_hi = b >> 32;
+    uint64_t p0 = a_lo * b_lo;
+    uint64_t p1 = a_lo * b_hi;
+    uint64_t p2 = a_hi * b_lo;
+    uint64_t p3 = a_hi * b_hi;
+    uint64_t mid = p1 + (p0 >> 32);
+    uint64_t carry = (mid < p1);
+    mid += p2;
+    carry += (mid < p2);
+    *lo = (mid << 32) | (uint32_t)p0;
+    *hi = p3 + (mid >> 32) + (carry << 32);
+}
+
+static inline uint64_t addcarry64(uint64_t a, uint64_t b, uint64_t *sum) {
+    *sum = a + b;
+    return (*sum < a) ? 1 : 0;
+}
+
+/* Multiply-accumulate: (hi:lo) = a*b + addend + carry_in */
+static inline void mac64(uint64_t a, uint64_t b, uint64_t addend, uint64_t carry_in,
+                         uint64_t *hi, uint64_t *lo) {
+    uint64_t ph, pl;
+    mul64(a, b, &ph, &pl);
+    uint64_t s = pl + addend;
+    uint64_t c = (s < pl);
+    *lo = s + carry_in;
+    c += (*lo < s);
+    *hi = ph + c;
+}
+
+/* Add with carry: sum = a + b + carry_in, returns carry out */
+static inline uint64_t adc64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t *sum) {
+    uint64_t s = a + b;
+    uint64_t c = (s < a);
+    *sum = s + carry_in;
+    c += (*sum < s);
+    return c;
+}
+
+/* Subtract with borrow: diff = a - b - borrow_in, returns borrow out */
+static inline uint64_t sbb64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t *diff) {
+    uint64_t d = a - b;
+    uint64_t c = (a < b);
+    *diff = d - borrow_in;
+    c += (d < borrow_in);
+    return c;
+}
 
 #define PUT16(b,v) do{(b)[0]=(uint8_t)((v)>>8);(b)[1]=(uint8_t)(v);}while(0)
 #define GET16(b) ((uint16_t)(((uint16_t)(b)[0]<<8)|(b)[1]))
@@ -799,7 +848,7 @@ static void poly1305_mac(const uint8_t key[32], const uint8_t *msg,
     for(int i=0;i<8;i++) r0|=(uint64_t)key[i]<<(8*i);
     for(int i=0;i<8;i++) r1|=(uint64_t)key[8+i]<<(8*i);
     r0&=0x0FFFFFFC0FFFFFFF; r1&=0x0FFFFFFC0FFFFFFC;
-    /* r as 3 limbs of 44/44/42 bits for schoolbook multiply with __uint128_t */
+    /* r as 3 limbs of 44/44/42 bits for schoolbook multiply */
     uint64_t rr0 = r0 & 0xFFFFFFFFFFF;
     uint64_t rr1 = ((r0>>44)|(r1<<20)) & 0xFFFFFFFFFFF;
     uint64_t rr2 = (r1>>24) & 0x3FFFFFFFFFF;
@@ -827,16 +876,38 @@ static void poly1305_mac(const uint8_t key[32], const uint8_t *msg,
         h0+=b0; h1+=b1; h2+=b2;
 
         /* h = h * r mod p using 44-bit limbs */
-        uint128_t d0=(uint128_t)h0*rr0 + (uint128_t)h1*s2 + (uint128_t)h2*s1;
-        uint128_t d1=(uint128_t)h0*rr1 + (uint128_t)h1*rr0 + (uint128_t)h2*s2;
-        uint128_t d2=(uint128_t)h0*rr2 + (uint128_t)h1*rr1 + (uint128_t)h2*rr0;
+        uint64_t d0_hi, d0_lo, d1_hi, d1_lo, d2_hi, d2_lo;
+        /* d0 = h0*rr0 + h1*s2 + h2*s1 */
+        mul64(h0, rr0, &d0_hi, &d0_lo);
+        { uint64_t ph, pl;
+          mul64(h1, s2, &ph, &pl);
+          d0_hi += ph + addcarry64(d0_lo, pl, &d0_lo);
+          mul64(h2, s1, &ph, &pl);
+          d0_hi += ph + addcarry64(d0_lo, pl, &d0_lo);
+        }
+        /* d1 = h0*rr1 + h1*rr0 + h2*s2 */
+        mul64(h0, rr1, &d1_hi, &d1_lo);
+        { uint64_t ph, pl;
+          mul64(h1, rr0, &ph, &pl);
+          d1_hi += ph + addcarry64(d1_lo, pl, &d1_lo);
+          mul64(h2, s2, &ph, &pl);
+          d1_hi += ph + addcarry64(d1_lo, pl, &d1_lo);
+        }
+        /* d2 = h0*rr2 + h1*rr1 + h2*rr0 */
+        mul64(h0, rr2, &d2_hi, &d2_lo);
+        { uint64_t ph, pl;
+          mul64(h1, rr1, &ph, &pl);
+          d2_hi += ph + addcarry64(d2_lo, pl, &d2_lo);
+          mul64(h2, rr0, &ph, &pl);
+          d2_hi += ph + addcarry64(d2_lo, pl, &d2_lo);
+        }
 
         /* Partial reduction / carry propagation */
-        uint64_t c0=(uint64_t)(d0>>44); h0=(uint64_t)d0 & 0xFFFFFFFFFFF;
-        d1+=c0;
-        uint64_t c1=(uint64_t)(d1>>44); h1=(uint64_t)d1 & 0xFFFFFFFFFFF;
-        d2+=c1;
-        uint64_t c2=(uint64_t)(d2>>42); h2=(uint64_t)d2 & 0x3FFFFFFFFFF;
+        uint64_t c0=(d0_lo >> 44) | (d0_hi << 20); h0=d0_lo & 0xFFFFFFFFFFF;
+        d1_hi += addcarry64(d1_lo, c0, &d1_lo);
+        uint64_t c1=(d1_lo >> 44) | (d1_hi << 20); h1=d1_lo & 0xFFFFFFFFFFF;
+        d2_hi += addcarry64(d2_lo, c1, &d2_lo);
+        uint64_t c2=(d2_lo >> 42) | (d2_hi << 22); h2=d2_lo & 0x3FFFFFFFFFF;
         h0+=c2*5;
         uint64_t c3=h0>>44; h0&=0xFFFFFFFFFFF;
         h1+=c3;
@@ -866,10 +937,8 @@ static void poly1305_mac(const uint8_t key[32], const uint8_t *msg,
     uint64_t s_lo=0,s_hi=0;
     for(int i=0;i<8;i++) s_lo|=(uint64_t)key[16+i]<<(8*i);
     for(int i=0;i<8;i++) s_hi|=(uint64_t)key[24+i]<<(8*i);
-    uint128_t sum=(uint128_t)lo+s_lo;
-    lo=(uint64_t)sum;
-    sum=(uint128_t)hi+s_hi+(uint64_t)(sum>>64);
-    hi=(uint64_t)sum;
+    uint64_t carry_s=addcarry64(lo, s_lo, &lo);
+    hi=hi+s_hi+carry_s;
 
     /* Output little-endian */
     for(int i=0;i<8;i++){tag[i]=(lo>>(8*i))&0xFF; tag[8+i]=(hi>>(8*i))&0xFF;}
@@ -975,10 +1044,11 @@ static int bn_cmp(const bignum *a, const bignum *b) {
 
 static void bn_sub(bignum *r, const bignum *a, const bignum *b) {
     int ml=a->len>b->len?a->len:b->len;
-    __int128 borrow=0;
+    uint64_t borrow=0;
     for(int i=0;i<ml;i++){
-        borrow=(__int128)(i<a->len?a->v[i]:0)-(i<b->len?b->v[i]:0)+borrow;
-        r->v[i]=(uint64_t)borrow; borrow>>=64;
+        uint64_t av=i<a->len?a->v[i]:0;
+        uint64_t bv=i<b->len?b->v[i]:0;
+        borrow=sbb64(av, bv, borrow, &r->v[i]);
     }
     r->len=ml;
     while(r->len>0&&r->v[r->len-1]==0) r->len--;
@@ -991,8 +1061,7 @@ static void bn_mul(bignum *r, const bignum *a, const bignum *b) {
     for(int i=0;i<a->len;i++){
         uint64_t carry=0;
         for(int j=0;j<b->len&&i+j<BN_MAX_LIMBS;j++){
-            uint128_t p=(uint128_t)a->v[i]*b->v[j]+t.v[i+j]+carry;
-            t.v[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+            mac64(a->v[i], b->v[j], t.v[i+j], carry, &carry, &t.v[i+j]);
         }
         if(i+b->len<BN_MAX_LIMBS) t.v[i+b->len]=carry;
     }
@@ -1073,21 +1142,19 @@ static void bn_mont_mul(bignum *r, const bignum *a, const bignum *b,
         /* t += a[i] * b */
         uint64_t carry = 0;
         for (int j = 0; j < n; j++) {
-            uint128_t p = (uint128_t)ai * ((j < b->len) ? b->v[j] : 0) + t[j] + carry;
-            t[j] = (uint64_t)p; carry = (uint64_t)(p >> 64);
+            mac64(ai, (j < b->len) ? b->v[j] : 0, t[j], carry, &carry, &t[j]);
         }
-        uint128_t s = (uint128_t)t[n] + carry;
-        t[n] = (uint64_t)s; t[n + 1] = (uint64_t)(s >> 64);
+        uint64_t sc = addcarry64(t[n], carry, &t[n]);
+        t[n + 1] = sc;
         /* u = t[0] * m_inv mod 2^64 */
         uint64_t u = t[0] * ctx->m_inv;
         /* t += u * m, cancels bottom limb */
         carry = 0;
         for (int j = 0; j < n; j++) {
-            uint128_t p = (uint128_t)u * m->v[j] + t[j] + carry;
-            t[j] = (uint64_t)p; carry = (uint64_t)(p >> 64);
+            mac64(u, m->v[j], t[j], carry, &carry, &t[j]);
         }
-        s = (uint128_t)t[n] + carry;
-        t[n] = (uint64_t)s; t[n + 1] += (uint64_t)(s >> 64);
+        sc = addcarry64(t[n], carry, &t[n]);
+        t[n + 1] += sc;
         /* shift right 64 bits (drop zeroed bottom limb) */
         for (int j = 0; j <= n; j++) t[j] = t[j + 1];
         t[n + 1] = 0;
@@ -1151,18 +1218,17 @@ static int fp384_cmp(const fp384 *a, const fp384 *b) {
 }
 
 static uint64_t fp384_add_raw(fp384 *r, const fp384 *a, const fp384 *b) {
-    uint128_t c=0;
-    for(int i=0;i<6;i++){c+=(uint128_t)a->v[i]+b->v[i];r->v[i]=(uint64_t)c;c>>=64;}
-    return (uint64_t)c;
+    uint64_t c=0;
+    for(int i=0;i<6;i++){c=adc64(a->v[i],b->v[i],c,&r->v[i]);}
+    return c;
 }
 
 static uint64_t fp384_sub_raw(fp384 *r, const fp384 *a, const fp384 *b) {
-    __int128 borrow=0;
+    uint64_t borrow=0;
     for(int i=0;i<6;i++){
-        borrow=(__int128)a->v[i]-b->v[i]+borrow;
-        r->v[i]=(uint64_t)borrow; borrow>>=64;
+        borrow=sbb64(a->v[i],b->v[i],borrow,&r->v[i]);
     }
-    return (borrow<0)?1:0;
+    return borrow;
 }
 
 static void fp384_add(fp384 *r, const fp384 *a, const fp384 *b) {
@@ -1186,8 +1252,7 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
     for(int i=0;i<6;i++){
         uint64_t carry=0;
         for(int j=0;j<6;j++){
-            uint128_t p=(uint128_t)a->v[i]*b->v[j]+w[i+j]+carry;
-            w[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+            mac64(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
         }
         w[i+6]=carry;
     }
@@ -1196,29 +1261,28 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
      * result = lo + hi + (hi<<128) + (hi<<96) - (hi<<32) mod p
      * Uses 10-limb (640-bit) accumulator for intermediate result */
     uint64_t acc[10]; memset(acc,0,sizeof(acc));
-    uint128_t c;
+    uint64_t c;
     /* +lo */
     for(int i=0;i<6;i++) acc[i]=w[i];
     /* +hi */
-    c=0; for(int i=0;i<6;i++){c+=(uint128_t)acc[i]+w[i+6];acc[i]=(uint64_t)c;c>>=64;}
-    for(int i=6;i<10;i++){c+=(uint128_t)acc[i];acc[i]=(uint64_t)c;c>>=64;}
+    c=0; for(int i=0;i<6;i++){c=adc64(acc[i],w[i+6],c,&acc[i]);}
+    for(int i=6;i<10;i++){c=adc64(acc[i],0,c,&acc[i]);}
     /* +hi<<128 (shift by 2 limbs) */
-    c=0; for(int i=0;i<6;i++){c+=(uint128_t)acc[i+2]+w[i+6];acc[i+2]=(uint64_t)c;c>>=64;}
-    for(int i=8;i<10;i++){c+=(uint128_t)acc[i];acc[i]=(uint64_t)c;c>>=64;}
+    c=0; for(int i=0;i<6;i++){c=adc64(acc[i+2],w[i+6],c,&acc[i+2]);}
+    for(int i=8;i<10;i++){c=adc64(acc[i],0,c,&acc[i]);}
     /* +hi<<96 (shift by 1 limb + 32 bits) */
     { uint64_t sh[10]={0};
       for(int i=0;i<6;i++){sh[i+1]|=w[i+6]<<32; sh[i+2]|=w[i+6]>>32;}
-      c=0; for(int i=0;i<10;i++){c+=(uint128_t)acc[i]+sh[i];acc[i]=(uint64_t)c;c>>=64;}
+      c=0; for(int i=0;i<10;i++){c=adc64(acc[i],sh[i],c,&acc[i]);}
     }
     /* -hi<<32 */
     { uint64_t sh[10]={0};
       sh[0]=w[6]<<32;
       for(int i=1;i<6;i++) sh[i]=(w[i+6]<<32)|(w[i+5]>>32);
       sh[6]=w[11]>>32;
-      __int128 borrow=0;
+      uint64_t borrow=0;
       for(int i=0;i<10;i++){
-          borrow=(__int128)acc[i]-sh[i]+borrow;
-          acc[i]=(uint64_t)borrow; borrow>>=64;
+          borrow=sbb64(acc[i],sh[i],borrow,&acc[i]);
       }
     }
     /* Second pass: reduce acc[6..9] * K + acc[0..5] */
@@ -1226,22 +1290,21 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
       memcpy(lo2,acc,48);
       memset(acc,0,sizeof(acc));
       for(int i=0;i<6;i++) acc[i]=lo2[i];
-      c=0; for(int i=0;i<6;i++){c+=(uint128_t)acc[i]+hi2[i];acc[i]=(uint64_t)c;c>>=64;}
-      for(int i=6;i<10;i++){c+=(uint128_t)acc[i];acc[i]=(uint64_t)c;c>>=64;}
-      c=0; for(int i=0;i<4;i++){c+=(uint128_t)acc[i+2]+hi2[i];acc[i+2]=(uint64_t)c;c>>=64;}
-      for(int i=6;i<10;i++){c+=(uint128_t)acc[i];acc[i]=(uint64_t)c;c>>=64;}
+      c=0; for(int i=0;i<6;i++){c=adc64(acc[i],hi2[i],c,&acc[i]);}
+      for(int i=6;i<10;i++){c=adc64(acc[i],0,c,&acc[i]);}
+      c=0; for(int i=0;i<4;i++){c=adc64(acc[i+2],hi2[i],c,&acc[i+2]);}
+      for(int i=6;i<10;i++){c=adc64(acc[i],0,c,&acc[i]);}
       { uint64_t sh[10]={0};
         for(int i=0;i<4;i++){sh[i+1]|=hi2[i]<<32; sh[i+2]|=hi2[i]>>32;}
-        c=0; for(int i=0;i<10;i++){c+=(uint128_t)acc[i]+sh[i];acc[i]=(uint64_t)c;c>>=64;}
+        c=0; for(int i=0;i<10;i++){c=adc64(acc[i],sh[i],c,&acc[i]);}
       }
       { uint64_t sh[10]={0};
         sh[0]=hi2[0]<<32;
         for(int i=1;i<4;i++) sh[i]=(hi2[i]<<32)|(hi2[i-1]>>32);
         sh[4]=hi2[3]>>32;
-        __int128 borrow=0;
+        uint64_t borrow=0;
         for(int i=0;i<10;i++){
-          borrow=(__int128)acc[i]-sh[i]+borrow;
-          acc[i]=(uint64_t)borrow; borrow>>=64;
+          borrow=sbb64(acc[i],sh[i],borrow,&acc[i]);
       }
       }
     }
@@ -1485,18 +1548,17 @@ static int fp256_is_zero(const fp256 *a) {
 }
 
 static uint64_t fp256_add_raw(fp256 *r, const fp256 *a, const fp256 *b) {
-    uint128_t c=0;
-    for(int i=0;i<4;i++){c+=(uint128_t)a->v[i]+b->v[i];r->v[i]=(uint64_t)c;c>>=64;}
-    return (uint64_t)c;
+    uint64_t c=0;
+    for(int i=0;i<4;i++){c=adc64(a->v[i],b->v[i],c,&r->v[i]);}
+    return c;
 }
 
 static uint64_t fp256_sub_raw(fp256 *r, const fp256 *a, const fp256 *b) {
-    __int128 borrow=0;
+    uint64_t borrow=0;
     for(int i=0;i<4;i++){
-        borrow=(__int128)a->v[i]-b->v[i]+borrow;
-        r->v[i]=(uint64_t)borrow; borrow>>=64;
+        borrow=sbb64(a->v[i],b->v[i],borrow,&r->v[i]);
     }
-    return (borrow<0)?1:0;
+    return borrow;
 }
 
 static void fp256_add(fp256 *r, const fp256 *a, const fp256 *b) {
@@ -1519,8 +1581,7 @@ static void fp256_mul(fp256 *r, const fp256 *a, const fp256 *b) {
     for(int i=0;i<4;i++){
         uint64_t carry=0;
         for(int j=0;j<4;j++){
-            uint128_t p=(uint128_t)a->v[i]*b->v[j]+w[i+j]+carry;
-            w[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+            mac64(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
         }
         w[i+4]=carry;
     }
@@ -1760,18 +1821,17 @@ static const fp25519 FP25519_P = {{
 }};
 
 static uint64_t fp25519_add_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
-    uint128_t c=0;
-    for(int i=0;i<4;i++){c+=(uint128_t)a->v[i]+b->v[i];r->v[i]=(uint64_t)c;c>>=64;}
-    return (uint64_t)c;
+    uint64_t c=0;
+    for(int i=0;i<4;i++){c=adc64(a->v[i],b->v[i],c,&r->v[i]);}
+    return c;
 }
 
 static uint64_t fp25519_sub_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
-    __int128 borrow=0;
+    uint64_t borrow=0;
     for(int i=0;i<4;i++){
-        borrow=(__int128)a->v[i]-b->v[i]+borrow;
-        r->v[i]=(uint64_t)borrow; borrow>>=64;
+        borrow=sbb64(a->v[i],b->v[i],borrow,&r->v[i]);
     }
-    return (borrow<0)?1:0;
+    return borrow;
 }
 
 static void fp25519_add(fp25519 *r, const fp25519 *a, const fp25519 *b) {
@@ -1794,21 +1854,26 @@ static void fp25519_mul(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     for(int i=0;i<4;i++){
         uint64_t carry=0;
         for(int j=0;j<4;j++){
-            uint128_t p=(uint128_t)a->v[i]*b->v[j]+w[i+j]+carry;
-            w[i+j]=(uint64_t)p; carry=(uint64_t)(p>>64);
+            mac64(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
         }
         w[i+4]=carry;
     }
     /* Reduce: result = w[0..3] + w[4..7] * 38 */
-    uint128_t c=0;
+    uint64_t c_hi=0, c_lo=0;
     for(int i=0;i<4;i++){
-        c+=(uint128_t)w[i]+(uint128_t)w[i+4]*38;
-        w[i]=(uint64_t)c; c>>=64;
+        uint64_t ph, pl;
+        mul64(w[i+4], 38, &ph, &pl);
+        c_hi += ph;
+        c_hi += addcarry64(c_lo, pl, &c_lo);
+        c_hi += addcarry64(c_lo, w[i], &c_lo);
+        w[i] = c_lo;
+        c_lo = c_hi;
+        c_hi = 0;
     }
     /* Carry could be up to ~38, fold once more */
-    c*=38;
-    c+=(uint128_t)w[0]; w[0]=(uint64_t)c; c>>=64;
-    for(int i=1;i<4&&c;i++){c+=(uint128_t)w[i]; w[i]=(uint64_t)c; c>>=64;}
+    uint64_t fold = c_lo * 38;
+    uint64_t ac = addcarry64(w[0], fold, &w[0]);
+    for(int i=1;i<4&&ac;i++){ac=addcarry64(w[i], ac, &w[i]);}
     fp25519 res={{w[0],w[1],w[2],w[3]}};
     /* Conditional subtraction of p */
     fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,&res,&FP25519_P);
@@ -1835,14 +1900,21 @@ static void fp25519_inv(fp25519 *r, const fp25519 *a) {
 
 static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     /* Multiply by a24 = (486662-2)/4 = 121665 per RFC 7748 */
-    uint128_t c=0;
+    uint64_t c_hi=0, c_lo=0;
     for(int i=0;i<4;i++){
-        c+=(uint128_t)a->v[i]*121665; r->v[i]=(uint64_t)c; c>>=64;
+        uint64_t ph, pl;
+        mul64(a->v[i], 121665, &ph, &pl);
+        c_hi += ph;
+        c_hi += addcarry64(c_lo, pl, &c_lo);
+        r->v[i] = c_lo;
+        c_lo = c_hi;
+        c_hi = 0;
     }
     /* Reduce carry: carry * 38 */
-    uint64_t hi=(uint64_t)c;
-    c=(uint128_t)r->v[0]+(uint128_t)hi*38; r->v[0]=(uint64_t)c; c>>=64;
-    for(int i=1;i<4&&c;i++){c+=(uint128_t)r->v[i]; r->v[i]=(uint64_t)c; c>>=64;}
+    uint64_t hi=c_lo;
+    uint64_t fold=hi*38;
+    uint64_t ac=addcarry64(r->v[0], fold, &r->v[0]);
+    for(int i=1;i<4&&ac;i++){ac=addcarry64(r->v[i], ac, &r->v[i]);}
     /* Conditional subtraction */
     fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
     uint64_t mask=-(uint64_t)(1-borrow);
