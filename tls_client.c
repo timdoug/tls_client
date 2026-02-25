@@ -54,7 +54,15 @@ typedef uint32_t limb_t;
 #define BN_MAX_LIMBS 260
 #endif
 
-/* Portable 64×64→128 multiply via 32-bit half-products (C11 compliant) */
+/* 64×64→128 multiply */
+#if defined(__SIZEOF_INT128__)
+static inline void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo) {
+    __extension__ unsigned __int128 p = (unsigned __int128)a * b;
+    *lo = (uint64_t)p;
+    *hi = (uint64_t)(p >> 64);
+}
+#else
+/* Portable fallback via 32-bit half-products (C11 compliant) */
 static inline void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo) {
     uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
     uint64_t b_lo = (uint32_t)b, b_hi = b >> 32;
@@ -69,6 +77,7 @@ static inline void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo) {
     *lo = (mid << 32) | (uint32_t)p0;
     *hi = p3 + (mid >> 32) + (carry << 32);
 }
+#endif
 
 static inline uint64_t addcarry64(uint64_t a, uint64_t b, uint64_t *sum) {
     *sum = a + b;
