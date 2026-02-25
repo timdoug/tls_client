@@ -143,6 +143,10 @@ static inline uint32_t sbb_limb(uint32_t a, uint32_t b, uint32_t borrow_in, uint
 #define GET16(b) ((uint16_t)(((uint16_t)(b)[0]<<8)|(b)[1]))
 #define GET24(b) (((uint32_t)(b)[0]<<16)|((uint32_t)(b)[1]<<8)|(b)[2])
 
+static inline void put_be64(uint8_t buf[8], uint64_t val) {
+    for(int i=7;i>=0;i--) { buf[i]=(uint8_t)(val&0xFF); val>>=8; }
+}
+
 /* TLS record types */
 #define TLS_RT_CCS      0x14
 #define TLS_RT_ALERT     0x15
@@ -175,7 +179,41 @@ static inline uint32_t sbb_limb(uint32_t a, uint32_t b, uint32_t borrow_in, uint
 
 /* X25519 / ChaCha20-Poly1305 sizes */
 #define X25519_KEY_LEN            32
+#define X25519_A24                121665
 #define CHACHA20_POLY1305_TAG_LEN 16
+
+/* TLS plaintext / AES-CBC sizes */
+#define TLS_MAX_PLAINTEXT 16384
+#define AES_BLOCK_SIZE    16
+
+/* TLS 1.3 cipher suites */
+#define TLS_AES_128_GCM_SHA256        0x1301
+#define TLS_AES_256_GCM_SHA384        0x1302
+#define TLS_CHACHA20_POLY1305_SHA256  0x1303
+
+/* TLS 1.2 cipher suites */
+#define TLS_ECDHE_ECDSA_CHACHA_POLY   0xCCA9
+#define TLS_ECDHE_RSA_CHACHA_POLY     0xCCA8
+#define TLS_ECDHE_ECDSA_AES128_GCM   0xC02B
+#define TLS_ECDHE_RSA_AES128_GCM     0xC02F
+#define TLS_ECDHE_ECDSA_AES256_GCM   0xC02C
+#define TLS_ECDHE_RSA_AES256_GCM     0xC030
+#define TLS_RSA_AES256_GCM           0x009D
+#define TLS_RSA_AES128_GCM           0x009C
+#define TLS_ECDHE_RSA_AES256_CBC     0xC014
+#define TLS_ECDHE_RSA_AES128_CBC     0xC013
+#define TLS_ECDHE_ECDSA_AES256_CBC   0xC00A
+#define TLS_ECDHE_ECDSA_AES128_CBC   0xC009
+#define TLS_RSA_AES256_CBC           0x0035
+#define TLS_RSA_AES128_CBC           0x002F
+
+/* Signature algorithms (RFC 8446 §4.2.3) */
+#define TLS_SIG_ECDSA_SECP256R1_SHA256 0x0403
+#define TLS_SIG_ECDSA_SECP384R1_SHA384 0x0503
+#define TLS_SIG_RSA_PKCS1_SHA256       0x0401
+#define TLS_SIG_RSA_PKCS1_SHA384       0x0501
+#define TLS_SIG_RSA_PSS_SHA256         0x0804
+#define TLS_SIG_RSA_PSS_SHA384         0x0805
 
 /* Buffer sizes */
 #define CH_BUF_SIZE   1024
@@ -187,11 +225,11 @@ _Noreturn static void die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg)
 
 static void random_bytes(uint8_t *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) die("open urandom");
+    if(fd < 0) die("open urandom");
     size_t d = 0;
-    while (d < len) {
+    while(d < len) {
         ssize_t n = read(fd, buf+d, len-d);
-        if (n<=0) die("read urandom");
+        if(n<=0) die("read urandom");
         d+=(size_t)n;
     }
     close(fd);
@@ -199,26 +237,26 @@ static void random_bytes(uint8_t *buf, size_t len) {
 
 static int read_exact(int fd, uint8_t *buf, size_t len) {
     size_t d = 0;
-    while (d < len) { ssize_t n = read(fd, buf+d, len-d); if (n<=0) return -1; d+=(size_t)n; }
+    while(d < len) { ssize_t n = read(fd, buf+d, len-d); if(n<=0) return -1; d+=(size_t)n; }
     return 0;
 }
 
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t d = 0;
-    while (d < len) { ssize_t n = write(fd, buf+d, len-d); if (n<=0) return -1; d+=(size_t)n; }
+    while(d < len) { ssize_t n = write(fd, buf+d, len-d); if(n<=0) return -1; d+=(size_t)n; }
     return 0;
 }
 
 /* Constant-time helpers */
 static void secure_zero(void *p, size_t len) {
     volatile uint8_t *v = p;
-    while (len--) *v++ = 0;
+    while(len--) *v++ = 0;
 }
 
 static int ct_memeq(const void *a, const void *b, size_t len) {
     const volatile uint8_t *x = a, *y = b;
     volatile uint8_t diff = 0;
-    for (size_t i = 0; i < len; i++) diff |= x[i] ^ y[i];
+    for(size_t i = 0; i < len; i++) diff |= x[i] ^ y[i];
     /* Constant-time: map 0 -> 1, nonzero -> 0 without branching */
     return (int)(1 & ((uint32_t)(diff - 1) >> 8));
 }
@@ -249,14 +287,14 @@ typedef struct { uint32_t h[8]; uint8_t buf[64]; size_t buf_len; uint64_t total;
 
 static void sha256_transform(sha256_ctx *ctx, const uint8_t blk[64]) {
     uint32_t w[64], a,b,c,d,e,f,g,h;
-    for (size_t i=0;i<16;i++)
+    for(size_t i=0;i<16;i++)
         w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)
             |((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
-    for (int i=16;i<64;i++)
+    for(int i=16;i<64;i++)
         w[i]=SIG1(w[i-2])+w[i-7]+SIG0(w[i-15])+w[i-16];
     a=ctx->h[0];b=ctx->h[1];c=ctx->h[2];d=ctx->h[3];
     e=ctx->h[4];f=ctx->h[5];g=ctx->h[6];h=ctx->h[7];
-    for (int i=0;i<64;i++) {
+    for(int i=0;i<64;i++) {
         uint32_t t1=h+EP1(e)+CH(e,f,g)+sha256_k[i]+w[i], t2=EP0(a)+MAJ(a,b,c);
         h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
     }
@@ -272,11 +310,11 @@ static void sha256_init(sha256_ctx *ctx) {
 
 static void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len) {
     ctx->total += len;
-    while (len > 0) {
+    while(len > 0) {
         size_t space = 64 - ctx->buf_len, chunk = len < space ? len : space;
         memcpy(ctx->buf + ctx->buf_len, data, chunk);
         ctx->buf_len += chunk; data += chunk; len -= chunk;
-        if (ctx->buf_len == 64) { sha256_transform(ctx, ctx->buf); ctx->buf_len = 0; }
+        if(ctx->buf_len == 64) { sha256_transform(ctx, ctx->buf); ctx->buf_len = 0; }
     }
 }
 
@@ -285,10 +323,10 @@ static void sha256_final(sha256_ctx *ctx, uint8_t out[32]) {
     uint8_t pad = 0x80;
     sha256_update(ctx, &pad, 1);
     pad = 0;
-    while (ctx->buf_len != 56) sha256_update(ctx, &pad, 1);
-    uint8_t lb[8]; for (int i=7;i>=0;i--) { lb[i]=bits&0xFF; bits>>=8; }
+    while(ctx->buf_len != 56) sha256_update(ctx, &pad, 1);
+    uint8_t lb[8]; put_be64(lb, bits);
     sha256_update(ctx, lb, 8);
-    for (size_t i=0;i<8;i++) {
+    for(size_t i=0;i<8;i++) {
         out[4*i]=(uint8_t)(ctx->h[i]>>24); out[4*i+1]=(uint8_t)(ctx->h[i]>>16);
         out[4*i+2]=(uint8_t)(ctx->h[i]>>8); out[4*i+3]=(uint8_t)ctx->h[i];
     }
@@ -349,7 +387,7 @@ static void sha1_final(sha1_ctx *ctx, uint8_t out[20]) {
     sha1_update(ctx,&pad,1);
     pad=0;
     while(ctx->buf_len!=56) sha1_update(ctx,&pad,1);
-    uint8_t lb[8]; for(int i=7;i>=0;i--){lb[i]=bits&0xFF;bits>>=8;}
+    uint8_t lb[8]; put_be64(lb, bits);
     sha1_update(ctx,lb,8);
     for(size_t i=0;i<5;i++){
         out[4*i]=(uint8_t)(ctx->h[i]>>24); out[4*i+1]=(uint8_t)(ctx->h[i]>>16);
@@ -440,8 +478,7 @@ static void sha512_final(sha512_ctx *ctx, uint8_t out[64]) {
     sha512_update(ctx,&pad,1);
     pad=0;
     while(ctx->buf_len!=112) sha512_update(ctx,&pad,1);
-    uint8_t lb[16]={0};
-    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
+    uint8_t lb[16]={0}; put_be64(lb+8, bits);
     sha512_update(ctx,lb,16);
     for(int i=0;i<8;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
 }
@@ -465,8 +502,7 @@ static void sha384_final(sha384_ctx *ctx, uint8_t out[48]) {
     sha384_update(ctx,&pad,1);
     pad=0;
     while(ctx->buf_len!=112) sha384_update(ctx,&pad,1);
-    uint8_t lb[16]={0};
-    for(int i=15;i>=8;i--){lb[i]=bits&0xFF;bits>>=8;}
+    uint8_t lb[16]={0}; put_be64(lb+8, bits);
     sha384_update(ctx,lb,16);
     for(int i=0;i<6;i++)for(int j=0;j<8;j++) out[i*8+j]=(ctx->h[i]>>(56-8*j))&0xFF;
 }
@@ -623,7 +659,7 @@ static uint8_t ct_sbox(uint8_t idx) {
 
 static void aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
     memcpy(rk,key,16);
-    for (size_t i=0;i<10;i++) {
+    for(size_t i=0;i<10;i++) {
         const uint8_t *p=rk+16*i; uint8_t *n=rk+16*(i+1);
         uint8_t t[4]={ct_sbox(p[13]),ct_sbox(p[14]),ct_sbox(p[15]),ct_sbox(p[12])};
         t[0]^=aes_rcon[i];
@@ -658,7 +694,7 @@ static uint8_t xt(uint8_t x){return (uint8_t)((x<<1)^((x>>7)*0x1b));}
 static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16]; memcpy(s,in,16);
     for(int i=0;i<16;i++) s[i]^=rk[i];
-    for (int r=1;r<=nr;r++) {
+    for(int r=1;r<=nr;r++) {
         for(int i=0;i<16;i++) s[i]=ct_sbox(s[i]);
         uint8_t t;
         t=s[1];s[1]=s[5];s[5]=s[9];s[9]=s[13];s[13]=t;
@@ -1189,9 +1225,9 @@ static void bn_mont_init(bn_mont_ctx *ctx, const bignum *m) {
     limb_t m0 = m->v[0];
     limb_t x = 1;
 #if USE_64BIT_LIMBS
-    for (int i = 0; i < 6; i++) /* 1->2->4->8->16->32->64 bits */
+    for(int i = 0; i < 6; i++) /* 1->2->4->8->16->32->64 bits */
 #else
-    for (int i = 0; i < 5; i++) /* 1->2->4->8->16->32 bits */
+    for(int i = 0; i < 5; i++) /* 1->2->4->8->16->32 bits */
 #endif
         x = x * (2 - m0 * x);
     ctx->m_inv = -x; /* negate: m_inv * m[0] ≡ -1 (mod 2^LIMB_BITS) */
@@ -1208,11 +1244,11 @@ static void bn_mont_mul(bignum *r, const bignum *a, const bignum *b,
     int n = ctx->n;
     limb_t t[BN_MAX_LIMBS + 2];
     memset(t, 0, ((size_t)n + 2) * sizeof(limb_t));
-    for (int i = 0; i < n; i++) {
+    for(int i = 0; i < n; i++) {
         limb_t ai = (i < a->len) ? a->v[i] : 0;
         /* t += a[i] * b */
         limb_t carry = 0;
-        for (int j = 0; j < n; j++) {
+        for(int j = 0; j < n; j++) {
             mac_limb(ai, (j < b->len) ? b->v[j] : 0, t[j], carry, &carry, &t[j]);
         }
         limb_t sc = adc_limb(t[n], carry, 0, &t[n]);
@@ -1221,20 +1257,20 @@ static void bn_mont_mul(bignum *r, const bignum *a, const bignum *b,
         limb_t u = t[0] * ctx->m_inv;
         /* t += u * m, cancels bottom limb */
         carry = 0;
-        for (int j = 0; j < n; j++) {
+        for(int j = 0; j < n; j++) {
             mac_limb(u, m->v[j], t[j], carry, &carry, &t[j]);
         }
         sc = adc_limb(t[n], carry, 0, &t[n]);
         t[n + 1] += sc;
         /* shift right LIMB_BITS (drop zeroed bottom limb) */
-        for (int j = 0; j <= n; j++) t[j] = t[j + 1];
+        for(int j = 0; j <= n; j++) t[j] = t[j + 1];
         t[n + 1] = 0;
     }
     bignum result; bn_zero(&result);
-    for (int i = 0; i <= n; i++) result.v[i] = t[i];
+    for(int i = 0; i <= n; i++) result.v[i] = t[i];
     result.len = n + 1;
-    while (result.len > 0 && result.v[result.len - 1] == 0) result.len--;
-    if (bn_cmp(&result, m) >= 0) bn_sub(r, &result, m);
+    while(result.len > 0 && result.v[result.len - 1] == 0) result.len--;
+    if(bn_cmp(&result, m) >= 0) bn_sub(r, &result, m);
     else *r = result;
 }
 
@@ -1248,14 +1284,14 @@ static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bi
     bignum one; bn_zero(&one); one.v[0] = 1; one.len = 1;
     bn_mont_mul(&table[0], &one, &ctx.rr, m, &ctx);
     table[1] = bm;
-    for (int i = 2; i < 16; i++)
+    for(int i = 2; i < 16; i++)
         bn_mont_mul(&table[i], &table[i - 1], &bm, m, &ctx);
     bignum result = table[0];
     /* Process exponent MSB to LSB in 4-bit windows, fixed count to avoid leaking length */
     int total_windows = m->len * (LIMB_BITS / 4); /* m->len * LIMB_BITS / 4 */
-    for (int w = total_windows - 1; w >= 0; w--) {
+    for(int w = total_windows - 1; w >= 0; w--) {
         /* Square 4 times */
-        for (int s = 0; s < 4; s++)
+        for(int s = 0; s < 4; s++)
             bn_mont_mul(&result, &result, &result, m, &ctx);
         /* Extract 4-bit window (always aligned to nibble, never spans limbs) */
         int bit_pos = w * 4;
@@ -1263,7 +1299,7 @@ static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bi
             ? (int)((exp->v[bit_pos / LIMB_BITS] >> (bit_pos % LIMB_BITS)) & 0xF) : 0;
         /* Constant-time table lookup */
         bignum sel = table[0];
-        for (int i = 1; i < 16; i++)
+        for(int i = 1; i < 16; i++)
             bn_cmov(&sel, &table[i], i == window);
         bn_mont_mul(&result, &result, &sel, m, &ctx);
     }
@@ -1316,19 +1352,25 @@ static limb_t fp384_sub_raw(fp384 *r, const fp384 *a, const fp384 *b) {
     return borrow;
 }
 
+/* Constant-time conditional selection: r = mask ? t : r (per-limb) */
+#define FP_CSEL(r, t, mask, N) do { \
+    for(int _i=0;_i<(N);_i++) \
+        (r)->v[_i]=((r)->v[_i]&~(mask))|((t)->v[_i]&(mask)); \
+} while(0)
+
 static void fp384_add(fp384 *r, const fp384 *a, const fp384 *b) {
     limb_t carry=fp384_add_raw(r,a,b);
     fp384 t; limb_t borrow=fp384_sub_raw(&t,r,&P384_P);
     /* Use subtracted result if carry, or if no borrow (r >= P) */
     limb_t mask=-(limb_t)(carry|(1-borrow));
-    for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP384_N);
 }
 
 static void fp384_sub(fp384 *r, const fp384 *a, const fp384 *b) {
     limb_t borrow=fp384_sub_raw(r,a,b);
     fp384 t; fp384_add_raw(&t,r,&P384_P);
     limb_t mask=-(limb_t)borrow;
-    for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP384_N);
 }
 
 #if USE_64BIT_LIMBS
@@ -1399,7 +1441,7 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
     for(int pass=0;pass<4;pass++){
         fp384 t; limb_t borrow=fp384_sub_raw(&t,r,&P384_P);
         limb_t mask=-(limb_t)(1-borrow);
-        for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+        FP_CSEL(r, &t, mask, FP384_N);
     }
 }
 #else /* 32-bit limbs: 12×12 schoolbook, limb-aligned shifts */
@@ -1457,7 +1499,7 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
     for(int pass=0;pass<4;pass++){
         fp384 t; limb_t borrow=fp384_sub_raw(&t,r,&P384_P);
         limb_t mask=-(limb_t)(1-borrow);
-        for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+        FP_CSEL(r, &t, mask, FP384_N);
     }
 }
 #endif
@@ -1764,14 +1806,14 @@ static void fp256_add(fp256 *r, const fp256 *a, const fp256 *b) {
     limb_t carry=fp256_add_raw(r,a,b);
     fp256 t; limb_t borrow=fp256_sub_raw(&t,r,&P256_P);
     limb_t mask=-(limb_t)(carry|(1-borrow));
-    for(int i=0;i<FP256_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP256_N);
 }
 
 static void fp256_sub(fp256 *r, const fp256 *a, const fp256 *b) {
     limb_t borrow=fp256_sub_raw(r,a,b);
     fp256 t; fp256_add_raw(&t,r,&P256_P);
     limb_t mask=-(limb_t)borrow;
-    for(int i=0;i<FP256_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP256_N);
 }
 
 #if USE_64BIT_LIMBS
@@ -2104,14 +2146,14 @@ static void fp25519_add(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     limb_t carry=fp25519_add_raw(r,a,b);
     fp25519 t; limb_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
     limb_t mask=-(limb_t)(carry|(1-borrow));
-    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP25519_N);
 }
 
 static void fp25519_sub(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     limb_t borrow=fp25519_sub_raw(r,a,b);
     fp25519 t; fp25519_add_raw(&t,r,&FP25519_P);
     limb_t mask=-(limb_t)borrow;
-    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP25519_N);
 }
 
 #if USE_64BIT_LIMBS
@@ -2145,7 +2187,7 @@ static void fp25519_mul(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     /* Conditional subtraction of p */
     fp25519 t; limb_t borrow=fp25519_sub_raw(&t,&res,&FP25519_P);
     limb_t mask=-(limb_t)(1-borrow);
-    for(int i=0;i<FP25519_N;i++) res.v[i]=(res.v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(&res, &t, mask, FP25519_N);
     *r=res;
 }
 #else /* 32-bit limbs: 8×8 schoolbook, native uint64_t for double-width */
@@ -2179,7 +2221,7 @@ static void fp25519_mul(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     /* Conditional subtraction of p */
     fp25519 t; limb_t borrow=fp25519_sub_raw(&t,&res,&FP25519_P);
     limb_t mask=-(limb_t)(1-borrow);
-    for(int i=0;i<FP25519_N;i++) res.v[i]=(res.v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(&res, &t, mask, FP25519_N);
     *r=res;
 }
 #endif
@@ -2214,7 +2256,7 @@ static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     uint64_t c_hi=0, c_lo=0;
     for(int i=0;i<4;i++){
         uint64_t ph, pl;
-        mul64(a->v[i], 121665, &ph, &pl);
+        mul64(a->v[i], X25519_A24, &ph, &pl);
         c_hi += ph;
         c_hi += addcarry64(c_lo, pl, &c_lo);
         r->v[i] = c_lo;
@@ -2229,13 +2271,13 @@ static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     /* Conditional subtraction */
     fp25519 t; limb_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
     limb_t mask=-(limb_t)(1-borrow);
-    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP25519_N);
 }
 #else /* 32-bit: native uint64_t multiplication */
 static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     uint64_t carry=0;
     for(int i=0;i<8;i++){
-        uint64_t s = (uint64_t)a->v[i] * 121665 + carry;
+        uint64_t s = (uint64_t)a->v[i] * X25519_A24 + carry;
         r->v[i] = (uint32_t)s;
         carry = s >> 32;
     }
@@ -2251,7 +2293,7 @@ static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     /* Conditional subtraction */
     fp25519 t; limb_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
     limb_t mask=-(limb_t)(1-borrow);
-    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    FP_CSEL(r, &t, mask, FP25519_N);
 }
 #endif
 
@@ -2279,7 +2321,7 @@ static void fp25519_to_le(uint8_t b[32], const fp25519 *a) {
     for(int pass=0;pass<2;pass++){
         fp25519 s; limb_t borrow=fp25519_sub_raw(&s,&t,&FP25519_P);
         limb_t mask=-(limb_t)(1-borrow);
-        for(int i=0;i<FP25519_N;i++) t.v[i]=(t.v[i]&~mask)|(s.v[i]&mask);
+        FP_CSEL(&t, &s, mask, FP25519_N);
     }
     for(int i=0;i<FP25519_N;i++)
         for(int j=0;j<LIMB_BYTES;j++)
@@ -2355,29 +2397,29 @@ static int x25519_shared_secret(const uint8_t priv[X25519_KEY_LEN],
  * Base64 / PEM Decoder
  * ================================================================ */
 static int b64val(uint8_t c) {
-    if (c>='A'&&c<='Z') return c-'A';
-    if (c>='a'&&c<='z') return c-'a'+26;
-    if (c>='0'&&c<='9') return c-'0'+52;
-    if (c=='+') return 62;
-    if (c=='/') return 63;
+    if(c>='A'&&c<='Z') return c-'A';
+    if(c>='a'&&c<='z') return c-'a'+26;
+    if(c>='0'&&c<='9') return c-'0'+52;
+    if(c=='+') return 62;
+    if(c=='/') return 63;
     return -1;
 }
 
 static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
     const char *begin = strstr(pem, "-----BEGIN ");
-    if (!begin) return 0;
+    if(!begin) return 0;
     begin = memchr(begin, '\n', pem_len-(size_t)(begin-pem));
-    if (!begin) return 0;
+    if(!begin) return 0;
     begin++;
     const char *end = strstr(begin, "-----END ");
-    if (!end) return 0;
+    if(!end) return 0;
     size_t out = 0;
     uint32_t acc = 0; int bits = 0;
-    for (const char *p = begin; p < end; p++) {
+    for(const char *p = begin; p < end; p++) {
         int v = b64val((uint8_t)*p);
-        if (v < 0) continue;
+        if(v < 0) continue;
         acc = (acc << 6) | (uint32_t)v; bits += 6;
-        if (bits >= 8) { bits -= 8; der[out++] = (acc >> bits) & 0xFF; }
+        if(bits >= 8) { bits -= 8; der[out++] = (acc >> bits) & 0xFF; }
     }
     return out;
 }
@@ -2388,19 +2430,19 @@ static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
 /* Read tag + length, return pointer to value. NULL on error. */
 static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
                                     uint8_t *tag, size_t *len) {
-    if (p >= end) return NULL;
+    if(p >= end) return NULL;
     *tag = *p++;
-    if (p >= end) return NULL;
-    if (*p < 0x80) {
+    if(p >= end) return NULL;
+    if(*p < 0x80) {
         *len = *p++;
     } else {
         int nb = *p++ & 0x7F;
         /* nb==0: reject BER indefinite length */
-        if (nb == 0 || nb > 3 || p + nb > end) return NULL;
+        if(nb == 0 || nb > 3 || p + nb > end) return NULL;
         *len = 0;
-        for (int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
+        for(int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
     }
-    if (p + *len > end) return NULL;
+    if(p + *len > end) return NULL;
     return p;
 }
 
@@ -2408,8 +2450,17 @@ static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
 static const uint8_t *der_skip(const uint8_t *p, const uint8_t *end) {
     uint8_t tag; size_t len;
     const uint8_t *val = der_read_tl(p, end, &tag, &len);
-    if (!val) return NULL;
+    if(!val) return NULL;
     return val + len;
+}
+
+/* Read TLV expecting a specific tag. Returns pointer to value, or NULL on mismatch. */
+static const uint8_t *der_expect(const uint8_t *p, const uint8_t *end,
+                                  uint8_t expected_tag, size_t *len) {
+    uint8_t tag;
+    const uint8_t *val=der_read_tl(p, end, &tag, len);
+    if(!val || tag!=expected_tag) return NULL;
+    return val;
 }
 
 static int oid_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
@@ -2472,19 +2523,19 @@ static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
 
     /* Parse DER signature → (r, s) */
     const uint8_t *p=sig_der, *end=sig_der+sig_len;
-    uint8_t tag; size_t len;
-    p=der_read_tl(p,end,&tag,&len);
-    if(!p||tag!=0x30) return 0;
+    size_t len;
+    p=der_expect(p,end,0x30,&len);
+    if(!p) return 0;
     end=p+len;
 
-    const uint8_t *rval=der_read_tl(p,end,&tag,&len);
-    if(!rval||tag!=0x02) return 0;
+    const uint8_t *rval=der_expect(p,end,0x02,&len);
+    if(!rval) return 0;
     const uint8_t *rp=rval; size_t rlen=len;
     if(rlen>0&&rp[0]==0){rp++;rlen--;}
     p=rval+len;
 
-    const uint8_t *sval=der_read_tl(p,end,&tag,&len);
-    if(!sval||tag!=0x02) return 0;
+    const uint8_t *sval=der_expect(p,end,0x02,&len);
+    if(!sval) return 0;
     const uint8_t *sp=sval; size_t slen=len;
     if(slen>0&&sp[0]==0){sp++;slen--;}
 
@@ -2546,19 +2597,19 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
 
     /* Parse DER signature → (r, s) */
     const uint8_t *p=sig_der, *end=sig_der+sig_len;
-    uint8_t tag; size_t len;
-    p=der_read_tl(p,end,&tag,&len);
-    if(!p||tag!=0x30) return 0;
+    size_t len;
+    p=der_expect(p,end,0x30,&len);
+    if(!p) return 0;
     end=p+len;
 
-    const uint8_t *rval=der_read_tl(p,end,&tag,&len);
-    if(!rval||tag!=0x02) return 0;
+    const uint8_t *rval=der_expect(p,end,0x02,&len);
+    if(!rval) return 0;
     const uint8_t *rp=rval; size_t rlen=len;
     if(rlen>0&&rp[0]==0){rp++;rlen--;}
     p=rval+len;
 
-    const uint8_t *sval=der_read_tl(p,end,&tag,&len);
-    if(!sval||tag!=0x02) return 0;
+    const uint8_t *sval=der_expect(p,end,0x02,&len);
+    if(!sval) return 0;
     const uint8_t *sp=sval; size_t slen=len;
     if(slen>0&&sp[0]==0){sp++;slen--;}
 
@@ -2806,19 +2857,19 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
     if(tp>=tbs_end||*tp!=0xA3) return 0;
     const uint8_t *ext_outer=der_read_tl(tp,tbs_end,&tag,&len);
     if(!ext_outer) return 0;
-    const uint8_t *exts_val=der_read_tl(ext_outer,ext_outer+len,&tag,&len);
-    if(!exts_val||tag!=0x30) return 0;
+    const uint8_t *exts_val=der_expect(ext_outer,ext_outer+len,0x30,&len);
+    if(!exts_val) return 0;
     const uint8_t *ep=exts_val, *exts_end=exts_val+len;
     #define MAX_EXT_OIDS 20
     struct { const uint8_t *oid; size_t len; } seen_oids[MAX_EXT_OIDS];
     int seen_count=0;
     while(ep<exts_end){
-        const uint8_t *ext_seq=der_read_tl(ep,exts_end,&tag,&len);
-        if(!ext_seq||tag!=0x30) break;
+        const uint8_t *ext_seq=der_expect(ep,exts_end,0x30,&len);
+        if(!ext_seq) break;
         const uint8_t *ext_end2=ext_seq+len;
         ep=ext_end2;
-        const uint8_t *eoid=der_read_tl(ext_seq,ext_end2,&tag,&len);
-        if(!eoid||tag!=0x06) continue;
+        const uint8_t *eoid=der_expect(ext_seq,ext_end2,0x06,&len);
+        if(!eoid) continue;
         /* RFC 5280 §4.2: each extension OID must be unique */
         for(int si=0;si<seen_count;si++){
             if(seen_oids[si].len==len && memcmp(seen_oids[si].oid,eoid,len)==0)
@@ -2910,14 +2961,14 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     uint8_t tag; size_t len;
 
     /* Certificate SEQUENCE */
-    p=der_read_tl(p,end,&tag,&len);
-    if(!p||tag!=0x30) return -1;
+    p=der_expect(p,end,0x30,&len);
+    if(!p) return -1;
     const uint8_t *cert_end=p+len;
 
     /* TBSCertificate — save raw bytes including tag+length */
     const uint8_t *tbs_start=p;
-    const uint8_t *tbs_val=der_read_tl(p,cert_end,&tag,&len);
-    if(!tbs_val||tag!=0x30) return -1;
+    const uint8_t *tbs_val=der_expect(p,cert_end,0x30,&len);
+    if(!tbs_val) return -1;
     cert->tbs=tbs_start;
     cert->tbs_len=(size_t)((tbs_val+len)-tbs_start);
     const uint8_t *tbs_end=tbs_val+len;
@@ -2945,8 +2996,8 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
 
     /* validity */
     {
-        const uint8_t *vld=der_read_tl(tp,tbs_end,&tag,&len);
-        if(!vld||tag!=0x30) return -1;
+        const uint8_t *vld=der_expect(tp,tbs_end,0x30,&len);
+        if(!vld) return -1;
         const uint8_t *vld_end=vld+len;
         cert->not_before=der_parse_time(vld,vld_end);
         const uint8_t *after_nb=der_skip(vld,vld_end);
@@ -2961,18 +3012,18 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     cert->subject_len=(size_t)(tp-subj_start);
 
     /* SubjectPublicKeyInfo */
-    const uint8_t *spki_val=der_read_tl(tp,tbs_end,&tag,&len);
-    if(!spki_val||tag!=0x30) return -1;
+    const uint8_t *spki_val=der_expect(tp,tbs_end,0x30,&len);
+    if(!spki_val) return -1;
     const uint8_t *spki_end=spki_val+len;
     tp=spki_end;
 
     /* AlgorithmIdentifier inside SPKI */
-    const uint8_t *alg_val=der_read_tl(spki_val,spki_end,&tag,&len);
-    if(!alg_val||tag!=0x30) return -1;
+    const uint8_t *alg_val=der_expect(spki_val,spki_end,0x30,&len);
+    if(!alg_val) return -1;
     const uint8_t *alg_end=alg_val+len;
 
-    const uint8_t *pk_oid=der_read_tl(alg_val,alg_end,&tag,&len);
-    if(!pk_oid||tag!=0x06) return -1;
+    const uint8_t *pk_oid=der_expect(alg_val,alg_end,0x06,&len);
+    if(!pk_oid) return -1;
     int is_ec=oid_eq(pk_oid,len,OID_EC_PUBKEY,sizeof(OID_EC_PUBKEY));
     int is_rsa=oid_eq(pk_oid,len,OID_RSA_ENC,sizeof(OID_RSA_ENC));
 
@@ -2987,17 +3038,17 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     } else if(is_rsa){
         cert->key_type=2;
         const uint8_t *rsa_p=bs_val+1, *rsa_end2=bs_val+len;
-        const uint8_t *rsa_seq=der_read_tl(rsa_p,rsa_end2,&tag,&len);
-        if(!rsa_seq||tag!=0x30) return -1;
+        const uint8_t *rsa_seq=der_expect(rsa_p,rsa_end2,0x30,&len);
+        if(!rsa_seq) return -1;
         const uint8_t *rsa_seq_end=rsa_seq+len;
         /* INTEGER n */
-        const uint8_t *nv=der_read_tl(rsa_seq,rsa_seq_end,&tag,&len);
-        if(!nv||tag!=0x02) return -1;
+        const uint8_t *nv=der_expect(rsa_seq,rsa_seq_end,0x02,&len);
+        if(!nv) return -1;
         cert->rsa_n=nv; cert->rsa_n_len=len;
         if(cert->rsa_n_len>0&&cert->rsa_n[0]==0){cert->rsa_n++;cert->rsa_n_len--;}
         /* INTEGER e */
-        const uint8_t *ev=der_read_tl(nv+len,rsa_seq_end,&tag,&len);
-        if(!ev||tag!=0x02) return -1;
+        const uint8_t *ev=der_expect(nv+len,rsa_seq_end,0x02,&len);
+        if(!ev) return -1;
         cert->rsa_e=ev; cert->rsa_e_len=len;
         if(cert->rsa_e_len>0&&cert->rsa_e[0]==0){cert->rsa_e++;cert->rsa_e_len--;}
     }
@@ -3007,11 +3058,11 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
 
     /* signatureAlgorithm (after TBS) */
     p=cert->tbs+cert->tbs_len;
-    const uint8_t *sa_seq=der_read_tl(p,cert_end,&tag,&len);
-    if(!sa_seq||tag!=0x30) return -1;
+    const uint8_t *sa_seq=der_expect(p,cert_end,0x30,&len);
+    if(!sa_seq) return -1;
     const uint8_t *sa_end=sa_seq+len;
-    const uint8_t *sa_oid=der_read_tl(sa_seq,sa_end,&tag,&len);
-    if(!sa_oid||tag!=0x06) return -1;
+    const uint8_t *sa_oid=der_expect(sa_seq,sa_end,0x06,&len);
+    if(!sa_oid) return -1;
     cert->sig_alg=sa_oid; cert->sig_alg_len=len;
 
     /* signatureValue BIT STRING */
@@ -3074,18 +3125,18 @@ static int verify_hostname(const x509_cert *cert, const char *hostname) {
     /* CN fallback */
     static const uint8_t OID_CN[]={0x55,0x04,0x03};
     const uint8_t *p=cert->subject, *end=cert->subject+cert->subject_len;
-    p=der_read_tl(p,end,&tag,&len);
-    if(!p||tag!=0x30) return 0;
+    p=der_expect(p,end,0x30,&len);
+    if(!p) return 0;
     end=p+len;
     while(p<end){
-        const uint8_t *set_val=der_read_tl(p,end,&tag,&len);
-        if(!set_val||tag!=0x31) break;
+        const uint8_t *set_val=der_expect(p,end,0x31,&len);
+        if(!set_val) break;
         p=set_val+len;
-        const uint8_t *seq_val=der_read_tl(set_val,set_val+len,&tag,&len);
-        if(!seq_val||tag!=0x30) continue;
+        const uint8_t *seq_val=der_expect(set_val,set_val+len,0x30,&len);
+        if(!seq_val) continue;
         const uint8_t *seq_end=seq_val+len;
-        const uint8_t *ov=der_read_tl(seq_val,seq_end,&tag,&len);
-        if(!ov||tag!=0x06) continue;
+        const uint8_t *ov=der_expect(seq_val,seq_end,0x06,&len);
+        if(!ov) continue;
         if(oid_eq(ov,len,OID_CN,sizeof(OID_CN))){
             const uint8_t *cv=der_read_tl(ov+len,seq_end,&tag,&len);
             if(cv&&dns_name_eq(cv,len,hostname,hn_len)) return 1;
@@ -3449,24 +3500,24 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 
     /* Cipher suites: TLS 1.3 + TLS 1.2 GCM + ChaCha20-Poly1305 + CBC + SCSV */
     buf[p++]=0x00; buf[p++]=0x24; /* 36 bytes = 18 suites */
-    buf[p++]=0x13; buf[p++]=0x01; /* TLS_AES_128_GCM_SHA256 */
-    buf[p++]=0x13; buf[p++]=0x02; /* TLS_AES_256_GCM_SHA384 */
-    buf[p++]=0x13; buf[p++]=0x03; /* TLS_CHACHA20_POLY1305_SHA256 */
-    buf[p++]=0xCC; buf[p++]=0xA9; /* TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 */
-    buf[p++]=0xCC; buf[p++]=0xA8; /* TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 */
-    buf[p++]=0xC0; buf[p++]=0x2B; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
-    buf[p++]=0xC0; buf[p++]=0x2F; /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
-    buf[p++]=0xC0; buf[p++]=0x2C; /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
-    buf[p++]=0xC0; buf[p++]=0x30; /* TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 */
-    buf[p++]=0x00; buf[p++]=0x9D; /* TLS_RSA_WITH_AES_256_GCM_SHA384 */
-    buf[p++]=0x00; buf[p++]=0x9C; /* TLS_RSA_WITH_AES_128_GCM_SHA256 */
-    buf[p++]=0xC0; buf[p++]=0x14; /* TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA */
-    buf[p++]=0xC0; buf[p++]=0x13; /* TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA */
-    buf[p++]=0xC0; buf[p++]=0x0A; /* TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA */
-    buf[p++]=0xC0; buf[p++]=0x09; /* TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA */
-    buf[p++]=0x00; buf[p++]=0x35; /* TLS_RSA_WITH_AES_256_CBC_SHA */
-    buf[p++]=0x00; buf[p++]=0x2F; /* TLS_RSA_WITH_AES_128_CBC_SHA */
-    buf[p++]=0x00; buf[p++]=0xFF; /* TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746) */
+    PUT16(buf+p, TLS_AES_128_GCM_SHA256); p+=2;
+    PUT16(buf+p, TLS_AES_256_GCM_SHA384); p+=2;
+    PUT16(buf+p, TLS_CHACHA20_POLY1305_SHA256); p+=2;
+    PUT16(buf+p, TLS_ECDHE_ECDSA_CHACHA_POLY); p+=2;
+    PUT16(buf+p, TLS_ECDHE_RSA_CHACHA_POLY); p+=2;
+    PUT16(buf+p, TLS_ECDHE_ECDSA_AES128_GCM); p+=2;
+    PUT16(buf+p, TLS_ECDHE_RSA_AES128_GCM); p+=2;
+    PUT16(buf+p, TLS_ECDHE_ECDSA_AES256_GCM); p+=2;
+    PUT16(buf+p, TLS_ECDHE_RSA_AES256_GCM); p+=2;
+    PUT16(buf+p, TLS_RSA_AES256_GCM); p+=2;
+    PUT16(buf+p, TLS_RSA_AES128_GCM); p+=2;
+    PUT16(buf+p, TLS_ECDHE_RSA_AES256_CBC); p+=2;
+    PUT16(buf+p, TLS_ECDHE_RSA_AES128_CBC); p+=2;
+    PUT16(buf+p, TLS_ECDHE_ECDSA_AES256_CBC); p+=2;
+    PUT16(buf+p, TLS_ECDHE_ECDSA_AES128_CBC); p+=2;
+    PUT16(buf+p, TLS_RSA_AES256_CBC); p+=2;
+    PUT16(buf+p, TLS_RSA_AES128_CBC); p+=2;
+    PUT16(buf+p, 0x00FF); p+=2; /* TLS_EMPTY_RENEGOTIATION_INFO_SCSV (RFC 5746) */
 
     /* Compression */
     buf[p++]=0x01; buf[p++]=0x00;
@@ -3504,12 +3555,12 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     buf[p++]=0x00;buf[p++]=0x0d;
     buf[p++]=0x00;buf[p++]=0x0e; /* ext len */
     buf[p++]=0x00;buf[p++]=0x0c; /* list len */
-    buf[p++]=0x05;buf[p++]=0x03; /* ecdsa_secp384r1_sha384 */
-    buf[p++]=0x04;buf[p++]=0x03; /* ecdsa_secp256r1_sha256 */
-    buf[p++]=0x08;buf[p++]=0x05; /* rsa_pss_rsae_sha384 */
-    buf[p++]=0x08;buf[p++]=0x04; /* rsa_pss_rsae_sha256 */
-    buf[p++]=0x05;buf[p++]=0x01; /* rsa_pkcs1_sha384 */
-    buf[p++]=0x04;buf[p++]=0x01; /* rsa_pkcs1_sha256 */
+    PUT16(buf+p, TLS_SIG_ECDSA_SECP384R1_SHA384); p+=2;
+    PUT16(buf+p, TLS_SIG_ECDSA_SECP256R1_SHA256); p+=2;
+    PUT16(buf+p, TLS_SIG_RSA_PSS_SHA384); p+=2;
+    PUT16(buf+p, TLS_SIG_RSA_PSS_SHA256); p+=2;
+    PUT16(buf+p, TLS_SIG_RSA_PKCS1_SHA384); p+=2;
+    PUT16(buf+p, TLS_SIG_RSA_PKCS1_SHA256); p+=2;
 
     /* key_share */
     buf[p++]=0x00;buf[p++]=0x33;
@@ -3599,11 +3650,15 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     if(b+2>sh_end) die("ServerHello truncated at cipher suite");
     uint16_t cs=GET16(b); b+=2;
     *cipher_suite_out=cs;
-    if(cs!=0x1301 && cs!=0x1302 && cs!=0x1303 &&
-       cs!=0xCCA9 && cs!=0xCCA8 &&
-       cs!=0xC02B && cs!=0xC02F && cs!=0xC02C && cs!=0xC030 &&
-       cs!=0x009D && cs!=0x009C && cs!=0x0035 && cs!=0x002F &&
-       cs!=0xC014 && cs!=0xC013 && cs!=0xC00A && cs!=0xC009) {
+    if(cs!=TLS_AES_128_GCM_SHA256 && cs!=TLS_AES_256_GCM_SHA384 &&
+       cs!=TLS_CHACHA20_POLY1305_SHA256 &&
+       cs!=TLS_ECDHE_ECDSA_CHACHA_POLY && cs!=TLS_ECDHE_RSA_CHACHA_POLY &&
+       cs!=TLS_ECDHE_ECDSA_AES128_GCM && cs!=TLS_ECDHE_RSA_AES128_GCM &&
+       cs!=TLS_ECDHE_ECDSA_AES256_GCM && cs!=TLS_ECDHE_RSA_AES256_GCM &&
+       cs!=TLS_RSA_AES256_GCM && cs!=TLS_RSA_AES128_GCM &&
+       cs!=TLS_RSA_AES256_CBC && cs!=TLS_RSA_AES128_CBC &&
+       cs!=TLS_ECDHE_RSA_AES256_CBC && cs!=TLS_ECDHE_RSA_AES128_CBC &&
+       cs!=TLS_ECDHE_ECDSA_AES256_CBC && cs!=TLS_ECDHE_ECDSA_AES128_CBC) {
         fprintf(stderr,"cipher suite 0x%04x\n",cs);
         die("unexpected cipher suite");
     }
@@ -3648,6 +3703,25 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     return version;
 }
 
+/* ================================================================
+ * TLS cipher mode classification
+ * ================================================================ */
+typedef enum { CIPHER_GCM, CIPHER_CBC, CIPHER_CHACHA } cipher_mode_t;
+
+static cipher_mode_t cipher_mode_of(uint16_t cs) {
+    switch(cs) {
+    case TLS_ECDHE_RSA_AES256_CBC: case TLS_ECDHE_RSA_AES128_CBC:
+    case TLS_RSA_AES256_CBC: case TLS_RSA_AES128_CBC:
+    case TLS_ECDHE_ECDSA_AES256_CBC: case TLS_ECDHE_ECDSA_AES128_CBC:
+        return CIPHER_CBC;
+    case TLS_ECDHE_ECDSA_CHACHA_POLY: case TLS_ECDHE_RSA_CHACHA_POLY:
+    case TLS_CHACHA20_POLY1305_SHA256:
+        return CIPHER_CHACHA;
+    default:
+        return CIPHER_GCM;
+    }
+}
+
 /* Construct TLS 1.3 per-record nonce: IV XOR sequence number */
 static void make_nonce(uint8_t nonce[AES_GCM_NONCE_LEN],
     const uint8_t iv[AES_GCM_NONCE_LEN], uint64_t seq) {
@@ -3660,7 +3734,7 @@ static void make_nonce(uint8_t nonce[AES_GCM_NONCE_LEN],
 static int decrypt_record(const uint8_t *rec, size_t rec_len,
                            const uint8_t *key, const uint8_t iv[AES_GCM_NONCE_LEN],
                            uint64_t seq, uint8_t *pt, size_t *pt_len,
-                           int is_aes256, int is_chacha) {
+                           cipher_mode_t mode, size_t key_len) {
     if(seq==UINT64_MAX) die("sequence number overflow");
     if(rec_len<16+1) die("encrypted record too short");
     size_t ct_len=rec_len-16; /* both GCM and ChaCha20-Poly1305 use 16-byte tags */
@@ -3674,12 +3748,10 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
     PUT16(aad+3,(uint16_t)rec_len);
 
     int r;
-    if(is_chacha)
+    if(mode==CIPHER_CHACHA)
         r=chacha20_poly1305_decrypt(key,nonce,aad,5,rec,ct_len,pt,tag);
-    else {
-        size_t kl=is_aes256?AES256_KEY_LEN:AES128_KEY_LEN;
-        r=aes_gcm_decrypt_impl(key,kl,nonce,aad,5,rec,ct_len,pt,tag);
-    }
+    else
+        r=aes_gcm_decrypt_impl(key,key_len,nonce,aad,5,rec,ct_len,pt,tag);
     if(r<0) die("AEAD decrypt failed");
 
     /* Find inner content type (last non-zero byte) */
@@ -3688,7 +3760,7 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
     if(i==0) die("no content type in record");
     uint8_t inner_type=pt[i-1];
     *pt_len=i-1;
-    if(*pt_len>16384) die("decrypted record exceeds maximum plaintext size");
+    if(*pt_len>TLS_MAX_PLAINTEXT) die("decrypted record exceeds maximum plaintext size");
     return inner_type;
 }
 
@@ -3696,10 +3768,10 @@ static int decrypt_record(const uint8_t *rec, size_t rec_len,
 static void encrypt_and_send(int fd, uint8_t inner_type,
                               const uint8_t *data, size_t len,
                               const uint8_t *key, const uint8_t iv[AES_GCM_NONCE_LEN],
-                              uint64_t seq, int is_aes256, int is_chacha) {
+                              uint64_t seq, cipher_mode_t mode, size_t key_len) {
     if(seq==UINT64_MAX) die("sequence number overflow");
     /* Build inner plaintext: data + content_type */
-    if(len>16384) die("TLS 1.3 record too large to encrypt");
+    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.3 record too large to encrypt");
     uint8_t *inner = malloc(len+1);
     if(!inner) die("malloc failed");
     memcpy(inner,data,len);
@@ -3716,15 +3788,24 @@ static void encrypt_and_send(int fd, uint8_t inner_type,
     uint8_t aad[5]={TLS_RT_APPDATA,(TLS_VERSION_12>>8),(TLS_VERSION_12&0xFF),0,0};
     PUT16(aad+3,(uint16_t)(ct_len+16));
 
-    if(is_chacha)
+    if(mode==CIPHER_CHACHA)
         chacha20_poly1305_encrypt(key,nonce,aad,5,inner,ct_len,ct,tag);
     else
-        aes_gcm_encrypt_impl(key,is_aes256?AES256_KEY_LEN:AES128_KEY_LEN,
-            nonce,aad,5,inner,ct_len,ct,tag);
+        aes_gcm_encrypt_impl(key,key_len,nonce,aad,5,inner,ct_len,ct,tag);
     memcpy(ct+ct_len,tag,16);
 
     tls_send_record(fd,TLS_RT_APPDATA,ct,ct_len+16);
     free(inner); free(ct);
+}
+
+/* Build TLS 1.2 AAD / MAC header: seq(8) || type(1) || version(2) || len(2) */
+static void build_tls12_aad(uint8_t aad[13], uint64_t seq,
+                             uint8_t content_type, uint16_t len) {
+    put_be64(aad, seq);
+    aad[8]=content_type;
+    aad[9]=(uint8_t)(TLS_VERSION_12>>8);
+    aad[10]=(uint8_t)(TLS_VERSION_12&0xFF);
+    PUT16(aad+11, len);
 }
 
 /* ================================================================
@@ -3741,15 +3822,12 @@ static void tls12_encrypt_and_send(int fd, uint8_t content_type,
     if(seq==UINT64_MAX) die("sequence number overflow");
     uint8_t nonce[AES_GCM_NONCE_LEN];
     memcpy(nonce, write_iv, 4);
-    for(int i=7;i>=0;i--) nonce[4+(7-i)]=(seq>>(8*i))&0xFF;
+    put_be64(nonce+4, seq);
 
     uint8_t aad[13];
-    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
-    aad[8]=content_type;
-    aad[9]=(TLS_VERSION_12>>8); aad[10]=(TLS_VERSION_12&0xFF);
-    PUT16(aad+11,(uint16_t)len);
+    build_tls12_aad(aad, seq, content_type, (uint16_t)len);
 
-    if(len>16384) die("TLS 1.2 record too large to encrypt");
+    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.2 record too large to encrypt");
     uint8_t *ct=malloc(len);
     if(!ct) die("malloc failed");
     uint8_t tag[AES_GCM_TAG_LEN];
@@ -3785,10 +3863,7 @@ static int tls12_decrypt_record(const uint8_t *rec, size_t rec_len,
     const uint8_t *tag = rec + 8 + ct_len;
 
     uint8_t aad[13];
-    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
-    aad[8]=content_type;
-    aad[9]=(TLS_VERSION_12>>8); aad[10]=(TLS_VERSION_12&0xFF);
-    PUT16(aad+11,(uint16_t)ct_len);
+    build_tls12_aad(aad, seq, content_type, (uint16_t)ct_len);
 
     int r=aes_gcm_decrypt_impl(read_key,key_len,nonce,aad,13,ct,ct_len,pt,tag);
     if(r<0) return -1;
@@ -3809,10 +3884,7 @@ static void tls12_encrypt_and_send_cbc(int fd, uint8_t content_type,
     /* Compute MAC: HMAC(mac_key, seq||type||version||length||data) */
     size_t mac_len=mac_alg->digest_len;
     uint8_t mac_input_hdr[13];
-    for(int i=7;i>=0;i--) mac_input_hdr[7-i]=(seq>>(8*i))&0xFF;
-    mac_input_hdr[8]=content_type;
-    mac_input_hdr[9]=(TLS_VERSION_12>>8); mac_input_hdr[10]=(TLS_VERSION_12&0xFF);
-    PUT16(mac_input_hdr+11,(uint16_t)len);
+    build_tls12_aad(mac_input_hdr, seq, content_type, (uint16_t)len);
 
     /* HMAC with incremental update for header+data */
     uint8_t mac_out[48];
@@ -3834,7 +3906,7 @@ static void tls12_encrypt_and_send_cbc(int fd, uint8_t content_type,
 
     /* Build plaintext: data || MAC || padding || padding_length */
     size_t unpadded=len+mac_len;
-    uint8_t pad_len=(uint8_t)(16-1-(unpadded%16)); /* 0..15 */
+    uint8_t pad_len=(uint8_t)(AES_BLOCK_SIZE-1-(unpadded%AES_BLOCK_SIZE));
     size_t padded_len=unpadded+pad_len+1;
     uint8_t *plain=malloc(padded_len);
     if(!plain) die("malloc failed");
@@ -3843,19 +3915,19 @@ static void tls12_encrypt_and_send_cbc(int fd, uint8_t content_type,
     memset(plain+unpadded,pad_len,pad_len+1);
 
     /* Generate random IV and encrypt */
-    uint8_t iv[16];
-    random_bytes(iv,16);
+    uint8_t iv[AES_BLOCK_SIZE];
+    random_bytes(iv,AES_BLOCK_SIZE);
     uint8_t *ct_body=malloc(padded_len);
     if(!ct_body) die("malloc failed");
     aes_cbc_encrypt(write_key,key_len,iv,plain,padded_len,ct_body);
     free(plain);
 
     /* Send record: [IV][ciphertext] */
-    size_t rec_len=16+padded_len;
+    size_t rec_len=AES_BLOCK_SIZE+padded_len;
     uint8_t *rec=malloc(rec_len);
     if(!rec) die("malloc failed");
-    memcpy(rec,iv,16);
-    memcpy(rec+16,ct_body,padded_len);
+    memcpy(rec,iv,AES_BLOCK_SIZE);
+    memcpy(rec+AES_BLOCK_SIZE,ct_body,padded_len);
     tls_send_record(fd,content_type,rec,rec_len);
     free(ct_body);
     free(rec);
@@ -3867,11 +3939,11 @@ static int tls12_decrypt_record_cbc(const uint8_t *rec, size_t rec_len,
                                       const uint8_t *mac_key, size_t mac_key_len,
                                       const hash_alg *mac_alg, uint64_t seq,
                                       uint8_t *pt, size_t *pt_len) {
-    if(rec_len<32) return -1; /* need at least IV(16) + one block(16) */
+    if(rec_len<2*AES_BLOCK_SIZE) return -1; /* need at least IV + one block */
     const uint8_t *iv=rec;
-    const uint8_t *ct=rec+16;
-    size_t ct_len=rec_len-16;
-    if(ct_len%16!=0) return -1;
+    const uint8_t *ct=rec+AES_BLOCK_SIZE;
+    size_t ct_len=rec_len-AES_BLOCK_SIZE;
+    if(ct_len%AES_BLOCK_SIZE!=0) return -1;
 
     /* Decrypt */
     uint8_t *plain=malloc(ct_len);
@@ -3899,10 +3971,7 @@ static int tls12_decrypt_record_cbc(const uint8_t *rec, size_t rec_len,
     const uint8_t *received_mac=plain+content_len;
 
     uint8_t mac_input_hdr[13];
-    for(int i=7;i>=0;i--) mac_input_hdr[7-i]=(seq>>(8*i))&0xFF;
-    mac_input_hdr[8]=content_type;
-    mac_input_hdr[9]=(TLS_VERSION_12>>8); mac_input_hdr[10]=(TLS_VERSION_12&0xFF);
-    PUT16(mac_input_hdr+11,(uint16_t)content_len);
+    build_tls12_aad(mac_input_hdr, seq, content_type, (uint16_t)content_len);
 
     uint8_t expected_mac[48];
     {
@@ -3943,16 +4012,12 @@ static void tls12_encrypt_and_send_chacha(int fd, uint8_t content_type,
                                             uint64_t seq) {
     if(seq==UINT64_MAX) die("sequence number overflow");
     uint8_t nonce[12];
-    memcpy(nonce,write_iv,12);
-    for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
+    make_nonce(nonce,write_iv,seq);
 
     uint8_t aad[13];
-    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
-    aad[8]=content_type;
-    aad[9]=(TLS_VERSION_12>>8); aad[10]=(TLS_VERSION_12&0xFF);
-    PUT16(aad+11,(uint16_t)len);
+    build_tls12_aad(aad, seq, content_type, (uint16_t)len);
 
-    if(len>16384) die("TLS 1.2 ChaCha record too large");
+    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.2 ChaCha record too large");
     uint8_t *ct=malloc(len);
     if(!ct) die("malloc failed");
     uint8_t tag[CHACHA20_POLY1305_TAG_LEN];
@@ -3979,14 +4044,10 @@ static int tls12_decrypt_record_chacha(const uint8_t *rec, size_t rec_len,
     const uint8_t *tag=rec+ct_len;
 
     uint8_t nonce[12];
-    memcpy(nonce,read_iv,12);
-    for(int i=0;i<8;i++) nonce[11-i]^=(seq>>(8*i))&0xFF;
+    make_nonce(nonce,read_iv,seq);
 
     uint8_t aad[13];
-    for(int i=7;i>=0;i--) aad[7-i]=(seq>>(8*i))&0xFF;
-    aad[8]=content_type;
-    aad[9]=(TLS_VERSION_12>>8); aad[10]=(TLS_VERSION_12&0xFF);
-    PUT16(aad+11,(uint16_t)ct_len);
+    build_tls12_aad(aad, seq, content_type, (uint16_t)ct_len);
 
     int r=chacha20_poly1305_decrypt(read_key,nonce,aad,13,rec,ct_len,pt,tag);
     if(r<0) return -1;
@@ -3998,29 +4059,29 @@ static int tls12_decrypt_record_chacha(const uint8_t *rec, size_t rec_len,
  * TLS 1.2 cipher dispatch helpers
  * ================================================================ */
 static void tls12_send_encrypted(int fd, uint8_t ct, const uint8_t *pt, size_t len,
-                                 int is_cbc, int is_chacha,
+                                 cipher_mode_t mode,
                                  const uint8_t *wk, size_t key_len,
                                  const uint8_t *mk, size_t mk_len,
                                  const hash_alg *mac_alg,
                                  const uint8_t *wiv, uint64_t seq) {
-    if(is_cbc)
+    if(mode==CIPHER_CBC)
         tls12_encrypt_and_send_cbc(fd,ct,pt,len,wk,key_len,mk,mk_len,mac_alg,seq);
-    else if(is_chacha)
+    else if(mode==CIPHER_CHACHA)
         tls12_encrypt_and_send_chacha(fd,ct,pt,len,wk,wiv,seq);
     else
         tls12_encrypt_and_send(fd,ct,pt,len,wk,wiv,seq,key_len);
 }
 
 static int tls12_recv_decrypt(const uint8_t *rec, size_t rec_len, uint8_t ct,
-                              int is_cbc, int is_chacha,
+                              cipher_mode_t mode,
                               const uint8_t *rk, size_t key_len,
                               const uint8_t *mk, size_t mk_len,
                               const hash_alg *mac_alg,
                               const uint8_t *riv, uint64_t seq,
                               uint8_t *pt, size_t *pt_len) {
-    if(is_cbc)
+    if(mode==CIPHER_CBC)
         return tls12_decrypt_record_cbc(rec,rec_len,ct,rk,key_len,mk,mk_len,mac_alg,seq,pt,pt_len);
-    else if(is_chacha)
+    else if(mode==CIPHER_CHACHA)
         return tls12_decrypt_record_chacha(rec,rec_len,ct,rk,riv,seq,pt,pt_len);
     else
         return tls12_decrypt_record(rec,rec_len,ct,rk,riv,seq,pt,pt_len,key_len);
@@ -4032,30 +4093,30 @@ static int tls12_recv_decrypt(const uint8_t *rec, size_t rec_len, uint8_t ct,
 static int verify_sig_algo(uint16_t algo, const uint8_t *data, size_t data_len,
                            const uint8_t *sig, size_t sig_len,
                            const x509_cert *leaf) {
-    if(algo==0x0403) { /* ecdsa_secp256r1_sha256: curve=P-256, hash=SHA-256 */
+    if(algo==TLS_SIG_ECDSA_SECP256R1_SHA256) {
         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(data,data_len,h);
         if(leaf->key_type==1 && leaf->pubkey_len==P256_POINT_LEN)
             return ecdsa_p256_verify(h,SHA256_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
-    } else if(algo==0x0503) { /* ecdsa_secp384r1_sha384: curve=P-384, hash=SHA-384 */
+    } else if(algo==TLS_SIG_ECDSA_SECP384R1_SHA384) {
         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(data,data_len,h);
         if(leaf->key_type==1 && leaf->pubkey_len==P384_POINT_LEN)
             return ecdsa_p384_verify(h,SHA384_DIGEST_LEN,sig,sig_len,leaf->pubkey,leaf->pubkey_len);
-    } else if(algo==0x0401) { /* rsa_pkcs1_sha256 */
+    } else if(algo==TLS_SIG_RSA_PKCS1_SHA256) {
         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(data,data_len,h);
         if(leaf->key_type==2)
             return rsa_pkcs1_verify(h,SHA256_DIGEST_LEN,DI_SHA256,sizeof(DI_SHA256),
                 sig,sig_len,leaf->rsa_n,leaf->rsa_n_len,leaf->rsa_e,leaf->rsa_e_len);
-    } else if(algo==0x0804) { /* rsa_pss_rsae_sha256 */
+    } else if(algo==TLS_SIG_RSA_PSS_SHA256) {
         uint8_t h[SHA256_DIGEST_LEN]; sha256_hash(data,data_len,h);
         if(leaf->key_type==2)
             return rsa_pss_verify(h,SHA256_DIGEST_LEN,sha256_hash,
                 sig,sig_len,leaf->rsa_n,leaf->rsa_n_len,leaf->rsa_e,leaf->rsa_e_len);
-    } else if(algo==0x0805) { /* rsa_pss_rsae_sha384 */
+    } else if(algo==TLS_SIG_RSA_PSS_SHA384) {
         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(data,data_len,h);
         if(leaf->key_type==2)
             return rsa_pss_verify(h,SHA384_DIGEST_LEN,sha384_hash,
                 sig,sig_len,leaf->rsa_n,leaf->rsa_n_len,leaf->rsa_e,leaf->rsa_e_len);
-    } else if(algo==0x0501) { /* rsa_pkcs1_sha384 */
+    } else if(algo==TLS_SIG_RSA_PKCS1_SHA384) {
         uint8_t h[SHA384_DIGEST_LEN]; sha384_hash(data,data_len,h);
         if(leaf->key_type==2)
             return rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,DI_SHA384,sizeof(DI_SHA384),
@@ -4096,22 +4157,27 @@ typedef struct {
 } tls12_keys;
 
 static void tls12_derive_keys(tls12_keys *k, uint16_t cipher_suite,
-                              int is_cbc, int is_chacha,
+                              cipher_mode_t mode,
                               const uint8_t *shared, size_t shared_len,
                               const uint8_t client_random[32],
                               const uint8_t server_random[32]) {
-    k->is_aes256 = (cipher_suite==0xC02C || cipher_suite==0xC030
-                 || cipher_suite==0x009D || cipher_suite==0xC014
-                 || cipher_suite==0x0035 || cipher_suite==0xC00A);
-    k->prf_is_sha384 = (cipher_suite==0xC02C || cipher_suite==0xC030 || cipher_suite==0x009D);
+    k->is_aes256 = (cipher_suite==TLS_ECDHE_ECDSA_AES256_GCM
+                 || cipher_suite==TLS_ECDHE_RSA_AES256_GCM
+                 || cipher_suite==TLS_RSA_AES256_GCM
+                 || cipher_suite==TLS_ECDHE_RSA_AES256_CBC
+                 || cipher_suite==TLS_RSA_AES256_CBC
+                 || cipher_suite==TLS_ECDHE_ECDSA_AES256_CBC);
+    k->prf_is_sha384 = (cipher_suite==TLS_ECDHE_ECDSA_AES256_GCM
+                      || cipher_suite==TLS_ECDHE_RSA_AES256_GCM
+                      || cipher_suite==TLS_RSA_AES256_GCM);
     k->alg = k->prf_is_sha384 ? &SHA384_ALG : &SHA256_ALG;
-    if(is_chacha) k->key_len=32;
+    if(mode==CIPHER_CHACHA) k->key_len=32;
     else k->key_len = k->is_aes256 ? AES256_KEY_LEN : AES128_KEY_LEN;
-    k->mac_key_len = is_cbc ? SHA1_DIGEST_LEN : 0;
-    if(is_cbc) k->iv_len=16;
-    else if(is_chacha) k->iv_len=12;
+    k->mac_key_len = (mode==CIPHER_CBC) ? SHA1_DIGEST_LEN : 0;
+    if(mode==CIPHER_CBC) k->iv_len=AES_BLOCK_SIZE;
+    else if(mode==CIPHER_CHACHA) k->iv_len=12;
     else k->iv_len=4;
-    k->mac_alg = is_cbc ? &SHA1_ALG : NULL;
+    k->mac_alg = (mode==CIPHER_CBC) ? &SHA1_ALG : NULL;
 
     uint8_t pms_seed[64];
     memcpy(pms_seed, client_random, 32);
@@ -4142,50 +4208,32 @@ static void tls12_derive_keys(tls12_keys *k, uint16_t cipher_suite,
 }
 
 /* ================================================================
- * TLS 1.2 Handshake
+ * TLS 1.2 Handshake Helpers
  * ================================================================ */
-static void tls12_handshake(const tls_conn *conn) {
-    int fd = conn->fd;
-    const char *host = conn->host;
-    uint16_t cipher_suite = conn->cipher_suite;
-    uint8_t client_random[32], server_random[32];
-    memcpy(client_random, conn->client_random, 32);
-    memcpy(server_random, conn->server_random, 32);
-    uint8_t p256_priv[P256_SCALAR_LEN], p256_pub[P256_POINT_LEN];
-    memcpy(p256_priv, conn->p256_priv, P256_SCALAR_LEN);
-    memcpy(p256_pub, conn->p256_pub, P256_POINT_LEN);
-    uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
-    memcpy(p384_priv, conn->p384_priv, P384_SCALAR_LEN);
-    memcpy(p384_pub, conn->p384_pub, P384_POINT_LEN);
-    sha256_ctx transcript = conn->transcript;
-    sha384_ctx transcript384 = conn->transcript384;
+typedef struct {
+    uint8_t *cert_msg;       /* heap-allocated, caller frees */
+    size_t cert_msg_len;
+    uint8_t ske_pubkey[P384_POINT_LEN];
+    uint16_t ske_curve;
+} tls12_server_params;
 
-    uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub[X25519_KEY_LEN];
-    memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
-    memcpy(x25519_pub, conn->x25519_pub, X25519_KEY_LEN);
-
-    int is_rsa_kex = (cipher_suite==0x009D || cipher_suite==0x009C
-                   || cipher_suite==0x0035 || cipher_suite==0x002F);
-    int is_cbc = (cipher_suite==0xC014 || cipher_suite==0xC013
-               || cipher_suite==0x0035 || cipher_suite==0x002F
-               || cipher_suite==0xC00A || cipher_suite==0xC009);
-    int is_chacha = (cipher_suite==0xCCA8 || cipher_suite==0xCCA9);
-    printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
-           is_rsa_kex?" RSA-kex":"", is_cbc?" CBC":"", is_chacha?" ChaCha20":"");
-
-    /* Read plaintext handshake messages */
+/* Phase 1: Read Certificate, ServerKeyExchange, ServerHelloDone */
+static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
+                                    sha384_ctx *transcript384,
+                                    const uint8_t *leftover, size_t leftover_len,
+                                    int is_rsa_kex,
+                                    const uint8_t client_random[32],
+                                    const uint8_t server_random[32],
+                                    const char *host,
+                                    tls12_server_params *out) {
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype;
     uint8_t hs12_buf[HS_BUF_SIZE]; size_t hs12_len=0;
     int got_server_done=0;
-    uint8_t *cert12_msg=NULL; size_t cert12_msg_len=0;
-    uint8_t ske_pubkey[P384_POINT_LEN];
-    uint16_t ske_curve=0;
 
-    /* Carry leftover handshake data from ServerHello record */
-    if(conn->sh_leftover>0 && conn->sh_leftover<=sizeof(hs12_buf)) {
-        memcpy(hs12_buf, conn->sh_leftover_data, conn->sh_leftover);
-        hs12_len=conn->sh_leftover;
+    if(leftover_len>0 && leftover_len<=sizeof(hs12_buf)) {
+        memcpy(hs12_buf, leftover, leftover_len);
+        hs12_len=leftover_len;
     }
 
     while(!got_server_done) {
@@ -4203,72 +4251,85 @@ static void tls12_handshake(const tls_conn *conn) {
             if(pos+4+mlen>hs12_len) break;
             size_t msg_total=4+mlen;
 
-            sha256_update(&transcript, hs12_buf+pos, msg_total);
-            sha384_update(&transcript384, hs12_buf+pos, msg_total);
+            sha256_update(transcript, hs12_buf+pos, msg_total);
+            sha384_update(transcript384, hs12_buf+pos, msg_total);
 
             switch(mtype) {
                 case 11: /* Certificate */
                     printf("  Certificate (%u bytes)\n",(unsigned)mlen);
-                    free(cert12_msg);
-                    cert12_msg=malloc(mlen);
-                    if(!cert12_msg) die("malloc failed");
-                    memcpy(cert12_msg, hs12_buf+pos+4, mlen);
-                    cert12_msg_len=mlen;
+                    free(out->cert_msg);
+                    out->cert_msg=malloc(mlen);
+                    if(!out->cert_msg) die("malloc failed");
+                    memcpy(out->cert_msg, hs12_buf+pos+4, mlen);
+                    out->cert_msg_len=mlen;
                     break;
-                case 12: { /* ServerKeyExchange (not sent for RSA key transport) */
-                    if(is_rsa_kex) die("unexpected ServerKeyExchange for RSA key transport");
+                case 12: { /* ServerKeyExchange */
+                    if(is_rsa_kex)
+                        die("unexpected ServerKeyExchange for RSA key transport");
                     printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
                     if(mlen<8) die("ServerKeyExchange too short");
                     const uint8_t *ske=hs12_buf+pos+4;
                     if(ske[0]!=0x03) die("expected named_curve type in SKE");
-                    ske_curve=GET16(ske+1);
+                    out->ske_curve=GET16(ske+1);
                     uint8_t pk_len=ske[3];
-                    if(ske_curve==TLS_GROUP_X25519) {
-                        if(pk_len!=X25519_KEY_LEN) die("expected 32-byte X25519 key");
-                    } else if(ske_curve==TLS_GROUP_SECP256R1) {
-                        if(pk_len!=P256_POINT_LEN) die("expected uncompressed P-256 point");
-                    } else if(ske_curve==TLS_GROUP_SECP384R1) {
-                        if(pk_len!=P384_POINT_LEN) die("expected uncompressed P-384 point");
+                    if(out->ske_curve==TLS_GROUP_X25519) {
+                        if(pk_len!=X25519_KEY_LEN)
+                            die("expected 32-byte X25519 key");
+                    } else if(out->ske_curve==TLS_GROUP_SECP256R1) {
+                        if(pk_len!=P256_POINT_LEN)
+                            die("expected uncompressed P-256 point");
+                    } else if(out->ske_curve==TLS_GROUP_SECP384R1) {
+                        if(pk_len!=P384_POINT_LEN)
+                            die("expected uncompressed P-384 point");
                     } else die("unsupported curve in SKE");
                     if(4+(uint32_t)pk_len>mlen) die("SKE pubkey truncated");
-                    memcpy(ske_pubkey, ske+4, pk_len);
+                    memcpy(out->ske_pubkey, ske+4, pk_len);
 
                     size_t params_len=4+pk_len;
-                    if(params_len+4>mlen) die("SKE signature header truncated");
+                    if(params_len+4>mlen)
+                        die("SKE signature header truncated");
                     const uint8_t *sig_ptr=ske+params_len;
                     uint16_t sig_algo=GET16(sig_ptr); sig_ptr+=2;
                     uint16_t sig_len_val=GET16(sig_ptr); sig_ptr+=2;
-                    if(params_len+4+sig_len_val>mlen) die("SKE signature truncated");
+                    if(params_len+4+sig_len_val>mlen)
+                        die("SKE signature truncated");
 
-                    /* Validate sig algo against offered signature_algorithms */
-                    if(sig_algo!=0x0403 && sig_algo!=0x0503 &&
-                       sig_algo!=0x0804 && sig_algo!=0x0805 &&
-                       sig_algo!=0x0401 && sig_algo!=0x0501)
+                    if(sig_algo!=TLS_SIG_ECDSA_SECP256R1_SHA256 &&
+                       sig_algo!=TLS_SIG_ECDSA_SECP384R1_SHA384 &&
+                       sig_algo!=TLS_SIG_RSA_PSS_SHA256 &&
+                       sig_algo!=TLS_SIG_RSA_PSS_SHA384 &&
+                       sig_algo!=TLS_SIG_RSA_PKCS1_SHA256 &&
+                       sig_algo!=TLS_SIG_RSA_PKCS1_SHA384)
                         die("SKE signature algorithm not in offered list");
 
-                    /* Signed data: client_random || server_random || params */
                     uint8_t signed_data[256];
                     memcpy(signed_data, client_random, 32);
                     memcpy(signed_data+32, server_random, 32);
                     memcpy(signed_data+64, ske, params_len);
                     size_t signed_len=64+params_len;
 
-                    /* Parse leaf cert for verification */
-                    if(!cert12_msg) die("Certificate must precede ServerKeyExchange");
-                    if(cert12_msg_len<6) die("Certificate message too short");
-                    const uint8_t *cp=cert12_msg;
+                    if(!out->cert_msg)
+                        die("Certificate must precede ServerKeyExchange");
+                    if(out->cert_msg_len<6)
+                        die("Certificate message too short");
+                    const uint8_t *cp=out->cert_msg;
                     uint32_t list_len12=GET24(cp); cp+=3;
-                    if(3+list_len12>cert12_msg_len) die("Certificate list length exceeds message");
+                    if(3+list_len12>out->cert_msg_len)
+                        die("Certificate list length exceeds message");
                     if(list_len12<3) die("Certificate list too short");
                     uint32_t first_cert_len=GET24(cp); cp+=3;
-                    if(6+first_cert_len>cert12_msg_len) die("First certificate exceeds message");
+                    if(6+first_cert_len>out->cert_msg_len)
+                        die("First certificate exceeds message");
                     x509_cert leaf;
-                    if(x509_parse(&leaf,cp,first_cert_len)!=0) die("Failed to parse leaf cert");
+                    if(x509_parse(&leaf,cp,first_cert_len)!=0)
+                        die("Failed to parse leaf cert");
 
-                    int sig_ok=verify_sig_algo(sig_algo,signed_data,signed_len,
-                        sig_ptr,sig_len_val,&leaf);
-                    if(!sig_ok) die("ServerKeyExchange signature verification failed");
-                    printf("    SKE signature verified (algo=0x%04x)\n",sig_algo);
+                    int sig_ok=verify_sig_algo(sig_algo,signed_data,
+                        signed_len,sig_ptr,sig_len_val,&leaf);
+                    if(!sig_ok)
+                        die("ServerKeyExchange signature verification failed");
+                    printf("    SKE signature verified (algo=0x%04x)\n",
+                           sig_algo);
                     break;
                 }
                 case 14: /* ServerHelloDone */
@@ -4276,7 +4337,8 @@ static void tls12_handshake(const tls_conn *conn) {
                     got_server_done=1;
                     break;
                 default:
-                    printf("  TLS 1.2 handshake msg type %d (%u bytes)\n",mtype,(unsigned)mlen);
+                    printf("  TLS 1.2 handshake msg type %d (%u bytes)\n",
+                           mtype,(unsigned)mlen);
                     break;
             }
             pos+=msg_total;
@@ -4289,104 +4351,124 @@ static void tls12_handshake(const tls_conn *conn) {
         }
     }
 
-    /* Validate certificate chain */
-    if(cert12_msg) {
+    if(out->cert_msg) {
         printf("  Validating certificate chain...\n");
-        if(verify_cert_chain(cert12_msg,cert12_msg_len,host,0)<0)
+        if(verify_cert_chain(out->cert_msg,out->cert_msg_len,host,0)<0)
             die("Certificate verification failed");
     }
+}
 
-    /* Send ClientKeyExchange */
+/* Phase 2: Send ClientKeyExchange, compute shared secret, derive keys */
+static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
+                                   sha384_ctx *transcript384,
+                                   const tls12_server_params *srv,
+                                   uint16_t cipher_suite, cipher_mode_t mode,
+                                   int is_rsa_kex,
+                                   uint8_t p256_priv[P256_SCALAR_LEN],
+                                   const uint8_t p256_pub[P256_POINT_LEN],
+                                   uint8_t p384_priv[P384_SCALAR_LEN],
+                                   const uint8_t p384_pub[P384_POINT_LEN],
+                                   uint8_t x25519_priv[X25519_KEY_LEN],
+                                   const uint8_t x25519_pub[X25519_KEY_LEN],
+                                   const uint8_t client_random[32],
+                                   const uint8_t server_random[32],
+                                   tls12_keys *tk) {
     uint8_t ss12[P384_SCALAR_LEN]; size_t ss12_len;
     if(is_rsa_kex) {
-        /* RSA key transport: encrypt PMS with server's RSA public key */
-        if(!cert12_msg) die("No certificate for RSA key exchange");
-        if(cert12_msg_len<6) die("Certificate message too short");
-        const uint8_t *cp2=cert12_msg;
+        if(!srv->cert_msg) die("No certificate for RSA key exchange");
+        if(srv->cert_msg_len<6) die("Certificate message too short");
+        const uint8_t *cp2=srv->cert_msg;
         uint32_t ll2=GET24(cp2); cp2+=3;
-        if(3+ll2>cert12_msg_len) die("cert list length");
+        if(3+ll2>srv->cert_msg_len) die("cert list length");
         if(ll2<3) die("cert list too short");
         uint32_t cl2=GET24(cp2); cp2+=3;
-        if(6+cl2>cert12_msg_len) die("first cert exceeds message");
+        if(6+cl2>srv->cert_msg_len) die("first cert exceeds message");
         x509_cert leaf;
-        if(x509_parse(&leaf,cp2,cl2)!=0) die("Failed to parse leaf cert for RSA kex");
+        if(x509_parse(&leaf,cp2,cl2)!=0)
+            die("Failed to parse leaf cert for RSA kex");
         if(leaf.key_type!=2) die("RSA key transport requires RSA cert");
 
         uint8_t pms[48];
-        pms[0]=0x03; pms[1]=0x03; /* TLS 1.2 version */
+        pms[0]=0x03; pms[1]=0x03;
         random_bytes(pms+2,46);
 
         uint8_t encrypted_pms[512];
-        if(rsa_encrypt(pms,48,leaf.rsa_n,leaf.rsa_n_len,leaf.rsa_e,leaf.rsa_e_len,encrypted_pms)<0)
+        if(rsa_encrypt(pms,48,leaf.rsa_n,leaf.rsa_n_len,
+                       leaf.rsa_e,leaf.rsa_e_len,encrypted_pms)<0)
             die("RSA encrypt failed");
 
         size_t enc_len=leaf.rsa_n_len;
         uint8_t cke[4+2+512];
         uint32_t cke_body_len=(uint32_t)(2+enc_len);
         cke[0]=0x10;
-        cke[1]=(cke_body_len>>16)&0xFF; cke[2]=(cke_body_len>>8)&0xFF; cke[3]=cke_body_len&0xFF;
+        cke[1]=(cke_body_len>>16)&0xFF;
+        cke[2]=(cke_body_len>>8)&0xFF;
+        cke[3]=cke_body_len&0xFF;
         PUT16(cke+4,(uint16_t)enc_len);
         memcpy(cke+6,encrypted_pms,enc_len);
         size_t cke_total=4+2+enc_len;
         tls_send_record(fd,TLS_RT_HANDSHAKE,cke,cke_total);
-        sha256_update(&transcript, cke, cke_total);
-        sha384_update(&transcript384, cke, cke_total);
+        sha256_update(transcript, cke, cke_total);
+        sha384_update(transcript384, cke, cke_total);
 
         memcpy(ss12,pms,48);
         ss12_len=48;
         secure_zero(pms,sizeof(pms));
-        printf("Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",enc_len);
-    } else if(ske_curve==TLS_GROUP_X25519) {
+        printf("Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",
+               enc_len);
+    } else if(srv->ske_curve==TLS_GROUP_X25519) {
         uint8_t cke[5+X25519_KEY_LEN];
-        cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=X25519_KEY_LEN+1; cke[4]=X25519_KEY_LEN;
+        cke[0]=0x10; cke[1]=0; cke[2]=0;
+        cke[3]=X25519_KEY_LEN+1; cke[4]=X25519_KEY_LEN;
         memcpy(cke+5, x25519_pub, X25519_KEY_LEN);
         tls_send_record(fd,TLS_RT_HANDSHAKE,cke,sizeof(cke));
-        sha256_update(&transcript, cke, sizeof(cke));
-        sha384_update(&transcript384, cke, sizeof(cke));
-        if(x25519_shared_secret(x25519_priv, ske_pubkey, ss12)<0)
+        sha256_update(transcript, cke, sizeof(cke));
+        sha384_update(transcript384, cke, sizeof(cke));
+        if(x25519_shared_secret(x25519_priv, srv->ske_pubkey, ss12)<0)
             die("X25519 shared secret is zero");
         ss12_len=X25519_KEY_LEN;
-        printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (X25519)\n");
-    } else if(ske_curve==TLS_GROUP_SECP256R1) {
+        printf("Sent ClientKeyExchange\n"
+               "Computed ECDHE shared secret (X25519)\n");
+    } else if(srv->ske_curve==TLS_GROUP_SECP256R1) {
         uint8_t cke[5+P256_POINT_LEN];
-        cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=P256_POINT_LEN+1; cke[4]=P256_POINT_LEN;
+        cke[0]=0x10; cke[1]=0; cke[2]=0;
+        cke[3]=P256_POINT_LEN+1; cke[4]=P256_POINT_LEN;
         memcpy(cke+5, p256_pub, P256_POINT_LEN);
         tls_send_record(fd,TLS_RT_HANDSHAKE,cke,sizeof(cke));
-        sha256_update(&transcript, cke, sizeof(cke));
-        sha384_update(&transcript384, cke, sizeof(cke));
-        ecdhe_p256_shared_secret(p256_priv, ske_pubkey, ss12);
+        sha256_update(transcript, cke, sizeof(cke));
+        sha384_update(transcript384, cke, sizeof(cke));
+        ecdhe_p256_shared_secret(p256_priv, srv->ske_pubkey, ss12);
         ss12_len=P256_SCALAR_LEN;
-        printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (P-256)\n");
+        printf("Sent ClientKeyExchange\n"
+               "Computed ECDHE shared secret (P-256)\n");
     } else {
         uint8_t cke[5+P384_POINT_LEN];
-        cke[0]=0x10; cke[1]=0; cke[2]=0; cke[3]=P384_POINT_LEN+1; cke[4]=P384_POINT_LEN;
+        cke[0]=0x10; cke[1]=0; cke[2]=0;
+        cke[3]=P384_POINT_LEN+1; cke[4]=P384_POINT_LEN;
         memcpy(cke+5, p384_pub, P384_POINT_LEN);
         tls_send_record(fd,TLS_RT_HANDSHAKE,cke,sizeof(cke));
-        sha256_update(&transcript, cke, sizeof(cke));
-        sha384_update(&transcript384, cke, sizeof(cke));
-        ecdhe_p384_shared_secret(p384_priv, ske_pubkey, ss12);
+        sha256_update(transcript, cke, sizeof(cke));
+        sha384_update(transcript384, cke, sizeof(cke));
+        ecdhe_p384_shared_secret(p384_priv, srv->ske_pubkey, ss12);
         ss12_len=P384_SCALAR_LEN;
-        printf("Sent ClientKeyExchange\nComputed ECDHE shared secret (P-384)\n");
+        printf("Sent ClientKeyExchange\n"
+               "Computed ECDHE shared secret (P-384)\n");
     }
-    secure_zero(p256_priv,sizeof(p256_priv));
-    secure_zero(p384_priv,sizeof(p384_priv));
-    secure_zero(x25519_priv,sizeof(x25519_priv));
+    secure_zero(p256_priv,P256_SCALAR_LEN);
+    secure_zero(p384_priv,P384_SCALAR_LEN);
+    secure_zero(x25519_priv,X25519_KEY_LEN);
 
-    /* TLS 1.2 key derivation */
-    tls12_keys tk;
-    tls12_derive_keys(&tk, cipher_suite, is_cbc, is_chacha, ss12, ss12_len,
+    tls12_derive_keys(tk, cipher_suite, mode, ss12, ss12_len,
                       client_random, server_random);
-    int prf_is_sha384 = tk.prf_is_sha384;
-    const hash_alg *alg = tk.alg;
-    size_t key_len = tk.key_len;
-    size_t mac_key_len = tk.mac_key_len;
-    const hash_alg *mac_alg = tk.mac_alg;
-    const uint8_t *c_wk=tk.c_wk, *s_wk=tk.s_wk;
-    const uint8_t *c_wiv=tk.c_wiv, *s_wiv=tk.s_wiv;
-    const uint8_t *c_mk=tk.c_mk, *s_mk=tk.s_mk;
-    const uint8_t *tls12_master=tk.master;
+    secure_zero(ss12,sizeof(ss12));
     printf("Derived TLS 1.2 traffic keys\n");
+}
 
+/* Phase 3: Exchange CCS and Finished messages */
+static void tls12_exchange_finished(int fd, cipher_mode_t mode,
+                                     const tls12_keys *tk,
+                                     sha256_ctx *transcript,
+                                     sha384_ctx *transcript384) {
     /* Send ChangeCipherSpec */
     { uint8_t ccs=1; tls_send_record(fd,TLS_RT_CCS,&ccs,1); }
     printf("Sent ChangeCipherSpec\n");
@@ -4395,16 +4477,17 @@ static void tls12_handshake(const tls_conn *conn) {
     {
         uint8_t th12[SHA384_DIGEST_LEN];
         size_t th12_len;
-        if(prf_is_sha384) {
-            sha384_ctx tc384=transcript384; sha384_final(&tc384,th12);
+        if(tk->prf_is_sha384) {
+            sha384_ctx tc384=*transcript384; sha384_final(&tc384,th12);
             th12_len=SHA384_DIGEST_LEN;
         } else {
-            sha256_ctx tc=transcript; sha256_final(&tc,th12);
+            sha256_ctx tc=*transcript; sha256_final(&tc,th12);
             th12_len=SHA256_DIGEST_LEN;
         }
 
         uint8_t verify_data[12];
-        tls12_prf_u(alg, tls12_master, 48, "client finished", th12, th12_len, verify_data, 12);
+        tls12_prf_u(tk->alg, tk->master, 48, "client finished",
+                    th12, th12_len, verify_data, 12);
 
         uint8_t fin_msg[16];
         fin_msg[0]=0x14;
@@ -4412,14 +4495,16 @@ static void tls12_handshake(const tls_conn *conn) {
         memcpy(fin_msg+4, verify_data, 12);
 
         tls12_send_encrypted(fd,TLS_RT_HANDSHAKE,fin_msg,16,
-            is_cbc,is_chacha,c_wk,key_len,c_mk,mac_key_len,mac_alg,c_wiv,0);
-        sha256_update(&transcript, fin_msg, 16);
-        sha384_update(&transcript384, fin_msg, 16);
+            mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
+            tk->mac_alg,tk->c_wiv,0);
+        sha256_update(transcript, fin_msg, 16);
+        sha384_update(transcript384, fin_msg, 16);
         printf("Sent Finished (encrypted)\n");
     }
 
     /* Receive ChangeCipherSpec */
-    rtype=tls_read_record(fd,rec,&rec_len);
+    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    int rtype=tls_read_record(fd,rec,&rec_len);
     if(rtype!=TLS_RT_CCS) die("expected ChangeCipherSpec from server");
     printf("Received ChangeCipherSpec\n");
 
@@ -4429,41 +4514,50 @@ static void tls12_handshake(const tls_conn *conn) {
     {
         uint8_t pt12[256]; size_t pt12_len;
         int dec_ok=tls12_recv_decrypt(rec,rec_len,TLS_RT_HANDSHAKE,
-            is_cbc,is_chacha,s_wk,key_len,s_mk,mac_key_len,mac_alg,s_wiv,0,pt12,&pt12_len);
+            mode,tk->s_wk,tk->key_len,tk->s_mk,tk->mac_key_len,
+            tk->mac_alg,tk->s_wiv,0,pt12,&pt12_len);
         if(dec_ok<0) die("Failed to decrypt server Finished");
         if(pt12[0]!=0x14) die("expected Finished message type");
-        if(pt12_len<4||GET24(pt12+1)!=12) die("Server Finished length mismatch");
+        if(pt12_len<4||GET24(pt12+1)!=12)
+            die("Server Finished length mismatch");
 
         uint8_t th12_sf[SHA384_DIGEST_LEN];
         size_t th12_sf_len;
-        if(prf_is_sha384) {
-            sha384_ctx tc384=transcript384; sha384_final(&tc384,th12_sf);
+        if(tk->prf_is_sha384) {
+            sha384_ctx tc384=*transcript384; sha384_final(&tc384,th12_sf);
             th12_sf_len=SHA384_DIGEST_LEN;
         } else {
-            sha256_ctx tc=transcript; sha256_final(&tc,th12_sf);
+            sha256_ctx tc=*transcript; sha256_final(&tc,th12_sf);
             th12_sf_len=SHA256_DIGEST_LEN;
         }
         uint8_t expected[12];
-        tls12_prf_u(alg, tls12_master, 48, "server finished", th12_sf, th12_sf_len, expected, 12);
-        if(!ct_memeq(expected, pt12+4, 12)) die("Server Finished verify failed!");
+        tls12_prf_u(tk->alg, tk->master, 48, "server finished",
+                    th12_sf, th12_sf_len, expected, 12);
+        if(!ct_memeq(expected, pt12+4, 12))
+            die("Server Finished verify failed!");
         printf("Server Finished VERIFIED\n");
     }
+}
 
-    /* Send HTTP GET */
+/* Phase 4: Application data transfer */
+static void tls12_transfer_appdata(int fd, const char *path, const char *host,
+                                    cipher_mode_t mode, const tls12_keys *tk) {
     uint64_t c12_seq=1;
     {
-        const char *path = conn->path;
         char req[REQ_BUF_SIZE];
         int rlen=snprintf(req,sizeof(req),
-            "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
+            "GET %s HTTP/1.1\r\nHost: %s\r\n"
+            "Connection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
         tls12_send_encrypted(fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
-            is_cbc,is_chacha,c_wk,key_len,c_mk,mac_key_len,mac_alg,c_wiv,c12_seq++);
+            mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
+            tk->mac_alg,tk->c_wiv,c12_seq++);
         printf("Sent HTTP GET %s\n\n",path);
     }
 
-    /* Receive HTTP response */
     uint64_t s12_seq=1;
+    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    int rtype;
     printf("=== HTTP Response ===\n");
     for(;;) {
         rtype=tls_read_record(fd,rec,&rec_len);
@@ -4471,10 +4565,11 @@ static void tls12_handshake(const tls_conn *conn) {
         if(rtype==TLS_RT_APPDATA) {
             uint8_t pt12[REC_BUF_SIZE]; size_t pt12_len;
             int dec_ok2=tls12_recv_decrypt(rec,rec_len,TLS_RT_APPDATA,
-                is_cbc,is_chacha,s_wk,key_len,s_mk,mac_key_len,
-                mac_alg,s_wiv,s12_seq++,pt12,&pt12_len);
+                mode,tk->s_wk,tk->key_len,tk->s_mk,tk->mac_key_len,
+                tk->mac_alg,tk->s_wiv,s12_seq++,pt12,&pt12_len);
             if(dec_ok2<0) {
-                fprintf(stderr,"Decrypt failed at seq %llu\n",(unsigned long long)(s12_seq-1));
+                fprintf(stderr,"Decrypt failed at seq %llu\n",
+                        (unsigned long long)(s12_seq-1));
                 break;
             }
             fwrite(pt12,1,pt12_len,stdout);
@@ -4485,19 +4580,66 @@ static void tls12_handshake(const tls_conn *conn) {
             break;
         }
     }
-    /* Send close_notify */
-    {   const uint8_t alert[2]={1,0};
-        tls12_send_encrypted(fd,TLS_RT_ALERT,alert,2,
-            is_cbc,is_chacha,c_wk,key_len,c_mk,mac_key_len,mac_alg,c_wiv,c12_seq++);
-    }
+    { const uint8_t alert[2]={1,0};
+      tls12_send_encrypted(fd,TLS_RT_ALERT,alert,2,
+          mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
+          tk->mac_alg,tk->c_wiv,c12_seq++); }
     printf("\n=== Done ===\n");
+}
 
-    free(cert12_msg);
-    secure_zero(ss12,sizeof(ss12));
+/* ================================================================
+ * TLS 1.2 Handshake
+ * ================================================================ */
+static void tls12_handshake(const tls_conn *conn) {
+    int fd = conn->fd;
+    const char *host = conn->host;
+    uint16_t cipher_suite = conn->cipher_suite;
+    uint8_t client_random[32], server_random[32];
+    memcpy(client_random, conn->client_random, 32);
+    memcpy(server_random, conn->server_random, 32);
+    uint8_t p256_priv[P256_SCALAR_LEN], p256_pub[P256_POINT_LEN];
+    memcpy(p256_priv, conn->p256_priv, P256_SCALAR_LEN);
+    memcpy(p256_pub, conn->p256_pub, P256_POINT_LEN);
+    uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
+    memcpy(p384_priv, conn->p384_priv, P384_SCALAR_LEN);
+    memcpy(p384_pub, conn->p384_pub, P384_POINT_LEN);
+    uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub[X25519_KEY_LEN];
+    memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
+    memcpy(x25519_pub, conn->x25519_pub, X25519_KEY_LEN);
+    sha256_ctx transcript = conn->transcript;
+    sha384_ctx transcript384 = conn->transcript384;
+
+    int is_rsa_kex = (cipher_suite==TLS_RSA_AES256_GCM
+                   || cipher_suite==TLS_RSA_AES128_GCM
+                   || cipher_suite==TLS_RSA_AES256_CBC
+                   || cipher_suite==TLS_RSA_AES128_CBC);
+    cipher_mode_t mode = cipher_mode_of(cipher_suite);
+    printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
+           is_rsa_kex?" RSA-kex":"", mode==CIPHER_CBC?" CBC":"",
+           mode==CIPHER_CHACHA?" ChaCha20":"");
+
+    /* Phase 1: Read Certificate, ServerKeyExchange, ServerHelloDone */
+    tls12_server_params srv;
+    memset(&srv,0,sizeof(srv));
+    tls12_read_server_msgs(fd, &transcript, &transcript384,
+        conn->sh_leftover_data, conn->sh_leftover,
+        is_rsa_kex, client_random, server_random, host, &srv);
+
+    /* Phase 2: Key exchange and derivation */
+    tls12_keys tk;
+    tls12_do_key_exchange(fd, &transcript, &transcript384, &srv,
+        cipher_suite, mode, is_rsa_kex,
+        p256_priv, p256_pub, p384_priv, p384_pub,
+        x25519_priv, x25519_pub, client_random, server_random, &tk);
+
+    /* Phase 3: Exchange CCS and Finished */
+    tls12_exchange_finished(fd, mode, &tk, &transcript, &transcript384);
+
+    /* Phase 4: Application data */
+    tls12_transfer_appdata(fd, conn->path, host, mode, &tk);
+
+    free(srv.cert_msg);
     secure_zero(&tk,sizeof(tk));
-    secure_zero(p384_priv,sizeof(p384_priv));
-    secure_zero(p256_priv,sizeof(p256_priv));
-    secure_zero(x25519_priv,sizeof(x25519_priv));
     close(fd);
 }
 
@@ -4516,12 +4658,400 @@ static void tls13_transcript_hash(int is_aes256,
 }
 
 /* ================================================================
+ * TLS 1.3 Handshake Helpers
+ * ================================================================ */
+typedef struct {
+    int fd;
+    const char *host, *path;
+    int is_aes256;
+    cipher_mode_t mode;
+    const hash_alg *alg;
+    size_t hash_len, kl;
+    sha256_ctx transcript;
+    sha384_ctx transcript384;
+    /* Handshake secrets and keys */
+    uint8_t hs_secret[SHA384_DIGEST_LEN];
+    uint8_t s_hs_key[AES256_KEY_LEN], s_hs_iv[AES_GCM_NONCE_LEN];
+    uint8_t c_hs_key[AES256_KEY_LEN], c_hs_iv[AES_GCM_NONCE_LEN];
+    uint8_t s_hs_traffic[SHA384_DIGEST_LEN], c_hs_traffic[SHA384_DIGEST_LEN];
+    /* Encrypted handshake outputs */
+    uint8_t *cert_msg;
+    size_t cert_msg_len;
+    int got_cert_request;
+    /* Application keys */
+    uint8_t s_ap_key[AES256_KEY_LEN], s_ap_iv[AES_GCM_NONCE_LEN];
+    uint8_t c_ap_key[AES256_KEY_LEN], c_ap_iv[AES_GCM_NONCE_LEN];
+    uint8_t s_ap_traffic[SHA384_DIGEST_LEN], c_ap_traffic[SHA384_DIGEST_LEN];
+} tls13_hs_state;
+
+/* Phase 1: Derive handshake traffic keys from shared secret */
+static void tls13_derive_hs_keys(tls13_hs_state *st,
+                                  const uint8_t *shared, size_t shared_len) {
+    const hash_alg *alg=st->alg;
+    uint8_t early_secret[SHA384_DIGEST_LEN];
+    { const uint8_t z[SHA384_DIGEST_LEN]={0};
+      hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret); }
+    uint8_t derived1[SHA384_DIGEST_LEN];
+    { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
+      hkdf_expand_label_u(alg,early_secret,"derived",empty_hash,
+          alg->digest_len,derived1,alg->digest_len); }
+    hkdf_extract_u(alg,derived1,alg->digest_len,
+                   shared,shared_len,st->hs_secret);
+
+    uint8_t th1[SHA384_DIGEST_LEN];
+    tls13_transcript_hash(st->is_aes256,&st->transcript,&st->transcript384,th1);
+
+    hkdf_expand_label_u(alg,st->hs_secret,"s hs traffic",th1,
+        alg->digest_len,st->s_hs_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,st->hs_secret,"c hs traffic",th1,
+        alg->digest_len,st->c_hs_traffic,alg->digest_len);
+
+    hkdf_expand_label_u(alg,st->s_hs_traffic,"key",NULL,0,st->s_hs_key,st->kl);
+    hkdf_expand_label_u(alg,st->s_hs_traffic,"iv",
+                        NULL,0,st->s_hs_iv,AES_GCM_NONCE_LEN);
+    hkdf_expand_label_u(alg,st->c_hs_traffic,"key",NULL,0,st->c_hs_key,st->kl);
+    hkdf_expand_label_u(alg,st->c_hs_traffic,"iv",
+                        NULL,0,st->c_hs_iv,AES_GCM_NONCE_LEN);
+    printf("Derived handshake traffic keys\n");
+
+    secure_zero(early_secret,sizeof(early_secret));
+    secure_zero(derived1,sizeof(derived1));
+}
+
+/* Phase 2: Process encrypted handshake messages until server Finished */
+static void tls13_process_encrypted_hs(tls13_hs_state *st) {
+    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    int rtype;
+    uint64_t s_hs_seq=0;
+    uint8_t hs_buf[HS_BUF_SIZE]; size_t hs_buf_len=0;
+
+    /* May get a ChangeCipherSpec first (compat) */
+    rtype=tls_read_record(st->fd,rec,&rec_len);
+    if(rtype==TLS_RT_CCS)
+        rtype=tls_read_record(st->fd,rec,&rec_len);
+
+    int got_finished=0, got_cert_verify=0;
+    while(!got_finished) {
+        if(rtype!=TLS_RT_APPDATA) die("expected encrypted record");
+        uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
+        int inner=decrypt_record(rec,rec_len,st->s_hs_key,st->s_hs_iv,
+            s_hs_seq++,pt,&pt_len,st->mode,st->kl);
+        if(inner!=TLS_RT_HANDSHAKE)
+            die("expected handshake inside encrypted record");
+
+        if(hs_buf_len+pt_len>sizeof(hs_buf))
+            die("TLS 1.3 handshake buffer overflow");
+        memcpy(hs_buf+hs_buf_len,pt,pt_len);
+        hs_buf_len+=pt_len;
+
+        size_t pos=0;
+        while(pos+4<=hs_buf_len) {
+            uint8_t mtype=hs_buf[pos];
+            uint32_t mlen=GET24(hs_buf+pos+1);
+            if(pos+4+mlen>hs_buf_len) break;
+            size_t msg_total=4+mlen;
+
+            switch(mtype) {
+                case 8: /* EncryptedExtensions */
+                    printf("  EncryptedExtensions (%u bytes)\n",
+                           (unsigned)mlen);
+                    if(st->is_aes256)
+                        sha384_update(&st->transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&st->transcript,hs_buf+pos,msg_total);
+                    break;
+                case 11: /* Certificate */
+                    printf("  Certificate (%u bytes)\n",(unsigned)mlen);
+                    if(st->is_aes256)
+                        sha384_update(&st->transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&st->transcript,hs_buf+pos,msg_total);
+                    free(st->cert_msg);
+                    st->cert_msg=malloc(mlen);
+                    if(!st->cert_msg) die("malloc failed");
+                    memcpy(st->cert_msg,hs_buf+pos+4,mlen);
+                    st->cert_msg_len=mlen;
+                    break;
+                case 13: /* CertificateRequest */
+                    printf("  CertificateRequest (%u bytes)\n",
+                           (unsigned)mlen);
+                    if(st->is_aes256)
+                        sha384_update(&st->transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&st->transcript,hs_buf+pos,msg_total);
+                    st->got_cert_request=1;
+                    break;
+                case 15: { /* CertificateVerify */
+                    printf("  CertificateVerify (%u bytes)\n",
+                           (unsigned)mlen);
+                    if(st->cert_msg){
+                        printf("  Validating certificate chain...\n");
+                        if(verify_cert_chain(st->cert_msg,st->cert_msg_len,
+                                             st->host,1)<0)
+                            die("Certificate verification failed");
+                    }
+                    if(mlen<4) die("CertificateVerify too short");
+                    const uint8_t *cv=hs_buf+pos+4;
+                    uint16_t cv_algo=GET16(cv);
+                    uint16_t cv_sig_len=GET16(cv+2);
+                    if(4+(uint32_t)cv_sig_len>mlen)
+                        die("CertificateVerify sig length mismatch");
+                    const uint8_t *cv_sig=cv+4;
+
+                    if(cv_algo!=TLS_SIG_ECDSA_SECP256R1_SHA256 &&
+                       cv_algo!=TLS_SIG_ECDSA_SECP384R1_SHA384 &&
+                       cv_algo!=TLS_SIG_RSA_PSS_SHA256 &&
+                       cv_algo!=TLS_SIG_RSA_PSS_SHA384)
+                        die("CertificateVerify uses sig algo not in offered list");
+
+                    uint8_t th_cv[SHA384_DIGEST_LEN];
+                    tls13_transcript_hash(st->is_aes256,&st->transcript,
+                                          &st->transcript384,th_cv);
+
+                    size_t cv_content_len=64+33+1+st->hash_len;
+                    uint8_t cv_content[64+33+1+SHA384_DIGEST_LEN];
+                    memset(cv_content,0x20,64);
+                    memcpy(cv_content+64,
+                           "TLS 1.3, server CertificateVerify",33);
+                    cv_content[97]=0x00;
+                    memcpy(cv_content+98,th_cv,st->hash_len);
+
+                    if(!st->cert_msg)
+                        die("No certificate for CertificateVerify");
+                    const uint8_t *cp2=st->cert_msg;
+                    uint8_t ctx_len2=*cp2++; cp2+=ctx_len2;
+                    cp2+=3;
+                    uint32_t leaf_len=GET24(cp2); cp2+=3;
+                    x509_cert leaf;
+                    if(x509_parse(&leaf,cp2,leaf_len)!=0)
+                        die("Failed to parse leaf cert for CV");
+
+                    int cv_ok=verify_sig_algo(cv_algo,cv_content,
+                        cv_content_len,cv_sig,cv_sig_len,&leaf);
+                    if(!cv_ok)
+                        die("CertificateVerify signature verification failed");
+                    printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",
+                           cv_algo);
+                    got_cert_verify=1;
+
+                    if(st->is_aes256)
+                        sha384_update(&st->transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&st->transcript,hs_buf+pos,msg_total);
+                    break;
+                }
+                case 20: { /* Finished */
+                    if(!got_cert_verify)
+                        die("Server Finished without CertificateVerify");
+                    if(mlen!=st->hash_len)
+                        die("Server Finished length mismatch");
+                    printf("  Server Finished\n");
+                    uint8_t fin_key[SHA384_DIGEST_LEN];
+                    hkdf_expand_label_u(st->alg,st->s_hs_traffic,"finished",
+                        NULL,0,fin_key,st->alg->digest_len);
+                    uint8_t th_before_fin[SHA384_DIGEST_LEN];
+                    tls13_transcript_hash(st->is_aes256,&st->transcript,
+                        &st->transcript384,th_before_fin);
+                    uint8_t expected[SHA384_DIGEST_LEN];
+                    hmac(st->alg,fin_key,st->alg->digest_len,
+                         th_before_fin,st->alg->digest_len,expected);
+                    if(!ct_memeq(expected,hs_buf+pos+4,st->hash_len))
+                        die("Server Finished verify failed!");
+                    printf("  Server Finished VERIFIED\n");
+                    if(st->is_aes256)
+                        sha384_update(&st->transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&st->transcript,hs_buf+pos,msg_total);
+                    got_finished=1;
+                    break;
+                }
+                default:
+                    printf("  Unknown handshake msg type %d\n",mtype);
+                    if(st->is_aes256)
+                        sha384_update(&st->transcript384,hs_buf+pos,msg_total);
+                    else sha256_update(&st->transcript,hs_buf+pos,msg_total);
+                    break;
+            }
+            pos+=msg_total;
+        }
+        if(pos>0 && pos<hs_buf_len) {
+            memmove(hs_buf,hs_buf+pos,hs_buf_len-pos);
+            hs_buf_len-=pos;
+        } else if(pos==hs_buf_len) {
+            hs_buf_len=0;
+        }
+
+        if(!got_finished)
+            rtype=tls_read_record(st->fd,rec,&rec_len);
+    }
+}
+
+/* Phase 3: Derive application traffic keys from master secret */
+static void tls13_derive_app_keys(tls13_hs_state *st) {
+    const hash_alg *alg=st->alg;
+    uint8_t th_sf[SHA384_DIGEST_LEN];
+    tls13_transcript_hash(st->is_aes256,&st->transcript,
+                          &st->transcript384,th_sf);
+
+    uint8_t derived2[SHA384_DIGEST_LEN];
+    { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
+      hkdf_expand_label_u(alg,st->hs_secret,"derived",empty_hash,
+          alg->digest_len,derived2,alg->digest_len); }
+    uint8_t master_secret[SHA384_DIGEST_LEN];
+    { const uint8_t z[SHA384_DIGEST_LEN]={0};
+      hkdf_extract_u(alg,derived2,alg->digest_len,
+                     z,alg->digest_len,master_secret); }
+
+    hkdf_expand_label_u(alg,master_secret,"s ap traffic",th_sf,
+        alg->digest_len,st->s_ap_traffic,alg->digest_len);
+    hkdf_expand_label_u(alg,master_secret,"c ap traffic",th_sf,
+        alg->digest_len,st->c_ap_traffic,alg->digest_len);
+
+    hkdf_expand_label_u(alg,st->s_ap_traffic,"key",
+                        NULL,0,st->s_ap_key,st->kl);
+    hkdf_expand_label_u(alg,st->s_ap_traffic,"iv",
+                        NULL,0,st->s_ap_iv,AES_GCM_NONCE_LEN);
+    hkdf_expand_label_u(alg,st->c_ap_traffic,"key",
+                        NULL,0,st->c_ap_key,st->kl);
+    hkdf_expand_label_u(alg,st->c_ap_traffic,"iv",
+                        NULL,0,st->c_ap_iv,AES_GCM_NONCE_LEN);
+    printf("Derived application traffic keys\n");
+
+    secure_zero(derived2,sizeof(derived2));
+    secure_zero(master_secret,sizeof(master_secret));
+}
+
+/* Phase 4: Send CCS, optional empty cert, and client Finished */
+static void tls13_send_client_finished(tls13_hs_state *st) {
+    /* Send client ChangeCipherSpec (compat) */
+    { uint8_t ccs=1; tls_send_record(st->fd,TLS_RT_CCS,&ccs,1); }
+
+    uint64_t c_hs_seq=0;
+
+    /* If server requested client cert, send empty Certificate */
+    if(st->got_cert_request) {
+        uint8_t cert_msg[8];
+        cert_msg[0]=0x0b;
+        cert_msg[1]=0; cert_msg[2]=0; cert_msg[3]=4;
+        cert_msg[4]=0;
+        cert_msg[5]=0; cert_msg[6]=0; cert_msg[7]=0;
+        encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,cert_msg,8,
+            st->c_hs_key,st->c_hs_iv,c_hs_seq++,st->mode,st->kl);
+        if(st->is_aes256) sha384_update(&st->transcript384,cert_msg,8);
+        else sha256_update(&st->transcript,cert_msg,8);
+        printf("Sent empty client Certificate\n");
+    }
+
+    /* Send client Finished */
+    {
+        uint8_t th_for_fin[SHA384_DIGEST_LEN];
+        tls13_transcript_hash(st->is_aes256,&st->transcript,
+                              &st->transcript384,th_for_fin);
+        uint8_t fin_key[SHA384_DIGEST_LEN];
+        hkdf_expand_label_u(st->alg,st->c_hs_traffic,"finished",
+                            NULL,0,fin_key,st->alg->digest_len);
+        uint8_t verify[SHA384_DIGEST_LEN];
+        hmac(st->alg,fin_key,st->alg->digest_len,
+             th_for_fin,st->alg->digest_len,verify);
+        uint8_t fin_msg[52]; fin_msg[0]=0x14;
+        fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=(uint8_t)st->hash_len;
+        memcpy(fin_msg+4,verify,st->hash_len);
+        encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,fin_msg,4+st->hash_len,
+            st->c_hs_key,st->c_hs_iv,c_hs_seq++,st->mode,st->kl);
+    }
+    printf("Sent client Finished\n");
+}
+
+/* Phase 5: Send HTTP GET, receive response with KeyUpdate support */
+static void tls13_transfer_appdata(tls13_hs_state *st) {
+    uint64_t c_ap_seq=0;
+    {
+        char req[REQ_BUF_SIZE];
+        int rlen=snprintf(req,sizeof(req),
+            "GET %s HTTP/1.1\r\nHost: %s\r\n"
+            "Connection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
+            st->path,st->host);
+        encrypt_and_send(st->fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
+            st->c_ap_key,st->c_ap_iv,c_ap_seq++,st->mode,st->kl);
+        printf("Sent HTTP GET %s\n\n",st->path);
+    }
+
+    uint64_t s_ap_seq=0;
+    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    int rtype;
+    printf("=== HTTP Response ===\n");
+    for(;;) {
+        rtype=tls_read_record(st->fd,rec,&rec_len);
+        if(rtype<0) break;
+        if(rtype==TLS_RT_APPDATA) {
+            uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
+            int inner=decrypt_record(rec,rec_len,st->s_ap_key,st->s_ap_iv,
+                s_ap_seq++,pt,&pt_len,st->mode,st->kl);
+            if(inner==TLS_RT_APPDATA) {
+                fwrite(pt,1,pt_len,stdout);
+            } else if(inner==TLS_RT_ALERT) {
+                if(pt_len>=2 && pt[0]==1 && pt[1]==0) break;
+                printf("\n[TLS Alert: %d %d]\n",pt[0],pt_len>1?pt[1]:-1);
+                break;
+            } else if(inner==TLS_RT_HANDSHAKE) {
+                if(pt_len>=5 && pt[0]==24 && GET24(pt+1)==1) {
+                    uint8_t request_update=pt[4];
+                    {
+                        uint8_t new_s[SHA384_DIGEST_LEN];
+                        hkdf_expand_label_u(st->alg,st->s_ap_traffic,
+                            "traffic upd",NULL,0,new_s,st->alg->digest_len);
+                        memcpy(st->s_ap_traffic,new_s,st->alg->digest_len);
+                        hkdf_expand_label_u(st->alg,st->s_ap_traffic,"key",
+                            NULL,0,st->s_ap_key,st->kl);
+                        hkdf_expand_label_u(st->alg,st->s_ap_traffic,"iv",
+                            NULL,0,st->s_ap_iv,AES_GCM_NONCE_LEN);
+                    }
+                    s_ap_seq=0;
+                    if(request_update==1) {
+                        const uint8_t ku_msg[5]={24,0,0,1,0};
+                        encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,ku_msg,5,
+                            st->c_ap_key,st->c_ap_iv,c_ap_seq++,
+                            st->mode,st->kl);
+                        {
+                            uint8_t new_c[SHA384_DIGEST_LEN];
+                            hkdf_expand_label_u(st->alg,st->c_ap_traffic,
+                                "traffic upd",NULL,0,new_c,
+                                st->alg->digest_len);
+                            memcpy(st->c_ap_traffic,new_c,
+                                   st->alg->digest_len);
+                            hkdf_expand_label_u(st->alg,st->c_ap_traffic,
+                                "key",NULL,0,st->c_ap_key,st->kl);
+                            hkdf_expand_label_u(st->alg,st->c_ap_traffic,
+                                "iv",NULL,0,st->c_ap_iv,AES_GCM_NONCE_LEN);
+                        }
+                        c_ap_seq=0;
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    { const uint8_t alert[2]={1,0};
+      encrypt_and_send(st->fd,TLS_RT_ALERT,alert,2,st->c_ap_key,st->c_ap_iv,
+          c_ap_seq,st->mode,st->kl); }
+    printf("\n=== Done ===\n");
+}
+
+/* ================================================================
  * TLS 1.3 Handshake
  * ================================================================ */
 static void tls13_handshake(const tls_conn *conn) {
-    int fd = conn->fd;
-    const char *host = conn->host;
+    tls13_hs_state st;
+    memset(&st,0,sizeof(st));
+    st.fd = conn->fd;
+    st.host = conn->host;
+    st.path = conn->path;
     uint16_t cipher_suite = conn->cipher_suite;
+    st.is_aes256 = (cipher_suite == TLS_AES_256_GCM_SHA384);
+    st.mode = cipher_mode_of(cipher_suite);
+    st.alg = st.is_aes256 ? &SHA384_ALG : &SHA256_ALG;
+    st.hash_len = st.alg->digest_len;
+    st.kl = st.is_aes256 ? AES256_KEY_LEN :
+            (st.mode==CIPHER_CHACHA ? 32 : AES128_KEY_LEN);
+    st.transcript = conn->transcript;
+    st.transcript384 = conn->transcript384;
+
     uint8_t server_pub[P384_POINT_LEN];
     size_t server_pub_len = conn->server_pub_len;
     memcpy(server_pub, conn->server_pub, server_pub_len);
@@ -4530,13 +5060,6 @@ static void tls13_handshake(const tls_conn *conn) {
     memcpy(p384_priv, conn->p384_priv, P384_SCALAR_LEN);
     uint8_t x25519_priv[X25519_KEY_LEN];
     memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
-    sha256_ctx transcript = conn->transcript;
-    sha384_ctx transcript384 = conn->transcript384;
-
-    int is_aes256 = (cipher_suite == 0x1302);
-    int is_chacha = (cipher_suite == 0x1303);
-    const hash_alg *alg = is_aes256 ? &SHA384_ALG : &SHA256_ALG;
-    size_t hash_len = alg->digest_len;
 
     uint16_t selected_group;
     if(server_pub_len==X25519_KEY_LEN) selected_group=TLS_GROUP_X25519;
@@ -4545,7 +5068,7 @@ static void tls13_handshake(const tls_conn *conn) {
     printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",
         cipher_suite,selected_group);
 
-    /* Compute shared secret based on negotiated group */
+    /* Compute shared secret */
     uint8_t shared[P384_SCALAR_LEN]; size_t shared_len;
     if(selected_group==TLS_GROUP_X25519) {
         if(x25519_shared_secret(x25519_priv,server_pub,shared)<0)
@@ -4566,338 +5089,25 @@ static void tls13_handshake(const tls_conn *conn) {
     secure_zero(x25519_priv,sizeof(x25519_priv));
     printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
-    /* Derive handshake keys */
-    uint8_t early_secret[SHA384_DIGEST_LEN];
-    { const uint8_t z[SHA384_DIGEST_LEN]={0};
-      hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret); }
-    uint8_t derived1[SHA384_DIGEST_LEN];
-    { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
-      hkdf_expand_label_u(alg,early_secret,"derived",empty_hash,
-          alg->digest_len,derived1,alg->digest_len); }
-    uint8_t hs_secret[SHA384_DIGEST_LEN];
-    hkdf_extract_u(alg,derived1,alg->digest_len,shared,shared_len,hs_secret);
-
-    uint8_t th1[SHA384_DIGEST_LEN];
-    tls13_transcript_hash(is_aes256,&transcript,&transcript384,th1);
-
-    uint8_t s_hs_traffic[SHA384_DIGEST_LEN], c_hs_traffic[SHA384_DIGEST_LEN];
-    hkdf_expand_label_u(alg,hs_secret,"s hs traffic",th1,
-        alg->digest_len,s_hs_traffic,alg->digest_len);
-    hkdf_expand_label_u(alg,hs_secret,"c hs traffic",th1,
-        alg->digest_len,c_hs_traffic,alg->digest_len);
-
-    size_t kl = is_aes256 ? AES256_KEY_LEN : (is_chacha ? 32 : AES128_KEY_LEN);
-    uint8_t s_hs_key[AES256_KEY_LEN], s_hs_iv[AES_GCM_NONCE_LEN];
-    uint8_t c_hs_key[AES256_KEY_LEN], c_hs_iv[AES_GCM_NONCE_LEN];
-    hkdf_expand_label_u(alg,s_hs_traffic,"key",NULL,0,s_hs_key,kl);
-    hkdf_expand_label_u(alg,s_hs_traffic,"iv",NULL,0,s_hs_iv,AES_GCM_NONCE_LEN);
-    hkdf_expand_label_u(alg,c_hs_traffic,"key",NULL,0,c_hs_key,kl);
-    hkdf_expand_label_u(alg,c_hs_traffic,"iv",NULL,0,c_hs_iv,AES_GCM_NONCE_LEN);
-    printf("Derived handshake traffic keys\n");
-
-    /* Read encrypted handshake messages */
-    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
-    int rtype;
-    uint64_t s_hs_seq=0;
-    uint8_t hs_buf[HS_BUF_SIZE]; size_t hs_buf_len=0;
-
-    /* May get a ChangeCipherSpec first (compat) */
-    rtype=tls_read_record(fd,rec,&rec_len);
-    if(rtype==TLS_RT_CCS) { /* CCS, skip it */
-        rtype=tls_read_record(fd,rec,&rec_len);
-    }
-
-    /* Process encrypted records until we get Finished */
-    int got_finished=0, got_cert_verify=0, got_cert_request=0;
-    uint8_t *saved_cert_msg=NULL; size_t saved_cert_msg_len=0;
-    while(!got_finished) {
-        if(rtype!=TLS_RT_APPDATA) die("expected encrypted record");
-        uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
-        int inner=decrypt_record(rec,rec_len,s_hs_key,s_hs_iv,
-            s_hs_seq++,pt,&pt_len,is_aes256,is_chacha);
-        if(inner!=TLS_RT_HANDSHAKE) die("expected handshake inside encrypted record");
-
-        /* Append to handshake buffer */
-        if(hs_buf_len+pt_len>sizeof(hs_buf)) die("TLS 1.3 handshake buffer overflow");
-        memcpy(hs_buf+hs_buf_len,pt,pt_len);
-        hs_buf_len+=pt_len;
-
-        /* Process complete handshake messages from buffer */
-        size_t pos=0;
-        while(pos+4<=hs_buf_len) {
-            uint8_t mtype=hs_buf[pos];
-            uint32_t mlen=GET24(hs_buf+pos+1);
-            if(pos+4+mlen>hs_buf_len) break; /* incomplete */
-            size_t msg_total=4+mlen;
-
-            switch(mtype) {
-                case 8: /* EncryptedExtensions */
-                    printf("  EncryptedExtensions (%u bytes)\n",(unsigned)mlen);
-                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
-                    else sha256_update(&transcript,hs_buf+pos,msg_total);
-                    break;
-                case 11: /* Certificate */
-                    printf("  Certificate (%u bytes)\n",(unsigned)mlen);
-                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
-                    else sha256_update(&transcript,hs_buf+pos,msg_total);
-                    free(saved_cert_msg);
-                    saved_cert_msg=malloc(mlen);
-                    if(!saved_cert_msg) die("malloc failed");
-                    memcpy(saved_cert_msg,hs_buf+pos+4,mlen);
-                    saved_cert_msg_len=mlen;
-                    break;
-                case 13: /* CertificateRequest */
-                    printf("  CertificateRequest (%u bytes)\n",(unsigned)mlen);
-                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
-                    else sha256_update(&transcript,hs_buf+pos,msg_total);
-                    got_cert_request=1;
-                    break;
-                case 15: { /* CertificateVerify */
-                    printf("  CertificateVerify (%u bytes)\n",(unsigned)mlen);
-
-                    /* Validate cert chain first */
-                    if(saved_cert_msg){
-                        printf("  Validating certificate chain...\n");
-                        if(verify_cert_chain(saved_cert_msg,saved_cert_msg_len,host,1)<0)
-                            die("Certificate verification failed");
-                    }
-
-                    /* Verify CertificateVerify signature (RFC 8446 §4.4.3) */
-                    if(mlen<4) die("CertificateVerify too short");
-                    const uint8_t *cv=hs_buf+pos+4;
-                    uint16_t cv_algo=GET16(cv);
-                    uint16_t cv_sig_len=GET16(cv+2);
-                    if(4+(uint32_t)cv_sig_len>mlen) die("CertificateVerify sig length mismatch");
-                    const uint8_t *cv_sig=cv+4;
-
-                    /* RFC 8446 §4.4.3: sig algos for CertificateVerify */
-                    if(cv_algo!=0x0403 && cv_algo!=0x0503 &&
-                       cv_algo!=0x0804 && cv_algo!=0x0805)
-                        die("CertificateVerify uses sig algo not in offered list");
-
-                    /* Transcript hash up to (but not including) CertificateVerify */
-                    uint8_t th_cv[SHA384_DIGEST_LEN];
-                    tls13_transcript_hash(is_aes256,&transcript,&transcript384,th_cv);
-
-                    /* Content to verify: 64 spaces || context string || 0x00 || transcript hash */
-                    size_t cv_content_len = 64 + 33 + 1 + hash_len;
-                    uint8_t cv_content[64+33+1+SHA384_DIGEST_LEN];
-                    memset(cv_content,0x20,64);
-                    memcpy(cv_content+64,"TLS 1.3, server CertificateVerify",33);
-                    cv_content[97]=0x00;
-                    memcpy(cv_content+98,th_cv,hash_len);
-
-                    /* Parse leaf cert public key */
-                    if(!saved_cert_msg) die("No certificate for CertificateVerify");
-                    const uint8_t *cp2=saved_cert_msg;
-                    uint8_t ctx_len2=*cp2++; cp2+=ctx_len2;
-                    cp2+=3; /* skip list length */
-                    uint32_t leaf_len=GET24(cp2); cp2+=3;
-                    x509_cert leaf;
-                    if(x509_parse(&leaf,cp2,leaf_len)!=0) die("Failed to parse leaf cert for CV");
-
-                    int cv_ok=verify_sig_algo(cv_algo,cv_content,cv_content_len,
-                        cv_sig,cv_sig_len,&leaf);
-                    if(!cv_ok) die("CertificateVerify signature verification failed");
-                    printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",cv_algo);
-                    got_cert_verify=1;
-
-                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
-                    else sha256_update(&transcript,hs_buf+pos,msg_total);
-                    break;
-                }
-                case 20: { /* Finished */
-                    if(!got_cert_verify) die("Server Finished without CertificateVerify");
-                    if(mlen!=hash_len) die("Server Finished length mismatch");
-                    printf("  Server Finished\n");
-                    /* Verify server finished */
-                    uint8_t fin_key[SHA384_DIGEST_LEN];
-                    hkdf_expand_label_u(alg,s_hs_traffic,"finished",NULL,0,fin_key,alg->digest_len);
-                    uint8_t th_before_fin[SHA384_DIGEST_LEN];
-                    tls13_transcript_hash(is_aes256,&transcript,&transcript384,th_before_fin);
-                    uint8_t expected[SHA384_DIGEST_LEN];
-                    hmac(alg,fin_key,alg->digest_len,th_before_fin,alg->digest_len,expected);
-                    if(!ct_memeq(expected,hs_buf+pos+4,hash_len))
-                        die("Server Finished verify failed!");
-                    printf("  Server Finished VERIFIED\n");
-                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
-                    else sha256_update(&transcript,hs_buf+pos,msg_total);
-                    got_finished=1;
-                    break;
-                }
-                default:
-                    printf("  Unknown handshake msg type %d\n",mtype);
-                    if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
-                    else sha256_update(&transcript,hs_buf+pos,msg_total);
-                    break;
-            }
-            pos+=msg_total;
-        }
-        /* Shift remaining data */
-        if(pos>0 && pos<hs_buf_len) {
-            memmove(hs_buf,hs_buf+pos,hs_buf_len-pos);
-            hs_buf_len-=pos;
-        } else if(pos==hs_buf_len) {
-            hs_buf_len=0;
-        }
-
-        if(!got_finished)
-            rtype=tls_read_record(fd,rec,&rec_len);
-    }
-
-    /* Derive application keys */
-    uint8_t th_sf[SHA384_DIGEST_LEN];
-    tls13_transcript_hash(is_aes256,&transcript,&transcript384,th_sf);
-
-    uint8_t derived2[SHA384_DIGEST_LEN];
-    { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
-      hkdf_expand_label_u(alg,hs_secret,"derived",empty_hash,
-          alg->digest_len,derived2,alg->digest_len); }
-    uint8_t master_secret[SHA384_DIGEST_LEN];
-    { const uint8_t z[SHA384_DIGEST_LEN]={0};
-      hkdf_extract_u(alg,derived2,alg->digest_len,z,alg->digest_len,master_secret); }
-
-    uint8_t s_ap_traffic[SHA384_DIGEST_LEN], c_ap_traffic[SHA384_DIGEST_LEN];
-    hkdf_expand_label_u(alg,master_secret,"s ap traffic",th_sf,
-        alg->digest_len,s_ap_traffic,alg->digest_len);
-    hkdf_expand_label_u(alg,master_secret,"c ap traffic",th_sf,
-        alg->digest_len,c_ap_traffic,alg->digest_len);
-
-    uint8_t s_ap_key[AES256_KEY_LEN], s_ap_iv[AES_GCM_NONCE_LEN];
-    uint8_t c_ap_key[AES256_KEY_LEN], c_ap_iv[AES_GCM_NONCE_LEN];
-    hkdf_expand_label_u(alg,s_ap_traffic,"key",NULL,0,s_ap_key,kl);
-    hkdf_expand_label_u(alg,s_ap_traffic,"iv",NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
-    hkdf_expand_label_u(alg,c_ap_traffic,"key",NULL,0,c_ap_key,kl);
-    hkdf_expand_label_u(alg,c_ap_traffic,"iv",NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
-    printf("Derived application traffic keys\n");
-
-    /* Send client ChangeCipherSpec (compat) */
-    { uint8_t ccs=1; tls_send_record(fd,TLS_RT_CCS,&ccs,1); }
-
-    uint64_t c_hs_seq=0;
-
-    /* If server requested client cert, send empty Certificate (RFC 8446 §4.4.2) */
-    if(got_cert_request) {
-        /* Empty Certificate: context_len(1)=0, cert_list_len(3)=0 */
-        uint8_t cert_msg[8];
-        cert_msg[0]=0x0b; /* Certificate */
-        cert_msg[1]=0; cert_msg[2]=0; cert_msg[3]=4; /* length = 4 */
-        cert_msg[4]=0; /* certificate_request_context length = 0 */
-        cert_msg[5]=0; cert_msg[6]=0; cert_msg[7]=0; /* certificate_list length = 0 */
-        encrypt_and_send(fd,TLS_RT_HANDSHAKE,cert_msg,8,
-            c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
-        if(is_aes256) sha384_update(&transcript384,cert_msg,8);
-        else sha256_update(&transcript,cert_msg,8);
-        printf("Sent empty client Certificate\n");
-    }
-
-    /* Send client Finished */
-    {
-        /* Transcript hash includes client Certificate if sent */
-        uint8_t th_for_fin[SHA384_DIGEST_LEN];
-        tls13_transcript_hash(is_aes256,&transcript,&transcript384,th_for_fin);
-        uint8_t fin_key[SHA384_DIGEST_LEN];
-        hkdf_expand_label_u(alg,c_hs_traffic,"finished",NULL,0,fin_key,alg->digest_len);
-        uint8_t verify[SHA384_DIGEST_LEN];
-        hmac(alg,fin_key,alg->digest_len,th_for_fin,alg->digest_len,verify);
-        uint8_t fin_msg[52]; fin_msg[0]=0x14;
-        fin_msg[1]=0; fin_msg[2]=0; fin_msg[3]=(uint8_t)hash_len;
-        memcpy(fin_msg+4,verify,hash_len);
-        encrypt_and_send(fd,TLS_RT_HANDSHAKE,fin_msg,4+hash_len,
-            c_hs_key,c_hs_iv,c_hs_seq++,is_aes256,is_chacha);
-    }
-    printf("Sent client Finished\n");
-
-    /* Send HTTP GET (encrypted with application keys) */
-    uint64_t c_ap_seq=0;
-    {
-        const char *path = conn->path;
-        char req[REQ_BUF_SIZE];
-        int rlen=snprintf(req,sizeof(req),
-            "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
-            path,host);
-        encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
-            c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
-        printf("Sent HTTP GET %s\n\n",path);
-    }
-
-    /* Receive HTTP response */
-    uint64_t s_ap_seq=0;
-    printf("=== HTTP Response ===\n");
-    for(;;) {
-        rtype=tls_read_record(fd,rec,&rec_len);
-        if(rtype<0) break;
-        if(rtype==TLS_RT_APPDATA) {
-            uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
-            int inner=decrypt_record(rec,rec_len,s_ap_key,s_ap_iv,
-                s_ap_seq++,pt,&pt_len,is_aes256,is_chacha);
-            if(inner==TLS_RT_APPDATA) { /* application data */
-                fwrite(pt,1,pt_len,stdout);
-            } else if(inner==TLS_RT_ALERT) { /* alert */
-                if(pt_len>=2 && pt[0]==1 && pt[1]==0) break; /* close_notify */
-                printf("\n[TLS Alert: %d %d]\n",pt[0],pt_len>1?pt[1]:-1);
-                break;
-            } else if(inner==TLS_RT_HANDSHAKE) {
-                /* Post-handshake message */
-                if(pt_len>=5 && pt[0]==24 && GET24(pt+1)==1) {
-                    /* KeyUpdate (type 24, length 1) */
-                    uint8_t request_update=pt[4];
-                    /* Derive new server traffic secret */
-                    {
-                        uint8_t new_s[SHA384_DIGEST_LEN];
-                        hkdf_expand_label_u(alg,s_ap_traffic,"traffic upd",
-                            NULL,0,new_s,alg->digest_len);
-                        memcpy(s_ap_traffic,new_s,alg->digest_len);
-                        hkdf_expand_label_u(alg,s_ap_traffic,"key",NULL,0,s_ap_key,kl);
-                        hkdf_expand_label_u(alg,s_ap_traffic,"iv",
-                            NULL,0,s_ap_iv,AES_GCM_NONCE_LEN);
-                    }
-                    s_ap_seq=0;
-                    if(request_update==1) {
-                        /* Send KeyUpdate(update_not_requested) with current client keys */
-                        const uint8_t ku_msg[5]={24,0,0,1,0};
-                        encrypt_and_send(fd,TLS_RT_HANDSHAKE,ku_msg,5,
-                            c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
-                        /* Derive new client traffic secret */
-                        {
-                            uint8_t new_c[SHA384_DIGEST_LEN];
-                            hkdf_expand_label_u(alg,c_ap_traffic,"traffic upd",
-                                NULL,0,new_c,alg->digest_len);
-                            memcpy(c_ap_traffic,new_c,alg->digest_len);
-                            hkdf_expand_label_u(alg,c_ap_traffic,"key",NULL,0,c_ap_key,kl);
-                            hkdf_expand_label_u(alg,c_ap_traffic,"iv",
-                                NULL,0,c_ap_iv,AES_GCM_NONCE_LEN);
-                        }
-                        c_ap_seq=0;
-                    }
-                }
-                /* else: NewSessionTicket or other post-handshake, skip */
-            }
-        } else {
-            break;
-        }
-    }
-    /* Send close_notify */
-    { const uint8_t alert[2]={1,0};
-      encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_ap_key,c_ap_iv,
-          c_ap_seq,is_aes256,is_chacha); }
-    printf("\n=== Done ===\n");
-    free(saved_cert_msg);
-    secure_zero(p384_priv,sizeof(p384_priv));
-    secure_zero(p256_priv,sizeof(p256_priv));
-    secure_zero(x25519_priv,sizeof(x25519_priv));
+    /* Phase 1: Derive handshake keys */
+    tls13_derive_hs_keys(&st, shared, shared_len);
     secure_zero(shared,sizeof(shared));
-    secure_zero(early_secret,sizeof(early_secret));
-    secure_zero(derived1,sizeof(derived1));
-    secure_zero(hs_secret,sizeof(hs_secret));
-    secure_zero(s_hs_traffic,sizeof(s_hs_traffic));
-    secure_zero(c_hs_traffic,sizeof(c_hs_traffic));
-    secure_zero(s_hs_key,sizeof(s_hs_key)); secure_zero(s_hs_iv,sizeof(s_hs_iv));
-    secure_zero(c_hs_key,sizeof(c_hs_key)); secure_zero(c_hs_iv,sizeof(c_hs_iv));
-    secure_zero(derived2,sizeof(derived2));
-    secure_zero(master_secret,sizeof(master_secret));
-    secure_zero(s_ap_key,sizeof(s_ap_key)); secure_zero(s_ap_iv,sizeof(s_ap_iv));
-    secure_zero(c_ap_key,sizeof(c_ap_key)); secure_zero(c_ap_iv,sizeof(c_ap_iv));
+
+    /* Phase 2: Process encrypted handshake messages */
+    tls13_process_encrypted_hs(&st);
+
+    /* Phase 3: Derive application keys */
+    tls13_derive_app_keys(&st);
+
+    /* Phase 4: Send client Finished */
+    tls13_send_client_finished(&st);
+
+    /* Phase 5: Application data transfer */
+    tls13_transfer_appdata(&st);
+
+    int fd=st.fd;
+    free(st.cert_msg);
+    secure_zero(&st,sizeof(st));
     close(fd);
 }
 
@@ -4947,7 +5157,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
         die("HRR selected unsupported group");
     printf("  HRR selected group 0x%04x\n",hrr_group);
 
-    int hrr_aes256 = (*cipher_suite == 0x1302);
+    int hrr_aes256 = (*cipher_suite == TLS_AES_256_GCM_SHA384);
 
     /* Transcript replacement per RFC 8446 §4.4.1 */
     if(hrr_aes256) {
@@ -5125,21 +5335,21 @@ static void do_https_get(const char *host, int port, const char *path) {
 
 
 int main(int argc, char **argv) {
-    if (argc != 2) { fprintf(stderr, "Usage: %s https://host[:port]/path\n", argv[0]); return 1; }
+    if(argc != 2) { fprintf(stderr, "Usage: %s https://host[:port]/path\n", argv[0]); return 1; }
     const char *url = argv[1];
-    if (strncmp(url, "https://", 8) != 0) die("URL must start with https://");
+    if(strncmp(url, "https://", 8) != 0) die("URL must start with https://");
     const char *hoststart = url + 8;
     const char *slash = strchr(hoststart, '/');
     const char *path = slash ? slash : "/";
     char host[256];
     int port = 443;
     size_t hostlen = slash ? (size_t)(slash - hoststart) : strlen(hoststart);
-    if (hostlen >= sizeof(host)) die("hostname too long");
+    if(hostlen >= sizeof(host)) die("hostname too long");
     memcpy(host, hoststart, hostlen);
     host[hostlen] = '\0';
     /* check for :port */
     char *colon = strchr(host, ':');
-    if (colon) { port = (int)strtol(colon + 1, NULL, 10); *colon = '\0'; }
+    if(colon) { port = (int)strtol(colon + 1, NULL, 10); *colon = '\0'; }
     printf("TLS 1.2/1.3 HTTPS Client — from scratch in C\n");
     printf("Ciphers: AES-128/256-GCM, AES-CBC, ChaCha20-Poly1305 | Key Exchange: X25519, P-256, P-384, RSA\n\n");
     do_https_get(host, port, path);
