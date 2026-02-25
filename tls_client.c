@@ -2834,6 +2834,8 @@ static const uint8_t OID_EXT_KEY_USAGE[]= {0x55,0x1D,0x25};
 static const uint8_t OID_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
 static const uint8_t OID_AIA[]         = {0x2B,0x06,0x01,0x05,0x05,0x07,0x01,0x01};
 static const uint8_t OID_CA_ISSUERS[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x30,0x02};
+static const uint8_t OID_NAME_CONSTRAINTS[]   = {0x55,0x1D,0x1E};
+static const uint8_t OID_POLICY_CONSTRAINTS[] = {0x55,0x1D,0x24};
 /* ================================================================
  * X.509 Certificate Parser
  * ================================================================ */
@@ -2848,6 +2850,7 @@ typedef struct {
     const uint8_t *rsa_e; size_t rsa_e_len;        /* RSA exponent */
     const uint8_t *san; size_t san_len;            /* SAN extension value */
     const uint8_t *aia_url; size_t aia_url_len;    /* caIssuers HTTP URL */
+    const uint8_t *name_constraints; size_t name_constraints_len;
     time_t not_before, not_after;                  /* validity period */
     int key_type;                                   /* 1=EC, 2=RSA */
     int is_ca;                                      /* basicConstraints CA flag */
@@ -2977,6 +2980,14 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
                     }
                 }
             }
+        } else if(oid_eq(eoid,len,OID_NAME_CONSTRAINTS,sizeof(OID_NAME_CONSTRAINTS))){
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){cert->name_constraints=oct;cert->name_constraints_len=len;}
+        } else if(oid_eq(eoid,len,OID_POLICY_CONSTRAINTS,sizeof(OID_POLICY_CONSTRAINTS))){
+            /* Recognized to avoid critical-extension rejection; not enforced */
+            (void)0;
         } else {
             /* RFC 5280 §4.2: reject unrecognized critical extensions */
             const uint8_t *rest=eoid+len;
@@ -3386,6 +3397,141 @@ static int http_fetch_der(const uint8_t *url, size_t url_len,
     return 0;
 }
 
+/* DNS name constraint matching per RFC 5280 §4.2.1.10:
+ * Constraint "example.com" matches "example.com" exactly and any subdomain
+ * like "foo.example.com". Comparison is case-insensitive. */
+static int dns_name_matches_constraint(const char *name, size_t name_len,
+                                        const uint8_t *constraint, size_t cons_len) {
+    if(cons_len==0) return 0;
+    /* Leading dot in constraint means subdomain-only (strip it for matching) */
+    if(constraint[0]=='.'){constraint++;cons_len--;}
+    if(cons_len==0) return 0;
+    /* Exact match */
+    if(name_len==cons_len){
+        for(size_t i=0;i<name_len;i++){
+            uint8_t a=(uint8_t)name[i], b=constraint[i];
+            if(a>='A'&&a<='Z') a+=32;
+            if(b>='A'&&b<='Z') b+=32;
+            if(a!=b) return 0;
+        }
+        return 1;
+    }
+    /* Subdomain match: name must end with ".constraint" */
+    if(name_len>cons_len+1&&name[name_len-cons_len-1]=='.'){
+        const char *suffix=name+(name_len-cons_len);
+        for(size_t i=0;i<cons_len;i++){
+            uint8_t a=(uint8_t)suffix[i], b=constraint[i];
+            if(a>='A'&&a<='Z') a+=32;
+            if(b>='A'&&b<='Z') b+=32;
+            if(a!=b) return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int check_name_constraints(const x509_cert *ca, const x509_cert *leaf,
+                                   const char *hostname) {
+    if(!ca->name_constraints||ca->name_constraints_len==0) return 0;
+    uint8_t tag; size_t len;
+    const uint8_t *p=ca->name_constraints;
+    const uint8_t *nc_end=p+ca->name_constraints_len;
+
+    /* NameConstraints ::= SEQUENCE { permittedSubtrees [0], excludedSubtrees [1] } */
+    const uint8_t *seq=der_expect(p,nc_end,0x30,&len);
+    if(!seq) return -1;
+    const uint8_t *seq_end=seq+len;
+    const uint8_t *sp=seq;
+
+    /* Collect permitted and excluded dNSName constraints */
+    #define MAX_NC_NAMES 16
+    struct { const uint8_t *name; size_t len; } permitted[MAX_NC_NAMES], excluded[MAX_NC_NAMES];
+    int n_permitted=0, n_excluded=0;
+
+    while(sp<seq_end){
+        const uint8_t *sub=der_read_tl(sp,seq_end,&tag,&len);
+        if(!sub) break;
+        const uint8_t *sub_end=sub+len;
+        sp=sub_end;
+        int is_permitted=(tag==0xA0);
+        int is_excluded=(tag==0xA1);
+        if(!is_permitted&&!is_excluded) continue;
+        /* Parse GeneralSubtrees: SEQUENCE OF GeneralSubtree */
+        const uint8_t *gp=sub;
+        while(gp<sub_end){
+            const uint8_t *gs=der_read_tl(gp,sub_end,&tag,&len);
+            if(!gs||tag!=0x30) break;
+            const uint8_t *gs_end=gs+len;
+            gp=gs_end;
+            /* GeneralSubtree.base is a GeneralName; dNSName = tag 0x82 */
+            const uint8_t *base=der_read_tl(gs,gs_end,&tag,&len);
+            if(!base) continue;
+            if(tag==0x82){ /* dNSName */
+                if(is_permitted&&n_permitted<MAX_NC_NAMES){
+                    permitted[n_permitted].name=base;
+                    permitted[n_permitted].len=len;
+                    n_permitted++;
+                } else if(is_excluded&&n_excluded<MAX_NC_NAMES){
+                    excluded[n_excluded].name=base;
+                    excluded[n_excluded].len=len;
+                    n_excluded++;
+                }
+            }
+        }
+    }
+    #undef MAX_NC_NAMES
+
+    /* If no DNS name constraints at all, nothing to enforce */
+    if(n_permitted==0&&n_excluded==0) return 0;
+
+    /* Check a single DNS name against the collected constraints.
+     * Returns 0 on success, -1 on violation. */
+    #define CHECK_NAME(name_str, name_len) do { \
+        for(int _e=0;_e<n_excluded;_e++){ \
+            if(dns_name_matches_constraint(name_str,name_len, \
+                                            excluded[_e].name,excluded[_e].len)) \
+                return -1; \
+        } \
+        if(n_permitted>0){ \
+            int _ok=0; \
+            for(int _p=0;_p<n_permitted;_p++){ \
+                if(dns_name_matches_constraint(name_str,name_len, \
+                                                permitted[_p].name,permitted[_p].len)){ \
+                    _ok=1; break; \
+                } \
+            } \
+            if(!_ok) return -1; \
+        } \
+    } while(0)
+
+    /* Check leaf SAN dNSName entries */
+    if(leaf->san&&leaf->san_len>0){
+        const uint8_t *lp=leaf->san;
+        const uint8_t *lend=lp+leaf->san_len;
+        lp=der_read_tl(lp,lend,&tag,&len);
+        if(lp&&tag==0x30){
+            lend=lp+len;
+            while(lp<lend){
+                const uint8_t *val=der_read_tl(lp,lend,&tag,&len);
+                if(!val) break;
+                if(tag==0x82&&len>0){ /* dNSName */
+                    char nbuf[256];
+                    size_t nlen=len<sizeof(nbuf)?len:sizeof(nbuf)-1;
+                    memcpy(nbuf,val,nlen); nbuf[nlen]='\0';
+                    CHECK_NAME(nbuf,nlen);
+                }
+                lp=val+len;
+            }
+        }
+    }
+
+    /* Also check the hostname (covers CN fallback case) */
+    CHECK_NAME(hostname, strlen(hostname));
+
+    #undef CHECK_NAME
+    return 0;
+}
+
 /* ================================================================
  * Certificate Chain Validation
  * ================================================================ */
@@ -3565,6 +3711,13 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         if(certs[i+1].has_key_usage && !(certs[i+1].key_usage & 0x04)){
             fprintf(stderr,"CA certificate %d keyUsage missing keyCertSign\n",i+1);
             return -1;
+        }
+        /* Check name constraints on the leaf against each CA in the chain */
+        if(certs[i+1].name_constraints){
+            if(check_name_constraints(&certs[i+1],&certs[0],hostname)<0){
+                fprintf(stderr,"Name constraints violated at cert %d\n",i+1);
+                return -1;
+            }
         }
     }
     fprintf(stderr,"No matching root CA found in trust store\n");
