@@ -24,6 +24,36 @@
 #include <time.h>
 #include <dirent.h>
 
+/* ---- Detect limb width: 64-bit on 64-bit platforms, 32-bit otherwise ---- */
+#if !defined(USE_64BIT_LIMBS)
+#if defined(__LP64__) || defined(_LP64) || defined(_WIN64) || \
+    defined(__x86_64__) || defined(__aarch64__) || defined(__ppc64__) || \
+    defined(__s390x__) || defined(__mips64) || \
+    (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ >= 8)
+#define USE_64BIT_LIMBS 1
+#else
+#define USE_64BIT_LIMBS 0
+#endif
+#endif
+
+#if USE_64BIT_LIMBS
+typedef uint64_t limb_t;
+#define LIMB_BITS  64
+#define LIMB_BYTES 8
+#define FP384_N    6
+#define FP256_N    4
+#define FP25519_N  4
+#define BN_MAX_LIMBS 130
+#else
+typedef uint32_t limb_t;
+#define LIMB_BITS  32
+#define LIMB_BYTES 4
+#define FP384_N    12
+#define FP256_N    8
+#define FP25519_N  8
+#define BN_MAX_LIMBS 260
+#endif
+
 /* Portable 64×64→128 multiply via 32-bit half-products (C11 compliant) */
 static inline void mul64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo) {
     uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
@@ -45,6 +75,8 @@ static inline uint64_t addcarry64(uint64_t a, uint64_t b, uint64_t *sum) {
     return (*sum < a) ? 1 : 0;
 }
 
+/* 64-bit helpers: used by 64-bit limb path and by Poly1305's 64-bit fp25519_mul */
+#if USE_64BIT_LIMBS
 /* Multiply-accumulate: (hi:lo) = a*b + addend + carry_in */
 static inline void mac64(uint64_t a, uint64_t b, uint64_t addend, uint64_t carry_in,
                          uint64_t *hi, uint64_t *lo) {
@@ -74,6 +106,29 @@ static inline uint64_t sbb64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_
     c += (d < borrow_in);
     return c;
 }
+#endif
+
+/* ---- Generic limb-width helpers (aliases on 64-bit, native on 32-bit) ---- */
+#if USE_64BIT_LIMBS
+#define mac_limb mac64
+#define adc_limb adc64
+#define sbb_limb sbb64
+#else
+static inline void mac_limb(uint32_t a, uint32_t b, uint32_t addend, uint32_t carry_in,
+                             uint32_t *hi, uint32_t *lo) {
+    uint64_t p = (uint64_t)a * b + addend + carry_in;
+    *lo = (uint32_t)p; *hi = (uint32_t)(p >> 32);
+}
+static inline uint32_t adc_limb(uint32_t a, uint32_t b, uint32_t carry_in, uint32_t *sum) {
+    uint64_t s = (uint64_t)a + b + carry_in;
+    *sum = (uint32_t)s; return (uint32_t)(s >> 32);
+}
+static inline uint32_t sbb_limb(uint32_t a, uint32_t b, uint32_t borrow_in, uint32_t *diff) {
+    uint32_t d = a - b, c = (a < b);
+    *diff = d - borrow_in; c += (d < borrow_in);
+    return c;
+}
+#endif
 
 #define PUT16(b,v) do{(b)[0]=(uint8_t)((v)>>8);(b)[1]=(uint8_t)(v);}while(0)
 #define GET16(b) ((uint16_t)(((uint16_t)(b)[0]<<8)|(b)[1]))
@@ -1007,9 +1062,7 @@ static int chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[
 /* ================================================================
  * Big-Number Arithmetic (for RSA and ECDSA mod-n operations)
  * ================================================================ */
-#define BN_MAX_LIMBS 130  /* must hold product of two RSA-4096 numbers (128 limbs) */
-
-typedef struct { uint64_t v[BN_MAX_LIMBS]; int len; } bignum;
+typedef struct { limb_t v[BN_MAX_LIMBS]; int len; } bignum;
 
 static void bn_zero(bignum *r) { memset(r,0,sizeof(*r)); }
 
@@ -1020,22 +1073,22 @@ static int bn_is_zero(const bignum *a) {
 
 static void bn_from_bytes(bignum *r, const uint8_t *buf, size_t blen) {
     bn_zero(r);
-    r->len=(int)((blen+7)/8);
+    r->len=(int)((blen+LIMB_BYTES-1)/LIMB_BYTES);
     if(r->len>BN_MAX_LIMBS) r->len=BN_MAX_LIMBS;
-    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
-        r->v[i/8]|=(uint64_t)buf[blen-1-i]<<(8*(i%8));
+    for(size_t i=0;i<blen&&(int)(i/LIMB_BYTES)<BN_MAX_LIMBS;i++)
+        r->v[i/LIMB_BYTES]|=(limb_t)buf[blen-1-i]<<(8*(i%LIMB_BYTES));
 }
 
 static void bn_to_bytes(const bignum *a, uint8_t *buf, size_t blen) {
     memset(buf,0,blen);
-    for(size_t i=0;i<blen&&(int)(i/8)<BN_MAX_LIMBS;i++)
-        buf[blen-1-i]=(a->v[i/8]>>(8*(i%8)))&0xFF;
+    for(size_t i=0;i<blen&&(int)(i/LIMB_BYTES)<BN_MAX_LIMBS;i++)
+        buf[blen-1-i]=(uint8_t)((a->v[i/LIMB_BYTES]>>(8*(i%LIMB_BYTES)))&0xFF);
 }
 
 static int bn_cmp(const bignum *a, const bignum *b) {
     int ml=a->len>b->len?a->len:b->len;
     for(int i=ml-1;i>=0;i--){
-        uint64_t av=i<a->len?a->v[i]:0, bv=i<b->len?b->v[i]:0;
+        limb_t av=i<a->len?a->v[i]:0, bv=i<b->len?b->v[i]:0;
         if(av>bv) return 1;
         if(av<bv) return -1;
     }
@@ -1044,11 +1097,11 @@ static int bn_cmp(const bignum *a, const bignum *b) {
 
 static void bn_sub(bignum *r, const bignum *a, const bignum *b) {
     int ml=a->len>b->len?a->len:b->len;
-    uint64_t borrow=0;
+    limb_t borrow=0;
     for(int i=0;i<ml;i++){
-        uint64_t av=i<a->len?a->v[i]:0;
-        uint64_t bv=i<b->len?b->v[i]:0;
-        borrow=sbb64(av, bv, borrow, &r->v[i]);
+        limb_t av=i<a->len?a->v[i]:0;
+        limb_t bv=i<b->len?b->v[i]:0;
+        borrow=sbb_limb(av, bv, borrow, &r->v[i]);
     }
     r->len=ml;
     while(r->len>0&&r->v[r->len-1]==0) r->len--;
@@ -1059,9 +1112,9 @@ static void bn_mul(bignum *r, const bignum *a, const bignum *b) {
     t.len=a->len+b->len;
     if(t.len>BN_MAX_LIMBS) t.len=BN_MAX_LIMBS;
     for(int i=0;i<a->len;i++){
-        uint64_t carry=0;
+        limb_t carry=0;
         for(int j=0;j<b->len&&i+j<BN_MAX_LIMBS;j++){
-            mac64(a->v[i], b->v[j], t.v[i+j], carry, &carry, &t.v[i+j]);
+            mac_limb(a->v[i], b->v[j], t.v[i+j], carry, &carry, &t.v[i+j]);
         }
         if(i+b->len<BN_MAX_LIMBS) t.v[i+b->len]=carry;
     }
@@ -1071,16 +1124,16 @@ static void bn_mul(bignum *r, const bignum *a, const bignum *b) {
 
 static int bn_bits(const bignum *a) {
     if(a->len==0) return 0;
-    int bits=(a->len-1)*64;
-    uint64_t top=a->v[a->len-1];
+    int bits=(a->len-1)*LIMB_BITS;
+    limb_t top=a->v[a->len-1];
     while(top){bits++;top>>=1;}
     return bits;
 }
 
 static void bn_shl1(bignum *a) {
-    uint64_t carry=0;
+    limb_t carry=0;
     for(int i=0;i<a->len;i++){
-        uint64_t nc=a->v[i]>>63;
+        limb_t nc=a->v[i]>>(LIMB_BITS-1);
         a->v[i]=(a->v[i]<<1)|carry;
         carry=nc;
     }
@@ -1092,7 +1145,7 @@ static void bn_mod(bignum *r, const bignum *a, const bignum *m) {
     int abits=bn_bits(a);
     for(int i=abits-1;i>=0;i--){
         bn_shl1(&rem);
-        if((a->v[i/64]>>(i%64))&1){rem.v[0]|=1;if(rem.len==0)rem.len=1;}
+        if((a->v[i/LIMB_BITS]>>(i%LIMB_BITS))&1){rem.v[0]|=1;if(rem.len==0)rem.len=1;}
         if(bn_cmp(&rem,m)>=0) bn_sub(&rem,&rem,m);
     }
     *r=rem;
@@ -1104,27 +1157,31 @@ static void bn_modmul(bignum *r, const bignum *a, const bignum *b, const bignum 
 
 /* Constant-time conditional copy: dst = src if bit==1, unchanged if bit==0 */
 static void bn_cmov(bignum *dst, const bignum *src, int bit) {
-    uint64_t mask = -(uint64_t)(bit&1); /* 0 or 0xFFFF... */
+    limb_t mask = -(limb_t)(bit&1); /* 0 or 0xFFFF... */
     int max_len = dst->len > src->len ? dst->len : src->len;
     for(int i=0;i<max_len;i++)
         dst->v[i] = (dst->v[i] & ~mask) | (src->v[i] & mask);
     dst->len = (dst->len & (int)~mask) | (src->len & (int)mask);
 }
 typedef struct {
-    uint64_t m_inv;   /* -m^(-1) mod 2^64 */
+    limb_t m_inv;     /* -m^(-1) mod 2^LIMB_BITS */
     int n;            /* number of limbs in m */
     bignum rr;        /* R^2 mod m, for converting to Montgomery form */
 } bn_mont_ctx;
 
 static void bn_mont_init(bn_mont_ctx *ctx, const bignum *m) {
     ctx->n = m->len;
-    /* Compute m_inv = -m[0]^(-1) mod 2^64 via Newton's method */
-    uint64_t m0 = m->v[0];
-    uint64_t x = 1;
-    for (int i = 0; i < 6; i++)
-        x = x * (2 - m0 * x); /* doubles correct bits each iteration: 1->2->4->8->16->32->64 */
-    ctx->m_inv = -x; /* negate: m_inv * m[0] ≡ -1 (mod 2^64) */
-    /* Compute R mod m where R = 2^(n*64) */
+    /* Compute m_inv = -m[0]^(-1) mod 2^LIMB_BITS via Newton's method */
+    limb_t m0 = m->v[0];
+    limb_t x = 1;
+#if USE_64BIT_LIMBS
+    for (int i = 0; i < 6; i++) /* 1->2->4->8->16->32->64 bits */
+#else
+    for (int i = 0; i < 5; i++) /* 1->2->4->8->16->32 bits */
+#endif
+        x = x * (2 - m0 * x);
+    ctx->m_inv = -x; /* negate: m_inv * m[0] ≡ -1 (mod 2^LIMB_BITS) */
+    /* Compute R mod m where R = 2^(n*LIMB_BITS) */
     bignum R; bn_zero(&R);
     R.v[ctx->n] = 1; R.len = ctx->n + 1;
     bignum R_mod_m; bn_mod(&R_mod_m, &R, m);
@@ -1135,27 +1192,27 @@ static void bn_mont_init(bn_mont_ctx *ctx, const bignum *m) {
 static void bn_mont_mul(bignum *r, const bignum *a, const bignum *b,
                         const bignum *m, const bn_mont_ctx *ctx) {
     int n = ctx->n;
-    uint64_t t[BN_MAX_LIMBS + 2];
-    memset(t, 0, ((size_t)n + 2) * sizeof(uint64_t));
+    limb_t t[BN_MAX_LIMBS + 2];
+    memset(t, 0, ((size_t)n + 2) * sizeof(limb_t));
     for (int i = 0; i < n; i++) {
-        uint64_t ai = (i < a->len) ? a->v[i] : 0;
+        limb_t ai = (i < a->len) ? a->v[i] : 0;
         /* t += a[i] * b */
-        uint64_t carry = 0;
+        limb_t carry = 0;
         for (int j = 0; j < n; j++) {
-            mac64(ai, (j < b->len) ? b->v[j] : 0, t[j], carry, &carry, &t[j]);
+            mac_limb(ai, (j < b->len) ? b->v[j] : 0, t[j], carry, &carry, &t[j]);
         }
-        uint64_t sc = addcarry64(t[n], carry, &t[n]);
+        limb_t sc = adc_limb(t[n], carry, 0, &t[n]);
         t[n + 1] = sc;
-        /* u = t[0] * m_inv mod 2^64 */
-        uint64_t u = t[0] * ctx->m_inv;
+        /* u = t[0] * m_inv mod 2^LIMB_BITS */
+        limb_t u = t[0] * ctx->m_inv;
         /* t += u * m, cancels bottom limb */
         carry = 0;
         for (int j = 0; j < n; j++) {
-            mac64(u, m->v[j], t[j], carry, &carry, &t[j]);
+            mac_limb(u, m->v[j], t[j], carry, &carry, &t[j]);
         }
-        sc = addcarry64(t[n], carry, &t[n]);
+        sc = adc_limb(t[n], carry, 0, &t[n]);
         t[n + 1] += sc;
-        /* shift right 64 bits (drop zeroed bottom limb) */
+        /* shift right LIMB_BITS (drop zeroed bottom limb) */
         for (int j = 0; j <= n; j++) t[j] = t[j + 1];
         t[n + 1] = 0;
     }
@@ -1181,15 +1238,15 @@ static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bi
         bn_mont_mul(&table[i], &table[i - 1], &bm, m, &ctx);
     bignum result = table[0];
     /* Process exponent MSB to LSB in 4-bit windows, fixed count to avoid leaking length */
-    int total_windows = m->len * 16; /* m->len * 64 / 4 */
+    int total_windows = m->len * (LIMB_BITS / 4); /* m->len * LIMB_BITS / 4 */
     for (int w = total_windows - 1; w >= 0; w--) {
         /* Square 4 times */
         for (int s = 0; s < 4; s++)
             bn_mont_mul(&result, &result, &result, m, &ctx);
         /* Extract 4-bit window (always aligned to nibble, never spans limbs) */
         int bit_pos = w * 4;
-        int window = (bit_pos / 64 < exp->len)
-            ? (int)((exp->v[bit_pos / 64] >> (bit_pos % 64)) & 0xF) : 0;
+        int window = (bit_pos / LIMB_BITS < exp->len)
+            ? (int)((exp->v[bit_pos / LIMB_BITS] >> (bit_pos % LIMB_BITS)) & 0xF) : 0;
         /* Constant-time table lookup */
         bignum sel = table[0];
         for (int i = 1; i < 16; i++)
@@ -1203,8 +1260,9 @@ static void bn_modexp(bignum *r, const bignum *base, const bignum *exp, const bi
 /* ================================================================
  * P-384 Field Arithmetic (mod p, p = 2^384 - 2^128 - 2^96 + 2^32 - 1)
  * ================================================================ */
-typedef struct { uint64_t v[6]; } fp384;
+typedef struct { limb_t v[FP384_N]; } fp384;
 
+#if USE_64BIT_LIMBS
 static const fp384 P384_P = {{
     0x00000000FFFFFFFF, 0xFFFFFFFF00000000,
     0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF,
@@ -1212,40 +1270,50 @@ static const fp384 P384_P = {{
 }};
 static const fp384 FP384_ZERO = {{0,0,0,0,0,0}};
 static const fp384 FP384_ONE  = {{1,0,0,0,0,0}};
+#else
+static const fp384 P384_P = {{
+    0xFFFFFFFF, 0x00000000, 0x00000000, 0xFFFFFFFF,
+    0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+}};
+static const fp384 FP384_ZERO = {{0,0,0,0,0,0,0,0,0,0,0,0}};
+static const fp384 FP384_ONE  = {{1,0,0,0,0,0,0,0,0,0,0,0}};
+#endif
 
 static int fp384_cmp(const fp384 *a, const fp384 *b) {
-    for(int i=5;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
+    for(int i=FP384_N-1;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
 }
 
-static uint64_t fp384_add_raw(fp384 *r, const fp384 *a, const fp384 *b) {
-    uint64_t c=0;
-    for(int i=0;i<6;i++){c=adc64(a->v[i],b->v[i],c,&r->v[i]);}
+static limb_t fp384_add_raw(fp384 *r, const fp384 *a, const fp384 *b) {
+    limb_t c=0;
+    for(int i=0;i<FP384_N;i++){c=adc_limb(a->v[i],b->v[i],c,&r->v[i]);}
     return c;
 }
 
-static uint64_t fp384_sub_raw(fp384 *r, const fp384 *a, const fp384 *b) {
-    uint64_t borrow=0;
-    for(int i=0;i<6;i++){
-        borrow=sbb64(a->v[i],b->v[i],borrow,&r->v[i]);
+static limb_t fp384_sub_raw(fp384 *r, const fp384 *a, const fp384 *b) {
+    limb_t borrow=0;
+    for(int i=0;i<FP384_N;i++){
+        borrow=sbb_limb(a->v[i],b->v[i],borrow,&r->v[i]);
     }
     return borrow;
 }
 
 static void fp384_add(fp384 *r, const fp384 *a, const fp384 *b) {
-    uint64_t carry=fp384_add_raw(r,a,b);
-    fp384 t; uint64_t borrow=fp384_sub_raw(&t,r,&P384_P);
+    limb_t carry=fp384_add_raw(r,a,b);
+    fp384 t; limb_t borrow=fp384_sub_raw(&t,r,&P384_P);
     /* Use subtracted result if carry, or if no borrow (r >= P) */
-    uint64_t mask=-(uint64_t)(carry|(1-borrow));
-    for(int i=0;i<6;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    limb_t mask=-(limb_t)(carry|(1-borrow));
+    for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
 static void fp384_sub(fp384 *r, const fp384 *a, const fp384 *b) {
-    uint64_t borrow=fp384_sub_raw(r,a,b);
+    limb_t borrow=fp384_sub_raw(r,a,b);
     fp384 t; fp384_add_raw(&t,r,&P384_P);
-    uint64_t mask=-(uint64_t)borrow;
-    for(int i=0;i<6;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    limb_t mask=-(limb_t)borrow;
+    for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
+#if USE_64BIT_LIMBS
 static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
     /* Schoolbook 6x6 -> 12 limbs */
     uint64_t w[12]; memset(w,0,sizeof(w));
@@ -1311,33 +1379,100 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
     /* Final: constant-time conditional subtraction of p (at most 4 times) */
     memcpy(r,acc,48);
     for(int pass=0;pass<4;pass++){
-        fp384 t; uint64_t borrow=fp384_sub_raw(&t,r,&P384_P);
-        uint64_t mask=-(uint64_t)(1-borrow); /* all 1s if no borrow (r>=P) */
-        for(int i=0;i<6;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+        fp384 t; limb_t borrow=fp384_sub_raw(&t,r,&P384_P);
+        limb_t mask=-(limb_t)(1-borrow);
+        for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
     }
 }
+#else /* 32-bit limbs: 12×12 schoolbook, limb-aligned shifts */
+static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
+    /* Schoolbook 12x12 -> 24 limbs (32-bit) */
+    uint32_t w[24]; memset(w,0,sizeof(w));
+    for(int i=0;i<12;i++){
+        uint32_t carry=0;
+        for(int j=0;j<12;j++){
+            mac_limb(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
+        }
+        w[i+12]=carry;
+    }
+    /* Reduction: 2^384 ≡ 2^128 + 2^96 - 2^32 + 1 (mod p)
+     * hi = w[12..23] (12 limbs), lo = w[0..11]
+     * result = lo + hi + (hi<<128) + (hi<<96) - (hi<<32) mod p
+     * All shifts are limb-aligned (32-bit boundaries). */
+    uint32_t acc[20]; memset(acc,0,sizeof(acc));
+    uint32_t c;
+    /* +lo */
+    for(int i=0;i<12;i++) acc[i]=w[i];
+    /* +hi (at position 0) */
+    c=0; for(int i=0;i<12;i++){c=adc_limb(acc[i],w[i+12],c,&acc[i]);}
+    for(int i=12;i<20;i++){c=adc_limb(acc[i],0,c,&acc[i]);}
+    /* +hi<<128 (shift by 4 limbs) */
+    c=0; for(int i=0;i<12;i++){c=adc_limb(acc[i+4],w[i+12],c,&acc[i+4]);}
+    for(int i=16;i<20;i++){c=adc_limb(acc[i],0,c,&acc[i]);}
+    /* +hi<<96 (shift by 3 limbs) */
+    c=0; for(int i=0;i<12;i++){c=adc_limb(acc[i+3],w[i+12],c,&acc[i+3]);}
+    for(int i=15;i<20;i++){c=adc_limb(acc[i],0,c,&acc[i]);}
+    /* -hi<<32 (shift by 1 limb) */
+    { uint32_t borrow=0;
+      for(int i=0;i<12;i++){borrow=sbb_limb(acc[i+1],w[i+12],borrow,&acc[i+1]);}
+      for(int i=13;i<20;i++){borrow=sbb_limb(acc[i],0,borrow,&acc[i]);}
+    }
+    /* Second pass: reduce acc[12..19] */
+    { uint32_t hi2[12]; memset(hi2,0,sizeof(hi2));
+      for(int i=0;i<8;i++) hi2[i]=acc[12+i];
+      uint32_t lo2[12]; memcpy(lo2,acc,48);
+      memset(acc,0,sizeof(acc));
+      for(int i=0;i<12;i++) acc[i]=lo2[i];
+      c=0; for(int i=0;i<12;i++){c=adc_limb(acc[i],hi2[i],c,&acc[i]);}
+      for(int i=12;i<20;i++){c=adc_limb(acc[i],0,c,&acc[i]);}
+      c=0; for(int i=0;i<8;i++){c=adc_limb(acc[i+4],hi2[i],c,&acc[i+4]);}
+      for(int i=12;i<20;i++){c=adc_limb(acc[i],0,c,&acc[i]);}
+      c=0; for(int i=0;i<8;i++){c=adc_limb(acc[i+3],hi2[i],c,&acc[i+3]);}
+      for(int i=11;i<20;i++){c=adc_limb(acc[i],0,c,&acc[i]);}
+      { uint32_t borrow=0;
+        for(int i=0;i<8;i++){borrow=sbb_limb(acc[i+1],hi2[i],borrow,&acc[i+1]);}
+        for(int i=9;i<20;i++){borrow=sbb_limb(acc[i],0,borrow,&acc[i]);}
+      }
+    }
+    /* Final: constant-time conditional subtraction of p (at most 4 times) */
+    memcpy(r,acc,48);
+    for(int pass=0;pass<4;pass++){
+        fp384 t; limb_t borrow=fp384_sub_raw(&t,r,&P384_P);
+        limb_t mask=-(limb_t)(1-borrow);
+        for(int i=0;i<FP384_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    }
+}
+#endif
 
 static void fp384_sqr(fp384 *r, const fp384 *a){fp384_mul(r,a,a);}
 
 static void fp384_inv(fp384 *r, const fp384 *a) {
+#if USE_64BIT_LIMBS
     static const fp384 pm2={{
         0x00000000FFFFFFFD,0xFFFFFFFF00000000,
         0xFFFFFFFFFFFFFFFE,0xFFFFFFFFFFFFFFFF,
         0xFFFFFFFFFFFFFFFF,0xFFFFFFFFFFFFFFFF
     }};
+#else
+    static const fp384 pm2={{
+        0xFFFFFFFD, 0x00000000, 0x00000000, 0xFFFFFFFF,
+        0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+    }};
+#endif
     fp384 result=FP384_ONE, base=*a;
     for(int i=0;i<384;i++){
-        if((pm2.v[i/64]>>(i%64))&1) fp384_mul(&result,&result,&base);
+        if((pm2.v[i/LIMB_BITS]>>(i%LIMB_BITS))&1) fp384_mul(&result,&result,&base);
         fp384_sqr(&base,&base);
     }
     *r=result;
 }
 
 static void fp384_from_bytes(fp384 *r, const uint8_t b[48]) {
-    for(int i=0;i<6;i++){r->v[i]=0;for(int j=0;j<8;j++)r->v[i]|=(uint64_t)b[47-(i*8+j)]<<(8*j);}
+    for(int i=0;i<FP384_N;i++){r->v[i]=0;for(int j=0;j<LIMB_BYTES;j++)r->v[i]|=(limb_t)b[47-(i*LIMB_BYTES+j)]<<(8*j);}
 }
 static void fp384_to_bytes(uint8_t b[48], const fp384 *a) {
-    for(int i=0;i<6;i++)for(int j=0;j<8;j++)b[47-(i*8+j)]=(a->v[i]>>(8*j))&0xFF;
+    for(int i=0;i<FP384_N;i++)for(int j=0;j<LIMB_BYTES;j++)b[47-(i*LIMB_BYTES+j)]=(uint8_t)((a->v[i]>>(8*j))&0xFF);
 }
 
 /* ================================================================
@@ -1345,6 +1480,7 @@ static void fp384_to_bytes(uint8_t b[48], const fp384 *a) {
  * ================================================================ */
 typedef struct { fp384 x,y,z; } ec384;
 
+#if USE_64BIT_LIMBS
 static const fp384 P384_B ={{
     0x2A85C8EDD3EC2AEF, 0xC656398D8A2ED19D, 0x0314088F5013875A,
     0x181D9C6EFE814112, 0x988E056BE3F82D19, 0xB3312FA7E23EE7E4}};
@@ -1354,6 +1490,20 @@ static const fp384 P384_GX={{
 static const fp384 P384_GY={{
     0x7A431D7C90EA0E5F, 0x0A60B1CE1D7E819D, 0xE9DA3113B5F0B8C0,
     0xF8F41DBD289A147C, 0x5D9E98BF9292DC29, 0x3617DE4A96262C6F}};
+#else
+static const fp384 P384_B ={{
+    0xD3EC2AEF, 0x2A85C8ED, 0x8A2ED19D, 0xC656398D,
+    0x5013875A, 0x0314088F, 0xFE814112, 0x181D9C6E,
+    0xE3F82D19, 0x988E056B, 0xE23EE7E4, 0xB3312FA7}};
+static const fp384 P384_GX={{
+    0x72760AB7, 0x3A545E38, 0xBF55296C, 0x5502F25D,
+    0x82542A38, 0x59F741E0, 0x8BA79B98, 0x6E1D3B62,
+    0xF320AD74, 0x8EB1C71E, 0xBE8B0537, 0xAA87CA22}};
+static const fp384 P384_GY={{
+    0x90EA0E5F, 0x7A431D7C, 0x1D7E819D, 0x0A60B1CE,
+    0xB5F0B8C0, 0xE9DA3113, 0x289A147C, 0xF8F41DBD,
+    0x9292DC29, 0x5D9E98BF, 0x96262C6F, 0x3617DE4A}};
+#endif
 
 static const uint8_t P384_ORDER[48] = {
     0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
@@ -1365,7 +1515,7 @@ static const uint8_t P384_ORDER[48] = {
 
 /* Check if affine point (x,y) is on curve: y^2 = x^3 - 3x + b */
 static int ec384_on_curve(const fp384 *x, const fp384 *y) {
-    fp384 y2, x3, t, three={{3,0,0,0,0,0}};
+    fp384 y2, x3, t, three={{0}}; three.v[0]=3;
     fp384_sqr(&y2, y);
     fp384_sqr(&t, x); fp384_mul(&x3, &t, x);
     fp384_mul(&t, x, &three);
@@ -1439,10 +1589,10 @@ static void ec384_to_affine(fp384 *ax, fp384 *ay, const ec384 *p) {
 }
 
 /* Constant-time conditional swap of two EC points */
-static void ec384_cswap(ec384 *a, ec384 *b, uint64_t bit) {
-    uint64_t mask = -(uint64_t)bit;
-    for(int i=0;i<6;i++){
-        uint64_t d;
+static void ec384_cswap(ec384 *a, ec384 *b, limb_t bit) {
+    limb_t mask = -(limb_t)bit;
+    for(int i=0;i<FP384_N;i++){
+        limb_t d;
         d=mask&(a->x.v[i]^b->x.v[i]); a->x.v[i]^=d; b->x.v[i]^=d;
         d=mask&(a->y.v[i]^b->y.v[i]); a->y.v[i]^=d; b->y.v[i]^=d;
         d=mask&(a->z.v[i]^b->z.v[i]); a->z.v[i]^=d; b->z.v[i]^=d;
@@ -1460,7 +1610,7 @@ static void ec384_scalar_mul(ec384 *r, const ec384 *p, const uint8_t scalar[48])
     for(int i=382;i>=0;i--){
         int byte_idx=47-(i/8);
         int bit_pos=i%8;
-        uint64_t bit=(scalar[byte_idx]>>bit_pos)&1;
+        limb_t bit=(scalar[byte_idx]>>bit_pos)&1;
         ec384_cswap(&R0,&R1,bit);
         ec384_add(&R1,&R0,&R1);
         ec384_double(&R0,&R0);
@@ -1512,8 +1662,9 @@ static void ecdhe_p384_shared_secret(const uint8_t priv[P384_SCALAR_LEN],
  * P-256 Field Arithmetic (mod p, p = 2^256 - 2^224 + 2^192 + 2^96 - 1)
  * Constant-time fixed-width 4x64-bit limbs, modeled on fp384.
  * ================================================================ */
-typedef struct { uint64_t v[4]; } fp256;
+typedef struct { limb_t v[FP256_N]; } fp256;
 
+#if USE_64BIT_LIMBS
 static const fp256 P256_P = {{
     0xFFFFFFFFFFFFFFFF, 0x00000000FFFFFFFF,
     0x0000000000000000, 0xFFFFFFFF00000001
@@ -1532,6 +1683,26 @@ static const fp256 P256_GY = {{
     0xCBB6406837BF51F5, 0x2BCE33576B315ECE,
     0x8EE7EB4A7C0F9E16, 0x4FE342E2FE1A7F9B
 }};
+#else
+static const fp256 P256_P = {{
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
+    0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF
+}};
+static const fp256 FP256_ZERO = {{0,0,0,0,0,0,0,0}};
+static const fp256 FP256_ONE  = {{1,0,0,0,0,0,0,0}};
+static const fp256 P256_B = {{
+    0x27D2604B, 0x3BCE3C3E, 0xCC53B0F6, 0x651D06B0,
+    0x769886BC, 0xB3EBBD55, 0xAA3A93E7, 0x5AC635D8
+}};
+static const fp256 P256_GX = {{
+    0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81,
+    0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2
+}};
+static const fp256 P256_GY = {{
+    0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357,
+    0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2
+}};
+#endif
 
 static const uint8_t P256_ORDER[32] = {
     0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,
@@ -1540,41 +1711,42 @@ static const uint8_t P256_ORDER[32] = {
 };
 
 static int fp256_cmp(const fp256 *a, const fp256 *b) {
-    for(int i=3;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
+    for(int i=FP256_N-1;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
 }
 
 static int fp256_is_zero(const fp256 *a) {
-    return (a->v[0]|a->v[1]|a->v[2]|a->v[3])==0;
+    limb_t z=0; for(int i=0;i<FP256_N;i++) z|=a->v[i]; return z==0;
 }
 
-static uint64_t fp256_add_raw(fp256 *r, const fp256 *a, const fp256 *b) {
-    uint64_t c=0;
-    for(int i=0;i<4;i++){c=adc64(a->v[i],b->v[i],c,&r->v[i]);}
+static limb_t fp256_add_raw(fp256 *r, const fp256 *a, const fp256 *b) {
+    limb_t c=0;
+    for(int i=0;i<FP256_N;i++){c=adc_limb(a->v[i],b->v[i],c,&r->v[i]);}
     return c;
 }
 
-static uint64_t fp256_sub_raw(fp256 *r, const fp256 *a, const fp256 *b) {
-    uint64_t borrow=0;
-    for(int i=0;i<4;i++){
-        borrow=sbb64(a->v[i],b->v[i],borrow,&r->v[i]);
+static limb_t fp256_sub_raw(fp256 *r, const fp256 *a, const fp256 *b) {
+    limb_t borrow=0;
+    for(int i=0;i<FP256_N;i++){
+        borrow=sbb_limb(a->v[i],b->v[i],borrow,&r->v[i]);
     }
     return borrow;
 }
 
 static void fp256_add(fp256 *r, const fp256 *a, const fp256 *b) {
-    uint64_t carry=fp256_add_raw(r,a,b);
-    fp256 t; uint64_t borrow=fp256_sub_raw(&t,r,&P256_P);
-    uint64_t mask=-(uint64_t)(carry|(1-borrow));
-    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    limb_t carry=fp256_add_raw(r,a,b);
+    fp256 t; limb_t borrow=fp256_sub_raw(&t,r,&P256_P);
+    limb_t mask=-(limb_t)(carry|(1-borrow));
+    for(int i=0;i<FP256_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
 static void fp256_sub(fp256 *r, const fp256 *a, const fp256 *b) {
-    uint64_t borrow=fp256_sub_raw(r,a,b);
+    limb_t borrow=fp256_sub_raw(r,a,b);
     fp256 t; fp256_add_raw(&t,r,&P256_P);
-    uint64_t mask=-(uint64_t)borrow;
-    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    limb_t mask=-(limb_t)borrow;
+    for(int i=0;i<FP256_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
+#if USE_64BIT_LIMBS
 static void fp256_mul(fp256 *r, const fp256 *a, const fp256 *b) {
     /* Schoolbook 4x4 -> 8 limbs */
     uint64_t w[8]; memset(w,0,sizeof(w));
@@ -1625,28 +1797,82 @@ static void fp256_mul(fp256 *r, const fp256 *a, const fp256 *b) {
     fp256_sub(&T,&T,&s9);
     *r=T;
 }
+#else /* 32-bit limbs: 8×8 schoolbook, limbs are the 32-bit words directly */
+static void fp256_mul(fp256 *r, const fp256 *a, const fp256 *b) {
+    /* Schoolbook 8x8 -> 16 limbs (32-bit) */
+    uint32_t w[16]; memset(w,0,sizeof(w));
+    for(int i=0;i<8;i++){
+        uint32_t carry=0;
+        for(int j=0;j<8;j++){
+            mac_limb(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
+        }
+        w[i+8]=carry;
+    }
+    /* NIST FIPS 186-4 D.2.3 fast reduction for P-256.
+     * c[0..15] = w[0..15] — limbs ARE the 32-bit words.
+     * s1..s9 constructed directly from limbs. */
+    uint32_t *c = w;
+    /* s1 = (c7,c6,c5,c4,c3,c2,c1,c0) */
+    fp256 s1={{c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7]}};
+    /* s2 = (c15,c14,c13,c12,c11,0,0,0) */
+    fp256 s2={{0,0,0,c[11],c[12],c[13],c[14],c[15]}};
+    /* s3 = (0,c15,c14,c13,c12,0,0,0) */
+    fp256 s3={{0,0,0,c[12],c[13],c[14],c[15],0}};
+    /* s4 = (c15,c14,0,0,0,c10,c9,c8) */
+    fp256 s4={{c[8],c[9],c[10],0,0,0,c[14],c[15]}};
+    /* s5 = (c8,c13,c15,c14,c13,c11,c10,c9) */
+    fp256 s5={{c[9],c[10],c[11],c[13],c[14],c[15],c[13],c[8]}};
+    /* s6 = (c10,c8,0,0,0,c13,c12,c11) */
+    fp256 s6={{c[11],c[12],c[13],0,0,0,c[8],c[10]}};
+    /* s7 = (c11,c9,0,0,c15,c14,c13,c12) */
+    fp256 s7={{c[12],c[13],c[14],c[15],0,0,c[9],c[11]}};
+    /* s8 = (c12,0,c10,c9,c8,c15,c14,c13) */
+    fp256 s8={{c[13],c[14],c[15],c[8],c[9],c[10],0,c[12]}};
+    /* s9 = (c13,0,c11,c10,c9,0,c15,c14) */
+    fp256 s9={{c[14],c[15],0,c[9],c[10],c[11],0,c[13]}};
+    /* Accumulate: T = s1 + 2*s2 + 2*s3 + s4 + s5 - s6 - s7 - s8 - s9 */
+    fp256 T;
+    T=s1;
+    fp256_add(&T,&T,&s2); fp256_add(&T,&T,&s2);
+    fp256_add(&T,&T,&s3); fp256_add(&T,&T,&s3);
+    fp256_add(&T,&T,&s4);
+    fp256_add(&T,&T,&s5);
+    fp256_sub(&T,&T,&s6);
+    fp256_sub(&T,&T,&s7);
+    fp256_sub(&T,&T,&s8);
+    fp256_sub(&T,&T,&s9);
+    *r=T;
+}
+#endif
 
 static void fp256_sqr(fp256 *r, const fp256 *a){fp256_mul(r,a,a);}
 
 static void fp256_inv(fp256 *r, const fp256 *a) {
     /* Fermat's little theorem: a^(p-2) mod p */
+#if USE_64BIT_LIMBS
     static const fp256 pm2={{
         0xFFFFFFFFFFFFFFFD, 0x00000000FFFFFFFF,
         0x0000000000000000, 0xFFFFFFFF00000001
     }};
+#else
+    static const fp256 pm2={{
+        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
+        0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF
+    }};
+#endif
     fp256 result=FP256_ONE, base=*a;
     for(int i=0;i<256;i++){
-        if((pm2.v[i/64]>>(i%64))&1) fp256_mul(&result,&result,&base);
+        if((pm2.v[i/LIMB_BITS]>>(i%LIMB_BITS))&1) fp256_mul(&result,&result,&base);
         fp256_sqr(&base,&base);
     }
     *r=result;
 }
 
 static void fp256_from_bytes(fp256 *r, const uint8_t b[32]) {
-    for(int i=0;i<4;i++){r->v[i]=0;for(int j=0;j<8;j++)r->v[i]|=(uint64_t)b[31-(i*8+j)]<<(8*j);}
+    for(int i=0;i<FP256_N;i++){r->v[i]=0;for(int j=0;j<LIMB_BYTES;j++)r->v[i]|=(limb_t)b[31-(i*LIMB_BYTES+j)]<<(8*j);}
 }
 static void fp256_to_bytes(uint8_t b[32], const fp256 *a) {
-    for(int i=0;i<4;i++)for(int j=0;j<8;j++)b[31-(i*8+j)]=(a->v[i]>>(8*j))&0xFF;
+    for(int i=0;i<FP256_N;i++)for(int j=0;j<LIMB_BYTES;j++)b[31-(i*LIMB_BYTES+j)]=(uint8_t)((a->v[i]>>(8*j))&0xFF);
 }
 
 /* ================================================================
@@ -1659,7 +1885,7 @@ static int ec256_is_inf(const ec256 *p){return fp256_is_zero(&p->z);}
 static void ec256_set_inf(ec256 *p){p->x=FP256_ONE;p->y=FP256_ONE;p->z=FP256_ZERO;}
 
 static int ec256_on_curve(const fp256 *x, const fp256 *y) {
-    fp256 y2, x3, t, three={{3,0,0,0}};
+    fp256 y2, x3, t, three={{0}}; three.v[0]=3;
     fp256_sqr(&y2, y);
     fp256_sqr(&t, x); fp256_mul(&x3, &t, x);
     fp256_mul(&t, x, &three);
@@ -1726,10 +1952,10 @@ static void ec256_to_affine(fp256 *ax, fp256 *ay, const ec256 *p) {
     fp256_mul(ax,&p->x,&zi2); fp256_mul(ay,&p->y,&zi3);
 }
 
-static void ec256_cswap(ec256 *a, ec256 *b, uint64_t bit) {
-    uint64_t mask = -(uint64_t)bit;
-    for(int i=0;i<4;i++){
-        uint64_t d;
+static void ec256_cswap(ec256 *a, ec256 *b, limb_t bit) {
+    limb_t mask = -(limb_t)bit;
+    for(int i=0;i<FP256_N;i++){
+        limb_t d;
         d=mask&(a->x.v[i]^b->x.v[i]); a->x.v[i]^=d; b->x.v[i]^=d;
         d=mask&(a->y.v[i]^b->y.v[i]); a->y.v[i]^=d; b->y.v[i]^=d;
         d=mask&(a->z.v[i]^b->z.v[i]); a->z.v[i]^=d; b->z.v[i]^=d;
@@ -1747,7 +1973,7 @@ static void ec256_scalar_mul(ec256 *r, const ec256 *p, const uint8_t scalar[32])
     for(int i=254;i>=0;i--){
         int byte_idx=31-(i/8);
         int bit_pos=i%8;
-        uint64_t bit=(scalar[byte_idx]>>bit_pos)&1;
+        limb_t bit=(scalar[byte_idx]>>bit_pos)&1;
         ec256_cswap(&R0,&R1,bit);
         ec256_add(&R1,&R0,&R1);
         ec256_double(&R0,&R0);
@@ -1810,44 +2036,51 @@ static void ecdhe_p256_shared_secret(const uint8_t priv[P256_SCALAR_LEN],
  * Curve25519 / X25519 Key Exchange
  * Field: GF(2^255 - 19), 4×64-bit limbs (little-endian)
  * ================================================================ */
-typedef struct { uint64_t v[4]; } fp25519;
+typedef struct { limb_t v[FP25519_N]; } fp25519;
 
+#if USE_64BIT_LIMBS
 static const fp25519 FP25519_ZERO = {{0,0,0,0}};
-
-/* p = 2^255 - 19 */
 static const fp25519 FP25519_P = {{
     0xFFFFFFFFFFFFFFED, 0xFFFFFFFFFFFFFFFF,
     0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF
 }};
+#else
+static const fp25519 FP25519_ZERO = {{0,0,0,0,0,0,0,0}};
+static const fp25519 FP25519_P = {{
+    0xFFFFFFED, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF
+}};
+#endif
 
-static uint64_t fp25519_add_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
-    uint64_t c=0;
-    for(int i=0;i<4;i++){c=adc64(a->v[i],b->v[i],c,&r->v[i]);}
+static limb_t fp25519_add_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    limb_t c=0;
+    for(int i=0;i<FP25519_N;i++){c=adc_limb(a->v[i],b->v[i],c,&r->v[i]);}
     return c;
 }
 
-static uint64_t fp25519_sub_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
-    uint64_t borrow=0;
-    for(int i=0;i<4;i++){
-        borrow=sbb64(a->v[i],b->v[i],borrow,&r->v[i]);
+static limb_t fp25519_sub_raw(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    limb_t borrow=0;
+    for(int i=0;i<FP25519_N;i++){
+        borrow=sbb_limb(a->v[i],b->v[i],borrow,&r->v[i]);
     }
     return borrow;
 }
 
 static void fp25519_add(fp25519 *r, const fp25519 *a, const fp25519 *b) {
-    uint64_t carry=fp25519_add_raw(r,a,b);
-    fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
-    uint64_t mask=-(uint64_t)(carry|(1-borrow));
-    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    limb_t carry=fp25519_add_raw(r,a,b);
+    fp25519 t; limb_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
+    limb_t mask=-(limb_t)(carry|(1-borrow));
+    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
 static void fp25519_sub(fp25519 *r, const fp25519 *a, const fp25519 *b) {
-    uint64_t borrow=fp25519_sub_raw(r,a,b);
+    limb_t borrow=fp25519_sub_raw(r,a,b);
     fp25519 t; fp25519_add_raw(&t,r,&FP25519_P);
-    uint64_t mask=-(uint64_t)borrow;
-    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    limb_t mask=-(limb_t)borrow;
+    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
 
+#if USE_64BIT_LIMBS
 static void fp25519_mul(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     /* Schoolbook 4×4 → 8 limbs, reduce via 2^256 ≡ 38 (mod p) */
     uint64_t w[8]; memset(w,0,sizeof(w));
@@ -1876,28 +2109,72 @@ static void fp25519_mul(fp25519 *r, const fp25519 *a, const fp25519 *b) {
     for(int i=1;i<4&&ac;i++){ac=addcarry64(w[i], ac, &w[i]);}
     fp25519 res={{w[0],w[1],w[2],w[3]}};
     /* Conditional subtraction of p */
-    fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,&res,&FP25519_P);
-    uint64_t mask=-(uint64_t)(1-borrow);
-    for(int i=0;i<4;i++) res.v[i]=(res.v[i]&~mask)|(t.v[i]&mask);
+    fp25519 t; limb_t borrow=fp25519_sub_raw(&t,&res,&FP25519_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    for(int i=0;i<FP25519_N;i++) res.v[i]=(res.v[i]&~mask)|(t.v[i]&mask);
     *r=res;
 }
+#else /* 32-bit limbs: 8×8 schoolbook, native uint64_t for double-width */
+static void fp25519_mul(fp25519 *r, const fp25519 *a, const fp25519 *b) {
+    /* Schoolbook 8×8 → 16 limbs (32-bit), reduce via 2^256 ≡ 38 (mod p) */
+    uint32_t w[16]; memset(w,0,sizeof(w));
+    for(int i=0;i<8;i++){
+        uint32_t carry=0;
+        for(int j=0;j<8;j++){
+            mac_limb(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
+        }
+        w[i+8]=carry;
+    }
+    /* Reduce: result = w[0..7] + w[8..15] * 38 */
+    uint64_t carry=0;
+    for(int i=0;i<8;i++){
+        uint64_t s = (uint64_t)w[i] + (uint64_t)w[i+8] * 38 + carry;
+        w[i] = (uint32_t)s;
+        carry = s >> 32;
+    }
+    /* Carry could be up to ~38, fold once more */
+    uint64_t fold = carry * 38;
+    carry = 0;
+    for(int i=0;i<8;i++){
+        uint64_t s = (uint64_t)w[i] + fold + carry;
+        w[i] = (uint32_t)s;
+        carry = s >> 32;
+        fold = 0;
+    }
+    fp25519 res={{w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]}};
+    /* Conditional subtraction of p */
+    fp25519 t; limb_t borrow=fp25519_sub_raw(&t,&res,&FP25519_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    for(int i=0;i<FP25519_N;i++) res.v[i]=(res.v[i]&~mask)|(t.v[i]&mask);
+    *r=res;
+}
+#endif
 
 static void fp25519_sqr(fp25519 *r, const fp25519 *a){fp25519_mul(r,a,a);}
 
 static void fp25519_inv(fp25519 *r, const fp25519 *a) {
     /* Fermat: a^(p-2) mod p, p-2 = 2^255 - 21 */
+#if USE_64BIT_LIMBS
     static const fp25519 pm2={{
         0xFFFFFFFFFFFFFFEB, 0xFFFFFFFFFFFFFFFF,
         0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF
     }};
-    fp25519 result={{1,0,0,0}}, base=*a;
+#else
+    static const fp25519 pm2={{
+        0xFFFFFFEB, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF
+    }};
+#endif
+    fp25519 result={{0}}; result.v[0]=1;
+    fp25519 base=*a;
     for(int i=0;i<255;i++){
-        if((pm2.v[i/64]>>(i%64))&1) fp25519_mul(&result,&result,&base);
+        if((pm2.v[i/LIMB_BITS]>>(i%LIMB_BITS))&1) fp25519_mul(&result,&result,&base);
         fp25519_sqr(&base,&base);
     }
     *r=result;
 }
 
+#if USE_64BIT_LIMBS
 static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     /* Multiply by a24 = (486662-2)/4 = 121665 per RFC 7748 */
     uint64_t c_hi=0, c_lo=0;
@@ -1916,22 +2193,45 @@ static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     uint64_t ac=addcarry64(r->v[0], fold, &r->v[0]);
     for(int i=1;i<4&&ac;i++){ac=addcarry64(r->v[i], ac, &r->v[i]);}
     /* Conditional subtraction */
-    fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
-    uint64_t mask=-(uint64_t)(1-borrow);
-    for(int i=0;i<4;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+    fp25519 t; limb_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
 }
+#else /* 32-bit: native uint64_t multiplication */
+static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
+    uint64_t carry=0;
+    for(int i=0;i<8;i++){
+        uint64_t s = (uint64_t)a->v[i] * 121665 + carry;
+        r->v[i] = (uint32_t)s;
+        carry = s >> 32;
+    }
+    /* Reduce carry: carry * 38 */
+    uint64_t fold = carry * 38;
+    carry = 0;
+    for(int i=0;i<8;i++){
+        uint64_t s = (uint64_t)r->v[i] + fold + carry;
+        r->v[i] = (uint32_t)s;
+        carry = s >> 32;
+        fold = 0;
+    }
+    /* Conditional subtraction */
+    fp25519 t; limb_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    for(int i=0;i<FP25519_N;i++) r->v[i]=(r->v[i]&~mask)|(t.v[i]&mask);
+}
+#endif
 
-static void fp25519_cswap(fp25519 *a, fp25519 *b, uint64_t bit) {
-    uint64_t mask=-(uint64_t)bit;
-    for(int i=0;i<4;i++){
-        uint64_t d=mask&(a->v[i]^b->v[i]);
+static void fp25519_cswap(fp25519 *a, fp25519 *b, limb_t bit) {
+    limb_t mask=-(limb_t)bit;
+    for(int i=0;i<FP25519_N;i++){
+        limb_t d=mask&(a->v[i]^b->v[i]);
         a->v[i]^=d; b->v[i]^=d;
     }
 }
 
 /* Load 32 bytes little-endian into fp25519 */
 static void fp25519_from_le(fp25519 *r, const uint8_t b[32]) {
-    for(int i=0;i<4;i++){r->v[i]=0;for(int j=0;j<8;j++)r->v[i]|=(uint64_t)b[i*8+j]<<(8*j);}
+    for(int i=0;i<FP25519_N;i++){r->v[i]=0;for(int j=0;j<LIMB_BYTES;j++)r->v[i]|=(limb_t)b[i*LIMB_BYTES+j]<<(8*j);}
 }
 
 /* Store fp25519 as 32 bytes little-endian. Fully reduces first. */
@@ -1939,11 +2239,11 @@ static void fp25519_to_le(uint8_t b[32], const fp25519 *a) {
     fp25519 t=*a;
     /* Ensure fully reduced: subtract p if >= p (up to 2 times) */
     for(int pass=0;pass<2;pass++){
-        fp25519 s; uint64_t borrow=fp25519_sub_raw(&s,&t,&FP25519_P);
-        uint64_t mask=-(uint64_t)(1-borrow);
-        for(int i=0;i<4;i++) t.v[i]=(t.v[i]&~mask)|(s.v[i]&mask);
+        fp25519 s; limb_t borrow=fp25519_sub_raw(&s,&t,&FP25519_P);
+        limb_t mask=-(limb_t)(1-borrow);
+        for(int i=0;i<FP25519_N;i++) t.v[i]=(t.v[i]&~mask)|(s.v[i]&mask);
     }
-    for(int i=0;i<4;i++)for(int j=0;j<8;j++)b[i*8+j]=(t.v[i]>>(8*j))&0xFF;
+    for(int i=0;i<FP25519_N;i++)for(int j=0;j<LIMB_BYTES;j++)b[i*LIMB_BYTES+j]=(uint8_t)((t.v[i]>>(8*j))&0xFF);
 }
 
 /* X25519 Montgomery ladder (RFC 7748 §5) — x-coordinate only */
@@ -1954,11 +2254,11 @@ static void x25519_scalar_mult(const uint8_t scalar[32],
     uint8_t s[32]; memcpy(s,scalar,32);
     s[0]&=248; s[31]&=127; s[31]|=64;
     /* Montgomery ladder */
-    fp25519 x_2={{1,0,0,0}}, z_2=FP25519_ZERO;
-    fp25519 x_3=u, z_3={{1,0,0,0}};
-    uint64_t swap=0;
+    fp25519 x_2={{0}}, z_2=FP25519_ZERO; x_2.v[0]=1;
+    fp25519 x_3=u, z_3={{0}}; z_3.v[0]=1;
+    limb_t swap=0;
     for(int t=254;t>=0;t--){
-        uint64_t kt=(s[t/8]>>(t%8))&1;
+        limb_t kt=(s[t/8]>>(t%8))&1;
         swap^=kt;
         fp25519_cswap(&x_2,&x_3,swap);
         fp25519_cswap(&z_2,&z_3,swap);
