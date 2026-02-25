@@ -70,7 +70,7 @@ typedef unsigned __int128 uint128_t;
 #define HS_BUF_SIZE   65536
 #define REQ_BUF_SIZE  512
 
-static void die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
+_Noreturn static void die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
 
 static void random_bytes(uint8_t *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);
@@ -1206,7 +1206,7 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
     for(int i=8;i<10;i++){c+=(uint128_t)acc[i];acc[i]=(uint64_t)c;c>>=64;}
     /* +hi<<96 (shift by 1 limb + 32 bits) */
     { uint64_t sh[10]={0};
-      for(int i=0;i<6;i++){sh[i+1]|=w[i+6]<<32; if(i+2<10) sh[i+2]|=w[i+6]>>32;}
+      for(int i=0;i<6;i++){sh[i+1]|=w[i+6]<<32; sh[i+2]|=w[i+6]>>32;}
       c=0; for(int i=0;i<10;i++){c+=(uint128_t)acc[i]+sh[i];acc[i]=(uint64_t)c;c>>=64;}
     }
     /* -hi<<32 */
@@ -1230,7 +1230,7 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
       c=0; for(int i=0;i<4;i++){c+=(uint128_t)acc[i+2]+hi2[i];acc[i+2]=(uint64_t)c;c>>=64;}
       for(int i=6;i<10;i++){c+=(uint128_t)acc[i];acc[i]=(uint64_t)c;c>>=64;}
       { uint64_t sh[10]={0};
-        for(int i=0;i<4;i++){sh[i+1]|=hi2[i]<<32; if(i+2<10) sh[i+2]|=hi2[i]>>32;}
+        for(int i=0;i<4;i++){sh[i+1]|=hi2[i]<<32; sh[i+2]|=hi2[i]>>32;}
         c=0; for(int i=0;i<10;i++){c+=(uint128_t)acc[i]+sh[i];acc[i]=(uint64_t)c;c>>=64;}
       }
       { uint64_t sh[10]={0};
@@ -2434,7 +2434,7 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
                         const uint8_t *bv=der_read_tl(bp,sq_end,&tag,&len);
                         if(bv&&tag==0x01&&len==1&&bv[0]!=0)
                             cert->is_ca=1;
-                        bp=bv+len;
+                        if(bv) bp=bv+len;
                     }
                     if(bp<sq_end&&*bp==0x02){
                         const uint8_t *pv=der_read_tl(bp,sq_end,&tag,&len);
@@ -3795,6 +3795,7 @@ static void tls12_handshake(tls_conn *conn) {
             switch(mtype) {
                 case 11: /* Certificate */
                     printf("  Certificate (%u bytes)\n",(unsigned)mlen);
+                    free(cert12_msg);
                     cert12_msg=malloc(mlen);
                     if(!cert12_msg) die("malloc failed");
                     memcpy(cert12_msg, hs12_buf+pos+4, mlen);
@@ -4224,6 +4225,7 @@ static void tls13_handshake(tls_conn *conn) {
                     printf("  Certificate (%u bytes)\n",(unsigned)mlen);
                     if(is_aes256) sha384_update(&transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&transcript,hs_buf+pos,msg_total);
+                    free(saved_cert_msg);
                     saved_cert_msg=malloc(mlen);
                     if(!saved_cert_msg) die("malloc failed");
                     memcpy(saved_cert_msg,hs_buf+pos+4,mlen);
@@ -4637,7 +4639,7 @@ static void do_https_get(const char *host, int port, const char *path) {
         die("server sent alert");
     }
     if(rtype!=TLS_RT_HANDSHAKE) die("expected handshake record");
-    if(rec[0]!=0x02) die("expected ServerHello");
+    if(rec_len<4||rec[0]!=0x02) die("expected ServerHello");
     uint8_t server_pub[P384_POINT_LEN]; size_t server_pub_len=0;
     uint8_t server_random[32];
     uint16_t cipher_suite;
