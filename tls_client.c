@@ -222,6 +222,7 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define REQ_BUF_SIZE  512
 
 /* Socket read timeouts (seconds) */
+#define TLS_READ_TIMEOUT_S   10
 #define AIA_READ_TIMEOUT_S   5
 
 _Noreturn static void die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
@@ -3583,6 +3584,9 @@ static int tcp_connect(const char *host, int port) {
     if(fd<0) die("socket");
     if(connect(fd,res->ai_addr,res->ai_addrlen)<0) die("connect");
     freeaddrinfo(res);
+    /* Prevents hanging when a server silently drops our ClientHello */
+    struct timeval tv={TLS_READ_TIMEOUT_S,0};
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
     return fd;
 }
 
