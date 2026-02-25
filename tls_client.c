@@ -27,7 +27,7 @@
 typedef unsigned __int128 uint128_t;
 
 #define PUT16(b,v) do{(b)[0]=(uint8_t)((v)>>8);(b)[1]=(uint8_t)(v);}while(0)
-#define GET16(b) (((uint16_t)(b)[0]<<8)|(b)[1])
+#define GET16(b) ((uint16_t)(((uint16_t)(b)[0]<<8)|(b)[1]))
 #define GET24(b) (((uint32_t)(b)[0]<<16)|((uint32_t)(b)[1]<<8)|(b)[2])
 
 /* TLS record types */
@@ -76,19 +76,19 @@ static void random_bytes(uint8_t *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) die("open urandom");
     size_t d = 0;
-    while (d < len) { ssize_t n = read(fd, buf+d, len-d); if (n<=0) die("read urandom"); d+=n; }
+    while (d < len) { ssize_t n = read(fd, buf+d, len-d); if (n<=0) die("read urandom"); d+=(size_t)n; }
     close(fd);
 }
 
 static int read_exact(int fd, uint8_t *buf, size_t len) {
     size_t d = 0;
-    while (d < len) { ssize_t n = read(fd, buf+d, len-d); if (n<=0) return -1; d+=n; }
+    while (d < len) { ssize_t n = read(fd, buf+d, len-d); if (n<=0) return -1; d+=(size_t)n; }
     return 0;
 }
 
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t d = 0;
-    while (d < len) { ssize_t n = write(fd, buf+d, len-d); if (n<=0) return -1; d+=n; }
+    while (d < len) { ssize_t n = write(fd, buf+d, len-d); if (n<=0) return -1; d+=(size_t)n; }
     return 0;
 }
 
@@ -132,7 +132,7 @@ typedef struct { uint32_t h[8]; uint8_t buf[64]; size_t buf_len; uint64_t total;
 
 static void sha256_transform(sha256_ctx *ctx, const uint8_t blk[64]) {
     uint32_t w[64], a,b,c,d,e,f,g,h;
-    for (int i=0;i<16;i++)
+    for (size_t i=0;i<16;i++)
         w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)
             |((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
     for (int i=16;i<64;i++)
@@ -171,9 +171,9 @@ static void sha256_final(sha256_ctx *ctx, uint8_t out[32]) {
     while (ctx->buf_len != 56) sha256_update(ctx, &pad, 1);
     uint8_t lb[8]; for (int i=7;i>=0;i--) { lb[i]=bits&0xFF; bits>>=8; }
     sha256_update(ctx, lb, 8);
-    for (int i=0;i<8;i++) {
-        out[4*i]=(ctx->h[i]>>24)&0xFF; out[4*i+1]=(ctx->h[i]>>16)&0xFF;
-        out[4*i+2]=(ctx->h[i]>>8)&0xFF; out[4*i+3]=ctx->h[i]&0xFF;
+    for (size_t i=0;i<8;i++) {
+        out[4*i]=(uint8_t)(ctx->h[i]>>24); out[4*i+1]=(uint8_t)(ctx->h[i]>>16);
+        out[4*i+2]=(uint8_t)(ctx->h[i]>>8); out[4*i+3]=(uint8_t)ctx->h[i];
     }
 }
 
@@ -190,7 +190,7 @@ typedef struct { uint32_t h[5]; uint8_t buf[64]; size_t buf_len; uint64_t total;
 
 static void sha1_transform(sha1_ctx *ctx, const uint8_t blk[64]) {
     uint32_t w[80];
-    for(int i=0;i<16;i++)
+    for(size_t i=0;i<16;i++)
         w[i]=((uint32_t)blk[4*i]<<24)|((uint32_t)blk[4*i+1]<<16)
             |((uint32_t)blk[4*i+2]<<8)|blk[4*i+3];
     for(int i=16;i<80;i++){
@@ -234,9 +234,9 @@ static void sha1_final(sha1_ctx *ctx, uint8_t out[20]) {
     while(ctx->buf_len!=56) sha1_update(ctx,&pad,1);
     uint8_t lb[8]; for(int i=7;i>=0;i--){lb[i]=bits&0xFF;bits>>=8;}
     sha1_update(ctx,lb,8);
-    for(int i=0;i<5;i++){
-        out[4*i]=(ctx->h[i]>>24)&0xFF; out[4*i+1]=(ctx->h[i]>>16)&0xFF;
-        out[4*i+2]=(ctx->h[i]>>8)&0xFF; out[4*i+3]=ctx->h[i]&0xFF;
+    for(size_t i=0;i<5;i++){
+        out[4*i]=(uint8_t)(ctx->h[i]>>24); out[4*i+1]=(uint8_t)(ctx->h[i]>>16);
+        out[4*i+2]=(uint8_t)(ctx->h[i]>>8); out[4*i+3]=(uint8_t)ctx->h[i];
     }
 }
 
@@ -506,7 +506,7 @@ static uint8_t ct_sbox(uint8_t idx) {
 
 static void aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
     memcpy(rk,key,16);
-    for (int i=0;i<10;i++) {
+    for (size_t i=0;i<10;i++) {
         uint8_t *p=rk+16*i, *n=rk+16*(i+1);
         uint8_t t[4]={ct_sbox(p[13]),ct_sbox(p[14]),ct_sbox(p[15]),ct_sbox(p[12])};
         t[0]^=aes_rcon[i];
@@ -519,7 +519,7 @@ static void aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
 
 static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
     memcpy(rk,key,32);
-    for(int i=0;i<7;i++){
+    for(size_t i=0;i<7;i++){
         uint8_t *prev=rk+32*i;
         uint8_t *next=prev+32;
         /* First 16 bytes: RotWord+SubWord+Rcon on last 4 bytes of prev 32 */
@@ -535,7 +535,7 @@ static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
     }
 }
 
-static uint8_t xt(uint8_t x){return (x<<1)^((x>>7)*0x1b);}
+static uint8_t xt(uint8_t x){return (uint8_t)((x<<1)^((x>>7)*0x1b));}
 
 static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16]; memcpy(s,in,16);
@@ -547,7 +547,7 @@ static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t
         t=s[2];s[2]=s[10];s[10]=t; t=s[6];s[6]=s[14];s[14]=t;
         t=s[15];s[15]=s[11];s[11]=s[7];s[7]=s[3];s[3]=t;
         if(r<nr) {
-            for(int c=0;c<4;c++){
+            for(size_t c=0;c<4;c++){
                 uint8_t *col=s+4*c, a0=col[0],a1=col[1],a2=col[2],a3=col[3];
                 col[0]=xt(a0)^xt(a1)^a1^a2^a3; col[1]=a0^xt(a1)^xt(a2)^a2^a3;
                 col[2]=a0^a1^xt(a2)^xt(a3)^a3; col[3]=xt(a0)^a0^a1^a2^xt(a3);
@@ -567,7 +567,7 @@ static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
         uint8_t mask = -((x[i/8]>>(7-(i%8)))&1); /* 0x00 or 0xFF */
         for(int j=0;j<16;j++) z[j]^=v[j]&mask;
         uint8_t lsb_mask=-(v[15]&1); /* 0x00 or 0xFF */
-        for(int j=15;j>0;j--) v[j]=(v[j]>>1)|(v[j-1]<<7);
+        for(int j=15;j>0;j--) v[j]=(uint8_t)((v[j]>>1)|(v[j-1]<<7));
         v[0]>>=1; v[0]^=0xe1&lsb_mask;
     }
     memcpy(r,z,16);
@@ -577,20 +577,20 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t al,
                    const uint8_t *ct, size_t cl, uint8_t out[16]) {
     uint8_t x[16]={0}, blk[16];
     size_t i;
-    for(i=0;i+16<=al;i+=16){for(int j=0;j<16;j++)x[j]^=aad[i+j];gf128_mul(x,x,h);}
+    for(i=0;i+16<=al;i+=16){for(size_t j=0;j<16;j++)x[j]^=aad[i+j];gf128_mul(x,x,h);}
     if(i<al){
         memset(blk,0,16); memcpy(blk,aad+i,al-i);
-        for(int j=0;j<16;j++) x[j]^=blk[j]; gf128_mul(x,x,h);
+        for(int j=0;j<16;j++){x[j]^=blk[j];} gf128_mul(x,x,h);
     }
-    for(i=0;i+16<=cl;i+=16){for(int j=0;j<16;j++)x[j]^=ct[i+j];gf128_mul(x,x,h);}
+    for(i=0;i+16<=cl;i+=16){for(size_t j=0;j<16;j++)x[j]^=ct[i+j];gf128_mul(x,x,h);}
     if(i<cl){
         memset(blk,0,16); memcpy(blk,ct+i,cl-i);
-        for(int j=0;j<16;j++) x[j]^=blk[j]; gf128_mul(x,x,h);
+        for(int j=0;j<16;j++){x[j]^=blk[j];} gf128_mul(x,x,h);
     }
     memset(blk,0,16);
     uint64_t ab=al*8, cb=cl*8;
     for(int j=0;j<8;j++){blk[7-j]=(ab>>(8*j))&0xFF;blk[15-j]=(cb>>(8*j))&0xFF;}
-    for(int j=0;j<16;j++)x[j]^=blk[j]; gf128_mul(x,x,h);
+    for(int j=0;j<16;j++){x[j]^=blk[j];} gf128_mul(x,x,h);
     memcpy(out,x,16);
 }
 
@@ -676,7 +676,7 @@ static uint8_t xtm(uint8_t x, uint8_t m) {
     for(int i=0;i<8;i++){
         if(m&1) r^=x;
         uint8_t hi=x&0x80;
-        x=(x<<1)^(hi?0x1b:0);
+        x=(uint8_t)((x<<1)^(hi?0x1b:0));
         m>>=1;
     }
     return r;
@@ -697,7 +697,7 @@ static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t
         for(int i=0;i<16;i++) s[i]^=rk[16*r+i];
         /* InvMixColumns (skip for round 0) */
         if(r>0){
-            for(int c=0;c<4;c++){
+            for(size_t c=0;c<4;c++){
                 uint8_t *col=s+4*c, a0=col[0],a1=col[1],a2=col[2],a3=col[3];
                 col[0]=xtm(a0,0x0e)^xtm(a1,0x0b)^xtm(a2,0x0d)^xtm(a3,0x09);
                 col[1]=xtm(a0,0x09)^xtm(a1,0x0e)^xtm(a2,0x0b)^xtm(a3,0x0d);
@@ -721,7 +721,7 @@ static void aes_cbc_encrypt(const uint8_t *key, size_t key_len,
     uint8_t prev[16]; memcpy(prev,iv,16);
     for(size_t i=0;i<len;i+=16){
         uint8_t blk[16];
-        for(int j=0;j<16;j++) blk[j]=pt[i+j]^prev[j];
+        for(size_t j=0;j<16;j++) blk[j]=pt[i+j]^prev[j];
         aes_encrypt(rk,nr,blk,ct+i);
         memcpy(prev,ct+i,16);
     }
@@ -737,7 +737,7 @@ static void aes_cbc_decrypt(const uint8_t *key, size_t key_len,
     for(size_t i=0;i<len;i+=16){
         uint8_t blk[16];
         aes_decrypt(rk,nr,ct+i,blk);
-        for(int j=0;j<16;j++) pt[i+j]=blk[j]^prev[j];
+        for(size_t j=0;j<16;j++) pt[i+j]=blk[j]^prev[j];
         memcpy(prev,ct+i,16);
     }
 }
@@ -748,20 +748,20 @@ static void aes_cbc_decrypt(const uint8_t *key, size_t key_len,
 static uint32_t rotl32(uint32_t x, int n){return (x<<n)|(x>>(32-n));}
 
 #define QR(a,b,c,d) \
-    a+=b;d^=a;d=rotl32(d,16); \
-    c+=d;b^=c;b=rotl32(b,12); \
-    a+=b;d^=a;d=rotl32(d,8);  \
-    c+=d;b^=c;b=rotl32(b,7);
+    (a)+=(b);(d)^=(a);(d)=rotl32((d),16); \
+    (c)+=(d);(b)^=(c);(b)=rotl32((b),12); \
+    (a)+=(b);(d)^=(a);(d)=rotl32((d),8);  \
+    (c)+=(d);(b)^=(c);(b)=rotl32((b),7);
 
 static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12],
     uint32_t counter, uint8_t out[64]) {
     uint32_t s[16];
     s[0]=0x61707865; s[1]=0x3320646e; s[2]=0x79622d32; s[3]=0x6b206574;
-    for(int i=0;i<8;i++)
+    for(size_t i=0;i<8;i++)
         s[4+i]=(uint32_t)key[4*i]|((uint32_t)key[4*i+1]<<8)
               |((uint32_t)key[4*i+2]<<16)|((uint32_t)key[4*i+3]<<24);
     s[12]=counter;
-    for(int i=0;i<3;i++)
+    for(size_t i=0;i<3;i++)
         s[13+i]=(uint32_t)nonce[4*i]|((uint32_t)nonce[4*i+1]<<8)
                |((uint32_t)nonce[4*i+2]<<16)|((uint32_t)nonce[4*i+3]<<24);
     uint32_t w[16]; memcpy(w,s,64);
@@ -772,7 +772,7 @@ static void chacha20_block(const uint8_t key[32], const uint8_t nonce[12],
         QR(w[2],w[7],w[8],w[13])  QR(w[3],w[4],w[9],w[14])
     }
     for(int i=0;i<16;i++) w[i]+=s[i];
-    for(int i=0;i<16;i++){
+    for(size_t i=0;i<16;i++){
         out[4*i]=(uint8_t)w[i]; out[4*i+1]=(uint8_t)(w[i]>>8);
         out[4*i+2]=(uint8_t)(w[i]>>16); out[4*i+3]=(uint8_t)(w[i]>>24);
     }
@@ -967,7 +967,8 @@ static int bn_cmp(const bignum *a, const bignum *b) {
     int ml=a->len>b->len?a->len:b->len;
     for(int i=ml-1;i>=0;i--){
         uint64_t av=i<a->len?a->v[i]:0, bv=i<b->len?b->v[i]:0;
-        if(av>bv)return 1; if(av<bv)return -1;
+        if(av>bv) return 1;
+        if(av<bv) return -1;
     }
     return 0;
 }
@@ -1066,7 +1067,7 @@ static void bn_mont_mul(bignum *r, const bignum *a, const bignum *b,
                         const bignum *m, const bn_mont_ctx *ctx) {
     int n = ctx->n;
     uint64_t t[BN_MAX_LIMBS + 2];
-    memset(t, 0, (n + 2) * sizeof(uint64_t));
+    memset(t, 0, ((size_t)n + 2) * sizeof(uint64_t));
     for (int i = 0; i < n; i++) {
         uint64_t ai = (i < a->len) ? a->v[i] : 0;
         /* t += a[i] * b */
@@ -1529,7 +1530,7 @@ static void fp256_mul(fp256 *r, const fp256 *a, const fp256 *b) {
      * Each si = (A7,A6,...,A0) big-endian 32-bit words.
      * Limb mapping: v[k] = (A_{2k+1} << 32) | A_{2k} */
     uint32_t c[16];
-    for(int i=0;i<8;i++){c[2*i]=(uint32_t)w[i];c[2*i+1]=(uint32_t)(w[i]>>32);}
+    for(size_t i=0;i<8;i++){c[2*i]=(uint32_t)w[i];c[2*i+1]=(uint32_t)(w[i]>>32);}
     #define W(hi,lo) ((uint64_t)(lo)|((uint64_t)(hi)<<32))
     /* s1 = (c7,c6,c5,c4,c3,c2,c1,c0) */
     fp256 s1={{w[0],w[1],w[2],w[3]}};
@@ -1840,7 +1841,7 @@ static void fp25519_mul_a24(fp25519 *r, const fp25519 *a) {
     }
     /* Reduce carry: carry * 38 */
     uint64_t hi=(uint64_t)c;
-    c=(uint128_t)r->v[0]+hi*38; r->v[0]=(uint64_t)c; c>>=64;
+    c=(uint128_t)r->v[0]+(uint128_t)hi*38; r->v[0]=(uint64_t)c; c>>=64;
     for(int i=1;i<4&&c;i++){c+=(uint128_t)r->v[i]; r->v[i]=(uint64_t)c; c>>=64;}
     /* Conditional subtraction */
     fp25519 t; uint64_t borrow=fp25519_sub_raw(&t,r,&FP25519_P);
@@ -1953,7 +1954,7 @@ static int b64val(uint8_t c) {
 static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
     const char *begin = strstr(pem, "-----BEGIN ");
     if (!begin) return 0;
-    begin = memchr(begin, '\n', pem_len-(begin-pem));
+    begin = memchr(begin, '\n', pem_len-(size_t)(begin-pem));
     if (!begin) return 0;
     begin++;
     const char *end = strstr(begin, "-----END ");
@@ -1963,7 +1964,7 @@ static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
     for (const char *p = begin; p < end; p++) {
         int v = b64val((uint8_t)*p);
         if (v < 0) continue;
-        acc = (acc << 6) | v; bits += 6;
+        acc = (acc << 6) | (uint32_t)v; bits += 6;
         if (bits >= 8) { bits -= 8; der[out++] = (acc >> bits) & 0xFF; }
     }
     return out;
@@ -2291,9 +2292,9 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
     while(done<db_len){
         uint8_t cb[52]; /* max: 48 + 4 */
         memcpy(cb,h,hash_len);
-        cb[hash_len]=(counter>>24)&0xFF;
-        cb[hash_len+1]=(counter>>16)&0xFF;
-        cb[hash_len+2]=(counter>>8)&0xFF;
+        cb[hash_len]=(uint8_t)((counter>>24)&0xFF);
+        cb[hash_len+1]=(uint8_t)((counter>>16)&0xFF);
+        cb[hash_len+2]=(uint8_t)((counter>>8)&0xFF);
         cb[hash_len+3]=counter&0xFF;
         uint8_t md[48];
         hash_fn(cb,hash_len+4,md);
@@ -2507,7 +2508,7 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     const uint8_t *tbs_val=der_read_tl(p,cert_end,&tag,&len);
     if(!tbs_val||tag!=0x30) return -1;
     cert->tbs=tbs_start;
-    cert->tbs_len=(tbs_val+len)-tbs_start;
+    cert->tbs_len=(size_t)((tbs_val+len)-tbs_start);
     const uint8_t *tbs_end=tbs_val+len;
     const uint8_t *tp=tbs_val;
 
@@ -2529,7 +2530,7 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     const uint8_t *issuer_start=tp;
     tp=der_skip(tp,tbs_end); if(!tp) return -1;
     cert->issuer=issuer_start;
-    cert->issuer_len=tp-issuer_start;
+    cert->issuer_len=(size_t)(tp-issuer_start);
 
     /* validity */
     {
@@ -2546,7 +2547,7 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     const uint8_t *subj_start=tp;
     tp=der_skip(tp,tbs_end); if(!tp) return -1;
     cert->subject=subj_start;
-    cert->subject_len=tp-subj_start;
+    cert->subject_len=(size_t)(tp-subj_start);
 
     /* SubjectPublicKeyInfo */
     const uint8_t *spki_val=der_read_tl(tp,tbs_end,&tag,&len);
@@ -3151,7 +3152,7 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 
     /* Fill in lengths */
     PUT16(buf+ext_len_pos,(uint16_t)(p-ext_len_pos-2));
-    uint32_t body_len=p-4;
+    uint32_t body_len=(uint32_t)(p-4);
     buf[1]=(body_len>>16)&0xFF;buf[2]=(body_len>>8)&0xFF;buf[3]=body_len&0xFF;
     return p;
 }
@@ -3819,7 +3820,7 @@ static void tls12_handshake(tls_conn *conn) {
                     } else if(ske_curve==TLS_GROUP_SECP384R1) {
                         if(pk_len!=P384_POINT_LEN) die("expected uncompressed P-384 point");
                     } else die("unsupported curve in SKE");
-                    if(4+pk_len>mlen) die("SKE pubkey truncated");
+                    if(4+(uint32_t)pk_len>mlen) die("SKE pubkey truncated");
                     memcpy(ske_pubkey, ske+4, pk_len);
 
                     size_t params_len=4+pk_len;
@@ -3911,7 +3912,7 @@ static void tls12_handshake(tls_conn *conn) {
 
         size_t enc_len=leaf.rsa_n_len;
         uint8_t cke[4+2+512];
-        uint32_t cke_body_len=2+enc_len;
+        uint32_t cke_body_len=(uint32_t)(2+enc_len);
         cke[0]=0x10;
         cke[1]=(cke_body_len>>16)&0xFF; cke[2]=(cke_body_len>>8)&0xFF; cke[3]=cke_body_len&0xFF;
         PUT16(cke+4,(uint16_t)enc_len);
@@ -4045,7 +4046,7 @@ static void tls12_handshake(tls_conn *conn) {
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
-        tls12_send_encrypted(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,
+        tls12_send_encrypted(fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             is_cbc,is_chacha,c_wk,key_len,c_mk,mac_key_len,mac_alg,c_wiv,c12_seq++);
         printf("Sent HTTP GET %s\n\n",path);
     }
@@ -4255,7 +4256,7 @@ static void tls13_handshake(tls_conn *conn) {
                     const uint8_t *cv=hs_buf+pos+4;
                     uint16_t cv_algo=GET16(cv);
                     uint16_t cv_sig_len=GET16(cv+2);
-                    if(4+cv_sig_len>mlen) die("CertificateVerify sig length mismatch");
+                    if(4+(uint32_t)cv_sig_len>mlen) die("CertificateVerify sig length mismatch");
                     const uint8_t *cv_sig=cv+4;
 
                     /* RFC 8446 §4.4.3: sig algos for CertificateVerify */
@@ -4403,7 +4404,7 @@ static void tls13_handshake(tls_conn *conn) {
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
-        encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,rlen,
+        encrypt_and_send(fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
         printf("Sent HTTP GET %s\n\n",path);
     }
@@ -4460,8 +4461,6 @@ static void tls13_handshake(tls_conn *conn) {
                 }
                 /* else: NewSessionTicket or other post-handshake, skip */
             }
-        } else if(rtype==TLS_RT_ALERT) {
-            break;
         } else {
             break;
         }
@@ -4560,8 +4559,9 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     /* Build and send new ClientHello with only the requested group.
        Reuse client_random and session_id per RFC 8446 §4.1.2. */
     uint8_t ch[CH_BUF_SIZE];
+    uint8_t cr_copy[32]; memcpy(cr_copy, client_random, 32);
     size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,host,
-        (uint8_t*)(uintptr_t)client_random,session_id,hrr_group);
+        cr_copy,session_id,hrr_group);
     if(hrr_aes256)
         sha384_update(transcript384,ch,ch_len);
     else
@@ -4727,7 +4727,7 @@ int main(int argc, char **argv) {
     host[hostlen] = '\0';
     /* check for :port */
     char *colon = strchr(host, ':');
-    if (colon) { port = atoi(colon + 1); *colon = '\0'; }
+    if (colon) { port = (int)strtol(colon + 1, NULL, 10); *colon = '\0'; }
     printf("TLS 1.2/1.3 HTTPS Client — from scratch in C\n");
     printf("Ciphers: AES-128/256-GCM, AES-CBC, ChaCha20-Poly1305 | Key Exchange: X25519, P-256, P-384, RSA\n\n");
     do_https_get(host, port, path);
