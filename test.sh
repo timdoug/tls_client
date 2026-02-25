@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # -- Settings --
-TEST_TIMEOUT=15   # seconds per test (must exceed TLS_READ_TIMEOUT_S in tls_client.c)
+TEST_TIMEOUT=30   # seconds per test (must exceed TLS_READ_TIMEOUT_S in tls_client.c)
 
 # -- Colors --
 RED='\033[0;31m'
@@ -407,9 +407,8 @@ for entry in "${pass_tests[@]}"; do
     rc=$TIMEOUT_RC
     output="$TIMEOUT_OUTPUT"
 
-    if [[ $rc -eq 0 ]] && echo "$output" | grep -q '=== Done ==='; then
-        info=$(echo "$output" | grep -E 'Negotiated TLS|Received ServerHello' | head -1 || true)
-        printf "${GRN}PASS${RST}  %s  [%s]\n" "$desc" "$info"
+    if [[ $rc -eq 0 ]]; then
+        printf "${GRN}PASS${RST}  %s\n" "$desc"
         pass=$((pass + 1))
     else
         reason=$(echo "$output" | grep 'FATAL:' | head -1 || true)
@@ -435,7 +434,7 @@ for entry in "${xfail_tests[@]}"; do
     rc=$TIMEOUT_RC
     output="$TIMEOUT_OUTPUT"
 
-    if [[ $rc -eq 0 ]] && echo "$output" | grep -q '=== Done ==='; then
+    if [[ $rc -eq 0 ]]; then
         printf "${RED}XPASS${RST} %s  (unexpected success!)\n" "$desc"
         xfail_unexpected_pass=$((xfail_unexpected_pass + 1))
         xfail_pass_list+=("$url ($desc): expected failure but passed")

@@ -24,6 +24,8 @@
 #include <time.h>
 #include <dirent.h>
 
+static int verbose = 0;
+
 /* ---- Detect limb width: 64-bit on 64-bit platforms, 32-bit otherwise ---- */
 #if !defined(USE_64BIT_LIMBS)
 #if defined(__LP64__) || defined(_LP64) || defined(_WIN64) || \
@@ -1713,7 +1715,7 @@ static void ecdhe_p384_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_PO
         if(!ec384_on_curve(&P384_GX,&P384_GY)) fprintf(stderr,"  G is NOT on curve either!\n");
         else fprintf(stderr,"  G IS on curve (field math OK, EC ops buggy)\n");
     } else {
-        printf("  Point verified on curve\n");
+        if(verbose) printf("  Point verified on curve\n");
     }
 }
 
@@ -2097,7 +2099,7 @@ static void ecdhe_p256_keygen(uint8_t priv[P256_SCALAR_LEN], uint8_t pub[P256_PO
     fp256_to_bytes(pub+1,&ax);
     fp256_to_bytes(pub+33,&ay);
     if(!ec256_on_curve(&ax,&ay)) fprintf(stderr,"BUG: P-256 point NOT on curve!\n");
-    else printf("  P-256 point verified on curve\n");
+    else if(verbose) printf("  P-256 point verified on curve\n");
 }
 
 static void ecdhe_p256_shared_secret(const uint8_t priv[P256_SCALAR_LEN],
@@ -3250,7 +3252,7 @@ static void load_trust_store(const char *dir) {
         trust_store_count++;
     }
     closedir(d);
-    printf("Loaded %d trust store certificates\n",trust_store_count);
+    if(verbose) printf("Loaded %d trust store certificates\n",trust_store_count);
 }
 
 /* Unified signature verification dispatch */
@@ -3308,7 +3310,7 @@ static int validate_leaf_cert(const x509_cert *leaf, const char *hostname) {
         fprintf(stderr,"Hostname verification failed for %s\n",hostname);
         return -1;
     }
-    printf("    Hostname verified: %s\n",hostname);
+    if(verbose) printf("    Hostname verified: %s\n",hostname);
     if(leaf->has_eku && !leaf->eku_server_auth){
         fprintf(stderr,"Leaf certificate EKU does not include serverAuth\n");
         return -1;
@@ -3603,7 +3605,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             return -1;
         }
     }
-    printf("    Validity periods OK\n");
+    if(verbose) printf("    Validity periods OK\n");
 
     /* Walk chain from leaf upward: at each cert, try trust store first,
      * then find issuer among remaining chain certs. Handles out-of-order
@@ -3615,7 +3617,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         for(int j=0;j<trust_store_count;j++){
             if(certs[i].issuer_len!=trust_store[j].subject_len) continue;
             if(memcmp(certs[i].issuer,trust_store[j].subject,certs[i].issuer_len)!=0) continue;
-            printf("    Verifying cert %d against trust store...\n",i);
+            if(verbose) printf("    Verifying cert %d against trust store...\n",i);
             if(verify_signature(certs[i].tbs,certs[i].tbs_len,
                                  certs[i].sig_alg,certs[i].sig_alg_len,
                                  certs[i].sig,certs[i].sig_len,
@@ -3623,8 +3625,8 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                                  trust_store[j].pubkey,trust_store[j].pubkey_len,
                                  trust_store[j].rsa_n,trust_store[j].rsa_n_len,
                                  trust_store[j].rsa_e,trust_store[j].rsa_e_len)){
-                printf("    Certificate %d root signature verified\n",i);
-                printf("    Certificate chain verified successfully!\n");
+                if(verbose) printf("    Certificate %d root signature verified\n",i);
+                if(verbose) printf("    Certificate chain verified successfully!\n");
                 return 0;
             }
         }
@@ -3638,7 +3640,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             }
         }
         if(found<0&&certs[i].aia_url&&chain_count<MAX_CHAIN&&aia_fetches<MAX_AIA_FETCHES){
-            printf("    AIA: fetching issuer for cert %d from %.*s\n",
+            if(verbose) printf("    AIA: fetching issuer for cert %d from %.*s\n",
                    i,(int)certs[i].aia_url_len,certs[i].aia_url);
             const uint8_t *fetched=NULL; size_t fetched_len=0;
             if(http_fetch_der(certs[i].aia_url,certs[i].aia_url_len,
@@ -3653,7 +3655,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                         certs[chain_count]=fc;
                         chain_count++;
                         aia_fetches++;
-                        printf("    AIA: fetched intermediate certificate\n");
+                        if(verbose) printf("    AIA: fetched intermediate certificate\n");
                         /* Retry issuer search with the new cert */
                         for(int j=i+1;j<chain_count;j++){
                             if(certs[i].issuer_len==certs[j].subject_len&&
@@ -3680,7 +3682,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         if(found!=i+1){
             x509_cert tmp=certs[i+1]; certs[i+1]=certs[found]; certs[found]=tmp;
         }
-        printf("    Verifying cert %d signature...\n",i);
+        if(verbose) printf("    Verifying cert %d signature...\n",i);
         if(!verify_signature(certs[i].tbs,certs[i].tbs_len,
                               certs[i].sig_alg,certs[i].sig_alg_len,
                               certs[i].sig,certs[i].sig_len,
@@ -3691,7 +3693,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             fprintf(stderr,"Signature verification failed for cert %d\n",i);
             return -1;
         }
-        printf("    Certificate %d signature verified\n",i);
+        if(verbose) printf("    Certificate %d signature verified\n",i);
         /* Intermediate must be v3 (only v3 has extensions) */
         if(certs[i+1].version!=2){
             fprintf(stderr,"Certificate %d is not v3, cannot be CA\n",i+1);
@@ -4577,7 +4579,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
 
             switch(mtype) {
                 case 11: /* Certificate */
-                    printf("  Certificate (%u bytes)\n",(unsigned)mlen);
+                    if(verbose) printf("  Certificate (%u bytes)\n",(unsigned)mlen);
                     free(out->cert_msg);
                     out->cert_msg=malloc(mlen);
                     if(!out->cert_msg) die("malloc failed");
@@ -4587,7 +4589,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                 case 12: { /* ServerKeyExchange */
                     if(is_rsa_kex)
                         die("unexpected ServerKeyExchange for RSA key transport");
-                    printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
+                    if(verbose) printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
                     if(mlen<8) die("ServerKeyExchange too short");
                     const uint8_t *ske=hs12_buf+pos+4;
                     if(ske[0]!=0x03) die("expected named_curve type in SKE");
@@ -4649,16 +4651,16 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                         signed_len,sig_ptr,sig_len_val,&leaf);
                     if(!sig_ok)
                         die("ServerKeyExchange signature verification failed");
-                    printf("    SKE signature verified (algo=0x%04x)\n",
+                    if(verbose) printf("    SKE signature verified (algo=0x%04x)\n",
                            sig_algo);
                     break;
                 }
                 case 14: /* ServerHelloDone */
-                    printf("  ServerHelloDone\n");
+                    if(verbose) printf("  ServerHelloDone\n");
                     got_server_done=1;
                     break;
                 default:
-                    printf("  TLS 1.2 handshake msg type %d (%u bytes)\n",
+                    if(verbose) printf("  TLS 1.2 handshake msg type %d (%u bytes)\n",
                            mtype,(unsigned)mlen);
                     break;
             }
@@ -4673,7 +4675,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
     }
 
     if(out->cert_msg) {
-        printf("  Validating certificate chain...\n");
+        if(verbose) printf("  Validating certificate chain...\n");
         if(verify_cert_chain(out->cert_msg,out->cert_msg_len,host,0)<0)
             die("Certificate verification failed");
     }
@@ -4735,7 +4737,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         memcpy(ss12,pms,48);
         ss12_len=48;
         secure_zero(pms,sizeof(pms));
-        printf("Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",
+        if(verbose) printf("Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",
                enc_len);
     } else if(srv->ske_curve==TLS_GROUP_X25519) {
         uint8_t cke[5+X25519_KEY_LEN];
@@ -4748,7 +4750,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         if(x25519_shared_secret(x25519_priv, srv->ske_pubkey, ss12)<0)
             die("X25519 shared secret is zero");
         ss12_len=X25519_KEY_LEN;
-        printf("Sent ClientKeyExchange\n"
+        if(verbose) printf("Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (X25519)\n");
     } else if(srv->ske_curve==TLS_GROUP_SECP256R1) {
         uint8_t cke[5+P256_POINT_LEN];
@@ -4760,7 +4762,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         sha384_update(transcript384, cke, sizeof(cke));
         ecdhe_p256_shared_secret(p256_priv, srv->ske_pubkey, ss12);
         ss12_len=P256_SCALAR_LEN;
-        printf("Sent ClientKeyExchange\n"
+        if(verbose) printf("Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (P-256)\n");
     } else {
         uint8_t cke[5+P384_POINT_LEN];
@@ -4772,7 +4774,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         sha384_update(transcript384, cke, sizeof(cke));
         ecdhe_p384_shared_secret(p384_priv, srv->ske_pubkey, ss12);
         ss12_len=P384_SCALAR_LEN;
-        printf("Sent ClientKeyExchange\n"
+        if(verbose) printf("Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (P-384)\n");
     }
     secure_zero(p256_priv,P256_SCALAR_LEN);
@@ -4782,7 +4784,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
     tls12_derive_keys(tk, cipher_suite, mode, ss12, ss12_len,
                       client_random, server_random);
     secure_zero(ss12,sizeof(ss12));
-    printf("Derived TLS 1.2 traffic keys\n");
+    if(verbose) printf("Derived TLS 1.2 traffic keys\n");
 }
 
 /* Phase 3: Exchange CCS and Finished messages */
@@ -4792,7 +4794,7 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
                                      sha384_ctx *transcript384) {
     /* Send ChangeCipherSpec */
     { uint8_t ccs=1; tls_send_record(fd,TLS_RT_CCS,&ccs,1); }
-    printf("Sent ChangeCipherSpec\n");
+    if(verbose) printf("Sent ChangeCipherSpec\n");
 
     /* Send Finished (encrypted) */
     {
@@ -4820,14 +4822,14 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
             tk->mac_alg,tk->c_wiv,0);
         sha256_update(transcript, fin_msg, 16);
         sha384_update(transcript384, fin_msg, 16);
-        printf("Sent Finished (encrypted)\n");
+        if(verbose) printf("Sent Finished (encrypted)\n");
     }
 
     /* Receive ChangeCipherSpec */
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype=tls_read_record(fd,rec,&rec_len);
     if(rtype!=TLS_RT_CCS) die("expected ChangeCipherSpec from server");
-    printf("Received ChangeCipherSpec\n");
+    if(verbose) printf("Received ChangeCipherSpec\n");
 
     /* Receive server Finished (encrypted) */
     rtype=tls_read_record(fd,rec,&rec_len);
@@ -4856,7 +4858,102 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
                     th12_sf, th12_sf_len, expected, 12);
         if(!ct_memeq(expected, pt12+4, 12))
             die("Server Finished verify failed!");
-        printf("Server Finished VERIFIED\n");
+        if(verbose) printf("Server Finished VERIFIED\n");
+    }
+}
+
+/* ---- HTTP response output: strips headers and decodes chunked TE ---- */
+static struct {
+    int state;       /* 0=headers 1=body 2=chunk_size 3=chunk_data 4=chunk_crlf 5=done */
+    int chunked;
+    int hex_done;
+    size_t chunk_rem;
+    uint8_t hdr[16384];
+    size_t hdr_len;
+} ho;
+
+static void http_output_init(void) { memset(&ho,0,sizeof(ho)); }
+
+static void http_output(const uint8_t *d, size_t len) {
+    size_t i=0;
+    while(i<len) {
+        switch(ho.state) {
+        case 0: /* accumulate headers until \r\n\r\n */
+            while(i<len) {
+                if(ho.hdr_len<sizeof(ho.hdr)-1)
+                    ho.hdr[ho.hdr_len++]=d[i];
+                i++;
+                if(ho.hdr_len>=4 &&
+                   ho.hdr[ho.hdr_len-4]=='\r' && ho.hdr[ho.hdr_len-3]=='\n' &&
+                   ho.hdr[ho.hdr_len-2]=='\r' && ho.hdr[ho.hdr_len-1]=='\n') {
+                    if(verbose) fwrite(ho.hdr,1,ho.hdr_len,stdout);
+                    ho.hdr[ho.hdr_len]='\0';
+                    /* scan for Transfer-Encoding: chunked */
+                    for(const char *p=(char*)ho.hdr; *p; ) {
+                        const char *te="transfer-encoding:";
+                        const char *a=p, *b=te;
+                        while(*b && *a!='\n') {
+                            char ca=*a, cb=*b;
+                            if(ca>='A'&&ca<='Z') ca+=32;
+                            if(ca!=cb) break;
+                            a++; b++;
+                        }
+                        if(!*b) {
+                            while(*a==' ') a++;
+                            const char *ck="chunked";
+                            const char *x=a, *y=ck;
+                            while(*y && *x!='\r' && *x!='\n') {
+                                char cx=*x;
+                                if(cx>='A'&&cx<='Z') cx+=32;
+                                if(cx!=*y) break;
+                                x++; y++;
+                            }
+                            if(!*y) ho.chunked=1;
+                        }
+                        while(*p && *p!='\n') p++;
+                        if(*p) p++;
+                    }
+                    ho.state=ho.chunked?2:1;
+                    break;
+                }
+            }
+            break;
+        case 1: /* non-chunked body */
+            fwrite(d+i,1,len-i,stdout);
+            i=len;
+            break;
+        case 2: /* chunk size line */
+            while(i<len) {
+                uint8_t c=d[i++];
+                if(c=='\n') {
+                    ho.state=ho.chunk_rem==0?5:3;
+                    ho.hex_done=0;
+                    break;
+                }
+                if(c=='\r'||ho.hex_done) continue;
+                int v;
+                if(c>='0'&&c<='9') v=c-'0';
+                else if(c>='a'&&c<='f') v=10+c-'a';
+                else if(c>='A'&&c<='F') v=10+c-'A';
+                else { ho.hex_done=1; continue; }
+                ho.chunk_rem=ho.chunk_rem*16+(size_t)v;
+            }
+            break;
+        case 3: { /* chunk data */
+            size_t avail=len-i;
+            size_t n=avail<ho.chunk_rem?avail:ho.chunk_rem;
+            fwrite(d+i,1,n,stdout);
+            i+=n;
+            ho.chunk_rem-=n;
+            if(ho.chunk_rem==0) ho.state=4;
+            break;
+        }
+        case 4: /* CRLF after chunk */
+            if(d[i]=='\n') { ho.state=2; ho.chunk_rem=0; }
+            i++;
+            break;
+        default: return;
+        }
     }
 }
 
@@ -4873,13 +4970,14 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
         tls12_send_encrypted(fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
             tk->mac_alg,tk->c_wiv,c12_seq++);
-        printf("Sent HTTP GET %s\n\n",path);
+        if(verbose) printf("Sent HTTP GET %s\n\n",path);
     }
 
     uint64_t s12_seq=1;
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype;
-    printf("=== HTTP Response ===\n");
+    if(verbose) printf("=== HTTP Response ===\n");
+    http_output_init();
     for(;;) {
         rtype=tls_read_record(fd,rec,&rec_len);
         if(rtype<0) break;
@@ -4893,7 +4991,7 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
                         (unsigned long long)(s12_seq-1));
                 break;
             }
-            fwrite(pt12,1,pt12_len,stdout);
+            http_output(pt12,pt12_len);
         } else if(rtype==TLS_RT_ALERT) {
             if(rec_len>=2 && rec[0]==1 && rec[1]==0) break;
             break;
@@ -4905,7 +5003,7 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
       tls12_send_encrypted(fd,TLS_RT_ALERT,alert,2,
           mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
           tk->mac_alg,tk->c_wiv,c12_seq++); }
-    printf("\n=== Done ===\n");
+    if(verbose) printf("\n=== Done ===\n");
 }
 
 /* ================================================================
@@ -4935,7 +5033,7 @@ static void tls12_handshake(const tls_conn *conn) {
                    || cipher_suite==TLS_RSA_AES256_CBC
                    || cipher_suite==TLS_RSA_AES128_CBC);
     cipher_mode_t mode = cipher_mode_of(cipher_suite);
-    printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
+    if(verbose) printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
            is_rsa_kex?" RSA-kex":"", mode==CIPHER_CBC?" CBC":"",
            mode==CIPHER_CHACHA?" ChaCha20":"");
 
@@ -5033,7 +5131,7 @@ static void tls13_derive_hs_keys(tls13_hs_state *st,
     hkdf_expand_label_u(alg,st->c_hs_traffic,"key",NULL,0,st->c_hs_key,st->kl);
     hkdf_expand_label_u(alg,st->c_hs_traffic,"iv",
                         NULL,0,st->c_hs_iv,AES_GCM_NONCE_LEN);
-    printf("Derived handshake traffic keys\n");
+    if(verbose) printf("Derived handshake traffic keys\n");
 
     secure_zero(early_secret,sizeof(early_secret));
     secure_zero(derived1,sizeof(derived1));
@@ -5074,14 +5172,14 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
 
             switch(mtype) {
                 case 8: /* EncryptedExtensions */
-                    printf("  EncryptedExtensions (%u bytes)\n",
+                    if(verbose) printf("  EncryptedExtensions (%u bytes)\n",
                            (unsigned)mlen);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
                     break;
                 case 11: /* Certificate */
-                    printf("  Certificate (%u bytes)\n",(unsigned)mlen);
+                    if(verbose) printf("  Certificate (%u bytes)\n",(unsigned)mlen);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
@@ -5092,7 +5190,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     st->cert_msg_len=mlen;
                     break;
                 case 13: /* CertificateRequest */
-                    printf("  CertificateRequest (%u bytes)\n",
+                    if(verbose) printf("  CertificateRequest (%u bytes)\n",
                            (unsigned)mlen);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
@@ -5100,10 +5198,10 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     st->got_cert_request=1;
                     break;
                 case 15: { /* CertificateVerify */
-                    printf("  CertificateVerify (%u bytes)\n",
+                    if(verbose) printf("  CertificateVerify (%u bytes)\n",
                            (unsigned)mlen);
                     if(st->cert_msg){
-                        printf("  Validating certificate chain...\n");
+                        if(verbose) printf("  Validating certificate chain...\n");
                         if(verify_cert_chain(st->cert_msg,st->cert_msg_len,
                                              st->host,1)<0)
                             die("Certificate verification failed");
@@ -5148,7 +5246,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                         cv_content_len,cv_sig,cv_sig_len,&leaf);
                     if(!cv_ok)
                         die("CertificateVerify signature verification failed");
-                    printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",
+                    if(verbose) printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",
                            cv_algo);
                     got_cert_verify=1;
 
@@ -5162,7 +5260,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                         die("Server Finished without CertificateVerify");
                     if(mlen!=st->hash_len)
                         die("Server Finished length mismatch");
-                    printf("  Server Finished\n");
+                    if(verbose) printf("  Server Finished\n");
                     uint8_t fin_key[SHA384_DIGEST_LEN];
                     hkdf_expand_label_u(st->alg,st->s_hs_traffic,"finished",
                         NULL,0,fin_key,st->alg->digest_len);
@@ -5174,7 +5272,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                          th_before_fin,st->alg->digest_len,expected);
                     if(!ct_memeq(expected,hs_buf+pos+4,st->hash_len))
                         die("Server Finished verify failed!");
-                    printf("  Server Finished VERIFIED\n");
+                    if(verbose) printf("  Server Finished VERIFIED\n");
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
@@ -5182,7 +5280,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     break;
                 }
                 default:
-                    printf("  Unknown handshake msg type %d\n",mtype);
+                    if(verbose) printf("  Unknown handshake msg type %d\n",mtype);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
@@ -5231,7 +5329,7 @@ static void tls13_derive_app_keys(tls13_hs_state *st) {
                         NULL,0,st->c_ap_key,st->kl);
     hkdf_expand_label_u(alg,st->c_ap_traffic,"iv",
                         NULL,0,st->c_ap_iv,AES_GCM_NONCE_LEN);
-    printf("Derived application traffic keys\n");
+    if(verbose) printf("Derived application traffic keys\n");
 
     secure_zero(derived2,sizeof(derived2));
     secure_zero(master_secret,sizeof(master_secret));
@@ -5255,7 +5353,7 @@ static void tls13_send_client_finished(tls13_hs_state *st) {
             st->c_hs_key,st->c_hs_iv,c_hs_seq++,st->mode,st->kl);
         if(st->is_aes256) sha384_update(&st->transcript384,cert_msg,8);
         else sha256_update(&st->transcript,cert_msg,8);
-        printf("Sent empty client Certificate\n");
+        if(verbose) printf("Sent empty client Certificate\n");
     }
 
     /* Send client Finished */
@@ -5275,7 +5373,7 @@ static void tls13_send_client_finished(tls13_hs_state *st) {
         encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,fin_msg,4+st->hash_len,
             st->c_hs_key,st->c_hs_iv,c_hs_seq++,st->mode,st->kl);
     }
-    printf("Sent client Finished\n");
+    if(verbose) printf("Sent client Finished\n");
 }
 
 /* Phase 5: Send HTTP GET, receive response with KeyUpdate support */
@@ -5289,13 +5387,14 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
             st->path,st->host);
         encrypt_and_send(st->fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             st->c_ap_key,st->c_ap_iv,c_ap_seq++,st->mode,st->kl);
-        printf("Sent HTTP GET %s\n\n",st->path);
+        if(verbose) printf("Sent HTTP GET %s\n\n",st->path);
     }
 
     uint64_t s_ap_seq=0;
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype;
-    printf("=== HTTP Response ===\n");
+    if(verbose) printf("=== HTTP Response ===\n");
+    http_output_init();
     for(;;) {
         rtype=tls_read_record(st->fd,rec,&rec_len);
         if(rtype<0) break;
@@ -5304,7 +5403,7 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
             int inner=decrypt_record(rec,rec_len,st->s_ap_key,st->s_ap_iv,
                 s_ap_seq++,pt,&pt_len,st->mode,st->kl);
             if(inner==TLS_RT_APPDATA) {
-                fwrite(pt,1,pt_len,stdout);
+                http_output(pt,pt_len);
             } else if(inner==TLS_RT_ALERT) {
                 if(pt_len>=2 && pt[0]==1 && pt[1]==0) break;
                 printf("\n[TLS Alert: %d %d]\n",pt[0],pt_len>1?pt[1]:-1);
@@ -5351,7 +5450,7 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
     { const uint8_t alert[2]={1,0};
       encrypt_and_send(st->fd,TLS_RT_ALERT,alert,2,st->c_ap_key,st->c_ap_iv,
           c_ap_seq,st->mode,st->kl); }
-    printf("\n=== Done ===\n");
+    if(verbose) printf("\n=== Done ===\n");
 }
 
 /* ================================================================
@@ -5386,7 +5485,7 @@ static void tls13_handshake(const tls_conn *conn) {
     if(server_pub_len==X25519_KEY_LEN) selected_group=TLS_GROUP_X25519;
     else if(server_pub_len==P256_POINT_LEN) selected_group=TLS_GROUP_SECP256R1;
     else selected_group=TLS_GROUP_SECP384R1;
-    printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",
+    if(verbose) printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",
         cipher_suite,selected_group);
 
     /* Compute shared secret */
@@ -5408,7 +5507,7 @@ static void tls13_handshake(const tls_conn *conn) {
     secure_zero(p256_priv,sizeof(p256_priv));
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(x25519_priv,sizeof(x25519_priv));
-    printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
+    if(verbose) printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Phase 1: Derive handshake keys */
     tls13_derive_hs_keys(&st, shared, shared_len);
@@ -5450,7 +5549,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
                                sha384_ctx *transcript384,
                                size_t *sh_leftover) {
     uint32_t sh_msg_len=4+GET24(rec+1);
-    printf("Received HelloRetryRequest (cipher=0x%04x)\n",*cipher_suite);
+    if(verbose) printf("Received HelloRetryRequest (cipher=0x%04x)\n",*cipher_suite);
 
     /* Parse HRR extensions to find selected group */
     uint16_t hrr_group=0;
@@ -5476,7 +5575,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_SECP256R1
        && hrr_group!=TLS_GROUP_SECP384R1)
         die("HRR selected unsupported group");
-    printf("  HRR selected group 0x%04x\n",hrr_group);
+    if(verbose) printf("  HRR selected group 0x%04x\n",hrr_group);
 
     int hrr_aes256 = (*cipher_suite == TLS_AES_256_GCM_SHA384);
 
@@ -5511,7 +5610,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
         sha256_update(transcript,ch,ch_len);
 
     tls_send_record(fd,TLS_RT_HANDSHAKE,ch,ch_len);
-    printf("Sent new ClientHello with group 0x%04x (%zu bytes)\n",hrr_group,ch_len);
+    if(verbose) printf("Sent new ClientHello with group 0x%04x (%zu bytes)\n",hrr_group,ch_len);
 
     /* Read real ServerHello (skip CCS if present) */
     int rtype=tls_read_record(fd,rec,rec_len);
@@ -5533,7 +5632,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     else
         sha256_update(transcript,rec,sh_msg_len);
     *sh_leftover=*rec_len>sh_msg_len ? *rec_len-sh_msg_len : 0;
-    printf("Received real ServerHello after HRR (cipher=0x%04x)\n",*cipher_suite);
+    if(verbose) printf("Received real ServerHello after HRR (cipher=0x%04x)\n",*cipher_suite);
 }
 
 /* Main TLS handshake + HTTP GET */
@@ -5541,7 +5640,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     load_trust_store("trust_store");
 
     int fd=tcp_connect(host,port);
-    printf("Connected to %s:%d\n",host,port);
+    if(verbose) printf("Connected to %s:%d\n",host,port);
 
     /* Generate ECDHE keypairs for all groups */
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
@@ -5550,7 +5649,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     ecdhe_p256_keygen(p256_priv,p256_pub);
     uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub_key[X25519_KEY_LEN];
     x25519_keygen(x25519_priv,x25519_pub_key);
-    printf("Generated ECDHE keypairs (X25519 + P-256 + P-384)\n");
+    if(verbose) printf("Generated ECDHE keypairs (X25519 + P-256 + P-384)\n");
 
     /* Build & send ClientHello */
     uint8_t ch[CH_BUF_SIZE];
@@ -5575,7 +5674,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     sha384_init(&transcript384);
     sha256_update(&transcript,ch,ch_len);
     sha384_update(&transcript384,ch,ch_len);
-    printf("Sent ClientHello (%zu bytes)\n",ch_len);
+    if(verbose) printf("Sent ClientHello (%zu bytes)\n",ch_len);
 
     /* Read ServerHello */
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
@@ -5656,8 +5755,10 @@ static void do_https_get(const char *host, int port, const char *path) {
 
 
 int main(int argc, char **argv) {
-    if(argc != 2) { fprintf(stderr, "Usage: %s https://host[:port]/path\n", argv[0]); return 1; }
-    const char *url = argv[1];
+    int arg = 1;
+    if(arg < argc && strcmp(argv[arg], "-v") == 0) { verbose = 1; arg++; }
+    if(arg != argc - 1) { fprintf(stderr, "Usage: %s [-v] https://host[:port]/path\n", argv[0]); return 1; }
+    const char *url = argv[arg];
     if(strncmp(url, "https://", 8) != 0) die("URL must start with https://");
     const char *hoststart = url + 8;
     const char *slash = strchr(hoststart, '/');
@@ -5671,8 +5772,6 @@ int main(int argc, char **argv) {
     /* check for :port */
     char *colon = strchr(host, ':');
     if(colon) { port = (int)strtol(colon + 1, NULL, 10); *colon = '\0'; }
-    printf("TLS 1.2/1.3 HTTPS Client — from scratch in C\n");
-    printf("Ciphers: AES-128/256-GCM, AES-CBC, ChaCha20-Poly1305 | Key Exchange: X25519, P-256, P-384, RSA\n\n");
     do_https_get(host, port, path);
     return 0;
 }
