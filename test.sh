@@ -26,6 +26,7 @@ printf "${GRN}ok${RST}\n"
 
 printf "  gcc-15 ... "
 gcc-15 -std=c17 -Wall -Wextra -Werror -pedantic -O2 -o tls_client_gcc tls_client.c
+rm -f tls_client_gcc
 printf "${GRN}ok${RST}\n"
 
 printf "\n${BLD}=== Static analysis ===${RST}\n"
