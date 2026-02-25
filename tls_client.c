@@ -2662,7 +2662,6 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
     /* RFC 8017 §9.1.2: emLen must be at least hLen + sLen + 2 */
     if(em_len < hash_len + salt_len + 2) return 0;
     size_t db_len=em_len-hash_len-1;
-    if(db_len < 1) return 0; /* always true given above check; explicit for analyzers */
     const uint8_t *masked_db=em;
     const uint8_t *h=em+db_len;
 
@@ -2684,7 +2683,7 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
         done+=use; counter++;
     }
 
-    uint8_t db[512];
+    uint8_t db[512] = {0}; /* zero-init silences false-positive uninitialized-read warning */
     for(size_t i=0;i<db_len;i++) db[i]=masked_db[i]^db_mask[i];
     db[0]&=0x7F;
 
