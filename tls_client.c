@@ -517,7 +517,7 @@ static void hmac(const hash_alg *alg, const uint8_t *key, size_t klen,
 
 static void hkdf_extract_u(const hash_alg *alg, const uint8_t *salt, size_t slen,
                              const uint8_t *ikm, size_t ilen, uint8_t *out) {
-    if(slen==0){uint8_t z[48]={0}; hmac(alg,z,alg->digest_len,ikm,ilen,out);}
+    if(slen==0){const uint8_t z[48]={0}; hmac(alg,z,alg->digest_len,ikm,ilen,out);}
     else hmac(alg,salt,slen,ikm,ilen,out);
 }
 
@@ -620,7 +620,7 @@ static uint8_t ct_sbox(uint8_t idx) {
 static void aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
     memcpy(rk,key,16);
     for (size_t i=0;i<10;i++) {
-        uint8_t *p=rk+16*i, *n=rk+16*(i+1);
+        const uint8_t *p=rk+16*i; uint8_t *n=rk+16*(i+1);
         uint8_t t[4]={ct_sbox(p[13]),ct_sbox(p[14]),ct_sbox(p[15]),ct_sbox(p[12])};
         t[0]^=aes_rcon[i];
         for(int j=0;j<4;j++){
@@ -633,8 +633,8 @@ static void aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
 static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
     memcpy(rk,key,32);
     for(size_t i=0;i<7;i++){
-        uint8_t *prev=rk+32*i;
-        uint8_t *next=prev+32;
+        const uint8_t *prev=rk+32*i;
+        uint8_t *next=rk+32*i+32;
         /* First 16 bytes: RotWord+SubWord+Rcon on last 4 bytes of prev 32 */
         uint8_t t[4]={ct_sbox(prev[29]),ct_sbox(prev[30]),ct_sbox(prev[31]),ct_sbox(prev[28])};
         t[0]^=aes_rcon[i];
@@ -642,7 +642,7 @@ static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
         for(int j=4;j<16;j++) next[j]=prev[j]^next[j-4];
         if(i==6) break; /* only need 15 round keys = 240 bytes, stop after 7th block of 16 */
         /* Second 16 bytes: SubWord on 4th word of current 16 */
-        uint8_t s[4]={ct_sbox(next[12]),ct_sbox(next[13]),ct_sbox(next[14]),ct_sbox(next[15])};
+        const uint8_t s[4]={ct_sbox(next[12]),ct_sbox(next[13]),ct_sbox(next[14]),ct_sbox(next[15])};
         for(int j=0;j<4;j++) next[16+j]=prev[16+j]^s[j];
         for(int j=20;j<32;j++) next[j]=prev[j]^next[j-4];
     }
@@ -1363,7 +1363,7 @@ static void fp384_mul(fp384 *r, const fp384 *a, const fp384 *b) {
       }
     }
     /* Second pass: reduce acc[6..9] * K + acc[0..5] */
-    { uint64_t hi2[6]={acc[6],acc[7],acc[8],acc[9],0,0}, lo2[6];
+    { const uint64_t hi2[6]={acc[6],acc[7],acc[8],acc[9],0,0}; uint64_t lo2[6];
       memcpy(lo2,acc,48);
       memset(acc,0,sizeof(acc));
       for(int i=0;i<6;i++) acc[i]=lo2[i];
@@ -2755,19 +2755,19 @@ typedef struct {
     const uint8_t *sig; size_t sig_len;            /* signature bytes */
     const uint8_t *issuer; size_t issuer_len;      /* raw DER of issuer Name */
     const uint8_t *subject; size_t subject_len;    /* raw DER of subject Name */
-    int key_type;                                   /* 1=EC, 2=RSA */
     const uint8_t *pubkey; size_t pubkey_len;      /* EC: 04||x||y */
     const uint8_t *rsa_n; size_t rsa_n_len;        /* RSA modulus */
     const uint8_t *rsa_e; size_t rsa_e_len;        /* RSA exponent */
     const uint8_t *san; size_t san_len;            /* SAN extension value */
     time_t not_before, not_after;                  /* validity period */
+    int key_type;                                   /* 1=EC, 2=RSA */
     int is_ca;                                      /* basicConstraints CA flag */
     int path_len;                                   /* pathLenConstraint (-1 = unlimited) */
-    uint16_t key_usage;                             /* keyUsage bit flags (0 = not present) */
     int has_key_usage;                              /* whether keyUsage extension was present */
     int has_eku;                                    /* whether EKU extension was present */
     int eku_server_auth;                            /* EKU contains serverAuth */
     int version;                                    /* 0=v1, 1=v2, 2=v3 */
+    uint16_t key_usage;                             /* keyUsage bit flags (0 = not present) */
 } x509_cert;
 
 static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8_t *tbs_end) {
@@ -3082,7 +3082,7 @@ static int trust_store_count=0;
 static void load_trust_store(const char *dir) {
     DIR *d=opendir(dir);
     if(!d){fprintf(stderr,"Warning: cannot open %s\n",dir);return;}
-    struct dirent *ent;
+    const struct dirent *ent;
     uint8_t der_buf[4096];
     char pem_buf[8192];
     while((ent=readdir(d))!=NULL&&trust_store_count<MAX_TRUST_CERTS){
@@ -4113,10 +4113,9 @@ static void tls12_derive_keys(tls12_keys *k, uint16_t cipher_suite,
 /* ================================================================
  * TLS 1.2 Handshake
  * ================================================================ */
-static void tls12_handshake(tls_conn *conn) {
+static void tls12_handshake(const tls_conn *conn) {
     int fd = conn->fd;
     const char *host = conn->host;
-    const char *path = conn->path;
     uint16_t cipher_suite = conn->cipher_suite;
     uint8_t client_random[32], server_random[32];
     memcpy(client_random, conn->client_random, 32);
@@ -4351,10 +4350,10 @@ static void tls12_handshake(tls_conn *conn) {
     size_t key_len = tk.key_len;
     size_t mac_key_len = tk.mac_key_len;
     const hash_alg *mac_alg = tk.mac_alg;
-    uint8_t *c_wk=tk.c_wk, *s_wk=tk.s_wk;
-    uint8_t *c_wiv=tk.c_wiv, *s_wiv=tk.s_wiv;
-    uint8_t *c_mk=tk.c_mk, *s_mk=tk.s_mk;
-    uint8_t *tls12_master=tk.master;
+    const uint8_t *c_wk=tk.c_wk, *s_wk=tk.s_wk;
+    const uint8_t *c_wiv=tk.c_wiv, *s_wiv=tk.s_wiv;
+    const uint8_t *c_mk=tk.c_mk, *s_mk=tk.s_mk;
+    const uint8_t *tls12_master=tk.master;
     printf("Derived TLS 1.2 traffic keys\n");
 
     /* Send ChangeCipherSpec */
@@ -4422,6 +4421,7 @@ static void tls12_handshake(tls_conn *conn) {
     /* Send HTTP GET */
     uint64_t c12_seq=1;
     {
+        const char *path = conn->path;
         char req[REQ_BUF_SIZE];
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
@@ -4454,7 +4454,7 @@ static void tls12_handshake(tls_conn *conn) {
         }
     }
     /* Send close_notify */
-    {   uint8_t alert[2]={1,0};
+    {   const uint8_t alert[2]={1,0};
         tls12_send_encrypted(fd,TLS_RT_ALERT,alert,2,
             is_cbc,is_chacha,c_wk,key_len,c_mk,mac_key_len,mac_alg,c_wiv,c12_seq++);
     }
@@ -4486,10 +4486,9 @@ static void tls13_transcript_hash(int is_aes256,
 /* ================================================================
  * TLS 1.3 Handshake
  * ================================================================ */
-static void tls13_handshake(tls_conn *conn) {
+static void tls13_handshake(const tls_conn *conn) {
     int fd = conn->fd;
     const char *host = conn->host;
-    const char *path = conn->path;
     uint16_t cipher_suite = conn->cipher_suite;
     uint8_t server_pub[P384_POINT_LEN];
     size_t server_pub_len = conn->server_pub_len;
@@ -4537,7 +4536,7 @@ static void tls13_handshake(tls_conn *conn) {
 
     /* Derive handshake keys */
     uint8_t early_secret[SHA384_DIGEST_LEN];
-    { uint8_t z[SHA384_DIGEST_LEN]={0};
+    { const uint8_t z[SHA384_DIGEST_LEN]={0};
       hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret); }
     uint8_t derived1[SHA384_DIGEST_LEN];
     { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
@@ -4723,7 +4722,7 @@ static void tls13_handshake(tls_conn *conn) {
       hkdf_expand_label_u(alg,hs_secret,"derived",empty_hash,
           alg->digest_len,derived2,alg->digest_len); }
     uint8_t master_secret[SHA384_DIGEST_LEN];
-    { uint8_t z[SHA384_DIGEST_LEN]={0};
+    { const uint8_t z[SHA384_DIGEST_LEN]={0};
       hkdf_extract_u(alg,derived2,alg->digest_len,z,alg->digest_len,master_secret); }
 
     uint8_t s_ap_traffic[SHA384_DIGEST_LEN], c_ap_traffic[SHA384_DIGEST_LEN];
@@ -4780,6 +4779,7 @@ static void tls13_handshake(tls_conn *conn) {
     /* Send HTTP GET (encrypted with application keys) */
     uint64_t c_ap_seq=0;
     {
+        const char *path = conn->path;
         char req[REQ_BUF_SIZE];
         int rlen=snprintf(req,sizeof(req),
             "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
@@ -4823,7 +4823,7 @@ static void tls13_handshake(tls_conn *conn) {
                     s_ap_seq=0;
                     if(request_update==1) {
                         /* Send KeyUpdate(update_not_requested) with current client keys */
-                        uint8_t ku_msg[5]={24,0,0,1,0};
+                        const uint8_t ku_msg[5]={24,0,0,1,0};
                         encrypt_and_send(fd,TLS_RT_HANDSHAKE,ku_msg,5,
                             c_ap_key,c_ap_iv,c_ap_seq++,is_aes256,is_chacha);
                         /* Derive new client traffic secret */
@@ -4846,7 +4846,7 @@ static void tls13_handshake(tls_conn *conn) {
         }
     }
     /* Send close_notify */
-    { uint8_t alert[2]={1,0};
+    { const uint8_t alert[2]={1,0};
       encrypt_and_send(fd,TLS_RT_ALERT,alert,2,c_ap_key,c_ap_iv,
           c_ap_seq,is_aes256,is_chacha); }
     printf("\n=== Done ===\n");
