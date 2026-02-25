@@ -2280,6 +2280,7 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
     /* RFC 8017 §9.1.2: emLen must be at least hLen + sLen + 2 */
     if(em_len < hash_len + salt_len + 2) return 0;
     size_t db_len=em_len-hash_len-1;
+    if(db_len < 1) return 0; /* always true given above check; explicit for analyzers */
     const uint8_t *masked_db=em;
     const uint8_t *h=em+db_len;
 
@@ -2318,7 +2319,8 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
 
     uint8_t hp[48];
     hash_fn(mp,8+hash_len+salt_len,hp);
-    return ct_memeq(hp,h,hash_len) & (pad_ok == 0);
+    int pad_valid = (pad_ok == 0);
+    return ct_memeq(hp,h,hash_len) & pad_valid;
 }
 
 /* ================================================================
@@ -2842,6 +2844,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     if(chain_count==0){fprintf(stderr,"No certificates in chain\n");return -1;}
 
     x509_cert certs[MAX_CHAIN];
+    memset(certs, 0, sizeof(certs));
     for(int i=0;i<chain_count;i++){
         if(x509_parse(&certs[i],chain_der[i],chain_len[i])!=0){
             fprintf(stderr,"Failed to parse certificate %d\n",i);
