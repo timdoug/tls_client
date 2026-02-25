@@ -189,7 +189,11 @@ static void random_bytes(uint8_t *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) die("open urandom");
     size_t d = 0;
-    while (d < len) { ssize_t n = read(fd, buf+d, len-d); if (n<=0) die("read urandom"); d+=(size_t)n; }
+    while (d < len) {
+        ssize_t n = read(fd, buf+d, len-d);
+        if (n<=0) die("read urandom");
+        d+=(size_t)n;
+    }
     close(fd);
 }
 
@@ -642,7 +646,8 @@ static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
         for(int j=4;j<16;j++) next[j]=prev[j]^next[j-4];
         if(i==6) break; /* only need 15 round keys = 240 bytes, stop after 7th block of 16 */
         /* Second 16 bytes: SubWord on 4th word of current 16 */
-        const uint8_t s[4]={ct_sbox(next[12]),ct_sbox(next[13]),ct_sbox(next[14]),ct_sbox(next[15])};
+        const uint8_t s[4]={ct_sbox(next[12]),ct_sbox(next[13]),
+                            ct_sbox(next[14]),ct_sbox(next[15])};
         for(int j=0;j<4;j++) next[16+j]=prev[16+j]^s[j];
         for(int j=20;j<32;j++) next[j]=prev[j]^next[j-4];
     }
@@ -1290,7 +1295,11 @@ static const fp384 FP384_ONE  = {{1,0,0,0,0,0,0,0,0,0,0,0}};
 #endif
 
 static int fp384_cmp(const fp384 *a, const fp384 *b) {
-    for(int i=FP384_N-1;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
+    for(int i=FP384_N-1;i>=0;i--) {
+        if(a->v[i]>b->v[i]) return 1;
+        if(a->v[i]<b->v[i]) return -1;
+    }
+    return 0;
 }
 
 static limb_t fp384_add_raw(fp384 *r, const fp384 *a, const fp384 *b) {
@@ -1478,10 +1487,16 @@ static void fp384_inv(fp384 *r, const fp384 *a) {
 }
 
 static void fp384_from_bytes(fp384 *r, const uint8_t b[48]) {
-    for(int i=0;i<FP384_N;i++){r->v[i]=0;for(int j=0;j<LIMB_BYTES;j++)r->v[i]|=(limb_t)b[47-(i*LIMB_BYTES+j)]<<(8*j);}
+    for(int i=0;i<FP384_N;i++) {
+        r->v[i]=0;
+        for(int j=0;j<LIMB_BYTES;j++)
+            r->v[i]|=(limb_t)b[47-(i*LIMB_BYTES+j)]<<(8*j);
+    }
 }
 static void fp384_to_bytes(uint8_t b[48], const fp384 *a) {
-    for(int i=0;i<FP384_N;i++)for(int j=0;j<LIMB_BYTES;j++)b[47-(i*LIMB_BYTES+j)]=(uint8_t)((a->v[i]>>(8*j))&0xFF);
+    for(int i=0;i<FP384_N;i++)
+        for(int j=0;j<LIMB_BYTES;j++)
+            b[47-(i*LIMB_BYTES+j)]=(uint8_t)((a->v[i]>>(8*j))&0xFF);
 }
 
 /* ================================================================
@@ -1720,7 +1735,11 @@ static const uint8_t P256_ORDER[32] = {
 };
 
 static int fp256_cmp(const fp256 *a, const fp256 *b) {
-    for(int i=FP256_N-1;i>=0;i--){if(a->v[i]>b->v[i])return 1;if(a->v[i]<b->v[i])return -1;}return 0;
+    for(int i=FP256_N-1;i>=0;i--) {
+        if(a->v[i]>b->v[i]) return 1;
+        if(a->v[i]<b->v[i]) return -1;
+    }
+    return 0;
 }
 
 static int fp256_is_zero(const fp256 *a) {
@@ -1878,10 +1897,16 @@ static void fp256_inv(fp256 *r, const fp256 *a) {
 }
 
 static void fp256_from_bytes(fp256 *r, const uint8_t b[32]) {
-    for(int i=0;i<FP256_N;i++){r->v[i]=0;for(int j=0;j<LIMB_BYTES;j++)r->v[i]|=(limb_t)b[31-(i*LIMB_BYTES+j)]<<(8*j);}
+    for(int i=0;i<FP256_N;i++) {
+        r->v[i]=0;
+        for(int j=0;j<LIMB_BYTES;j++)
+            r->v[i]|=(limb_t)b[31-(i*LIMB_BYTES+j)]<<(8*j);
+    }
 }
 static void fp256_to_bytes(uint8_t b[32], const fp256 *a) {
-    for(int i=0;i<FP256_N;i++)for(int j=0;j<LIMB_BYTES;j++)b[31-(i*LIMB_BYTES+j)]=(uint8_t)((a->v[i]>>(8*j))&0xFF);
+    for(int i=0;i<FP256_N;i++)
+        for(int j=0;j<LIMB_BYTES;j++)
+            b[31-(i*LIMB_BYTES+j)]=(uint8_t)((a->v[i]>>(8*j))&0xFF);
 }
 
 /* ================================================================
@@ -2240,7 +2265,11 @@ static void fp25519_cswap(fp25519 *a, fp25519 *b, limb_t bit) {
 
 /* Load 32 bytes little-endian into fp25519 */
 static void fp25519_from_le(fp25519 *r, const uint8_t b[32]) {
-    for(int i=0;i<FP25519_N;i++){r->v[i]=0;for(int j=0;j<LIMB_BYTES;j++)r->v[i]|=(limb_t)b[i*LIMB_BYTES+j]<<(8*j);}
+    for(int i=0;i<FP25519_N;i++) {
+        r->v[i]=0;
+        for(int j=0;j<LIMB_BYTES;j++)
+            r->v[i]|=(limb_t)b[i*LIMB_BYTES+j]<<(8*j);
+    }
 }
 
 /* Store fp25519 as 32 bytes little-endian. Fully reduces first. */
@@ -2252,7 +2281,9 @@ static void fp25519_to_le(uint8_t b[32], const fp25519 *a) {
         limb_t mask=-(limb_t)(1-borrow);
         for(int i=0;i<FP25519_N;i++) t.v[i]=(t.v[i]&~mask)|(s.v[i]&mask);
     }
-    for(int i=0;i<FP25519_N;i++)for(int j=0;j<LIMB_BYTES;j++)b[i*LIMB_BYTES+j]=(uint8_t)((t.v[i]>>(8*j))&0xFF);
+    for(int i=0;i<FP25519_N;i++)
+        for(int j=0;j<LIMB_BYTES;j++)
+            b[i*LIMB_BYTES+j]=(uint8_t)((t.v[i]>>(8*j))&0xFF);
 }
 
 /* X25519 Montgomery ladder (RFC 7748 §5) — x-coordinate only */
@@ -4440,7 +4471,8 @@ static void tls12_handshake(const tls_conn *conn) {
         if(rtype==TLS_RT_APPDATA) {
             uint8_t pt12[REC_BUF_SIZE]; size_t pt12_len;
             int dec_ok2=tls12_recv_decrypt(rec,rec_len,TLS_RT_APPDATA,
-                is_cbc,is_chacha,s_wk,key_len,s_mk,mac_key_len,mac_alg,s_wiv,s12_seq++,pt12,&pt12_len);
+                is_cbc,is_chacha,s_wk,key_len,s_mk,mac_key_len,
+                mac_alg,s_wiv,s12_seq++,pt12,&pt12_len);
             if(dec_ok2<0) {
                 fprintf(stderr,"Decrypt failed at seq %llu\n",(unsigned long long)(s12_seq-1));
                 break;
