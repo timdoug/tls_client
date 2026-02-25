@@ -1,0 +1,8 @@
+# Build artifacts
+tls_client
+tls_client_*
+*.plist
+*.dSYM/
+
+# Trust store (local runtime data)
+trust_store/
