@@ -91,7 +91,6 @@ pass_tests=(
     "https://cbc.badssl.com/|CBC cipher mode"
     "https://static-rsa.badssl.com/|static RSA key exchange"
     "https://tls-v1-2.badssl.com:1012/|TLS 1.2 only server"
-    "https://revoked.badssl.com/|revoked cert (no OCSP checking)"
     "https://pinning-test.badssl.com/|cert pinning test"
     "https://hsts.badssl.com/|HSTS header"
     # -- Top 250 domains --
@@ -365,6 +364,8 @@ pass_tests=(
 # ================================================================
 # Format: URL|description|expected error substring
 xfail_tests=(
+    # -- Revoked certificates --
+    "https://revoked.badssl.com/|revoked cert (CRL)|revoked"
     # -- Bad certificates (cert verification should reject) --
     "https://expired.badssl.com/|expired cert|Certificate verification failed"
     "https://wrong.host.badssl.com/|wrong hostname|Certificate verification failed"

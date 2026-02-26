@@ -35,6 +35,12 @@ Chrome's CT log list, enforcing Chrome/Apple SCT policy — 2 SCTs for
 certificates <=180 days, 3 for longer-lived certificates, from >=2 distinct log
 operators.
 
+**CRL revocation checking**: fetches CRL from distribution point URLs embedded
+in leaf certificates, verifies the CRL signature against the issuer, and rejects
+connections if the certificate serial number appears revoked. Fetched CRLs are
+cached to the `crls/` directory and reused until `nextUpdate` expires. Soft-fails
+(warns but allows) if no CRL distribution point is present or the fetch fails.
+
 **AIA chasing**: fetches missing intermediate certificates over HTTP when the
 server sends an incomplete chain.
 
@@ -72,7 +78,7 @@ ladder, RSA modular exponentiation (64-bit & 32-bit limb paths).
 
 ## What's not implemented
 
-- Revocation checking: OCSP, CRL
+- OCSP stapling / OCSP responder checking
 - Session resumption (every connection is a full handshake)
 - Client certificates
 - TLS 1.0/1.1

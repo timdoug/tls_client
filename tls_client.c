@@ -23,6 +23,8 @@
 #include <fcntl.h>
 #include <time.h>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <limits.h>
 
 static int verbose = 0;
@@ -227,6 +229,7 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 /* Socket read timeouts (seconds) */
 #define TLS_READ_TIMEOUT_S   10
 #define AIA_READ_TIMEOUT_S   5
+#define CRL_READ_TIMEOUT_S   10
 
 static void __attribute__((noreturn)) die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
 
@@ -2840,6 +2843,7 @@ static const uint8_t OID_CA_ISSUERS[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x30,0x0
 static const uint8_t OID_NAME_CONSTRAINTS[]   = {0x55,0x1D,0x1E};
 static const uint8_t OID_POLICY_CONSTRAINTS[] = {0x55,0x1D,0x24};
 static const uint8_t OID_SCT_LIST[] = {0x2B,0x06,0x01,0x04,0x01,0xD6,0x79,0x02,0x04,0x02};
+static const uint8_t OID_CRL_DIST_POINTS[] = {0x55,0x1D,0x1F};
 
 #include "ct_log_table.inc"
 
@@ -2869,6 +2873,8 @@ typedef struct {
     uint16_t key_usage;                             /* keyUsage bit flags (0 = not present) */
     const uint8_t *sct_list; size_t sct_list_len;   /* SCT list extension value */
     const uint8_t *spki; size_t spki_len;            /* raw DER SubjectPublicKeyInfo */
+    const uint8_t *serial; size_t serial_len;        /* raw DER INTEGER (tag+len+value) */
+    const uint8_t *crl_dp_url; size_t crl_dp_url_len; /* first HTTP CRL distribution point */
 } x509_cert;
 
 static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8_t *tbs_end) {
@@ -3002,6 +3008,54 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
             if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
             const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
             if(oct&&tag==0x04){cert->sct_list=oct;cert->sct_list_len=len;}
+        } else if(oid_eq(eoid,len,OID_CRL_DIST_POINTS,sizeof(OID_CRL_DIST_POINTS))){
+            /* CRL Distribution Points: SEQUENCE OF DistributionPoint
+             * DistributionPoint ::= SEQUENCE { distributionPoint [0] { fullName [0] GeneralNames } }
+             * GeneralName ::= uniformResourceIdentifier [6] IA5String */
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){
+                /* OCTET STRING wraps SEQUENCE OF DistributionPoint */
+                const uint8_t *sq=der_expect(oct,oct+len,0x30,&len);
+                if(sq){
+                    const uint8_t *sq_end=sq+len;
+                    while(sq<sq_end&&!cert->crl_dp_url){
+                        /* DistributionPoint SEQUENCE */
+                        const uint8_t *dp=der_read_tl(sq,sq_end,&tag,&len);
+                        if(!dp||tag!=0x30) break;
+                        const uint8_t *dp_end=dp+len;
+                        sq=dp_end;
+                        /* distributionPoint [0] EXPLICIT */
+                        if(dp<dp_end&&*dp==0xA0){
+                            const uint8_t *dpn=der_read_tl(dp,dp_end,&tag,&len);
+                            if(dpn&&tag==0xA0){
+                                const uint8_t *dpn_end=dpn+len;
+                                /* fullName [0] EXPLICIT -> GeneralNames */
+                                if(dpn<dpn_end&&*dpn==0xA0){
+                                    const uint8_t *fn=der_read_tl(dpn,dpn_end,&tag,&len);
+                                    if(fn&&tag==0xA0){
+                                        const uint8_t *fn_end=fn+len;
+                                        /* Find uniformResourceIdentifier [6] */
+                                        const uint8_t *gn=fn;
+                                        while(gn<fn_end){
+                                            const uint8_t *gv=der_read_tl(gn,fn_end,&tag,&len);
+                                            if(!gv) break;
+                                            if(tag==0x86&&len>7&&
+                                               memcmp(gv,"http://",7)==0){
+                                                cert->crl_dp_url=gv;
+                                                cert->crl_dp_url_len=len;
+                                                break;
+                                            }
+                                            gn=gv+len;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             /* RFC 5280 §4.2: reject unrecognized critical extensions */
             const uint8_t *rest=eoid+len;
@@ -3045,7 +3099,9 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
         tp=v_end;
     }
     /* serialNumber */
+    cert->serial=tp;
     tp=der_skip(tp,tbs_end); if(!tp) return -1;
+    cert->serial_len=(size_t)(tp-cert->serial);
     /* signature AlgorithmIdentifier */
     tp=der_skip(tp,tbs_end); if(!tp) return -1;
 
@@ -3341,11 +3397,11 @@ static int validate_leaf_cert(const x509_cert *leaf, const char *hostname) {
 }
 
 /* ================================================================
- * AIA (Authority Information Access) Fetcher
+ * HTTP Fetcher (shared by AIA and CRL)
  * ================================================================ */
-static int http_fetch_der(const uint8_t *url, size_t url_len,
-                           const uint8_t **out, size_t *out_len) {
-    static uint8_t aia_buf[8192];
+static int http_fetch(const uint8_t *url, size_t url_len,
+                      uint8_t *buf, size_t buf_size, int timeout_s,
+                      const uint8_t **out, size_t *out_len) {
     /* Parse URL: skip "http://" prefix, extract host and path */
     if(url_len<=7) return -1;
     const uint8_t *hp=url+7;
@@ -3374,7 +3430,7 @@ static int http_fetch_der(const uint8_t *url, size_t url_len,
     if(getaddrinfo(host,"80",&hints,&res)!=0) return -1;
     int fd=socket(res->ai_family,res->ai_socktype,res->ai_protocol);
     if(fd<0){ freeaddrinfo(res); return -1; }
-    struct timeval tv={AIA_READ_TIMEOUT_S,0};
+    struct timeval tv={timeout_s,0};
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
     if(connect(fd,res->ai_addr,res->ai_addrlen)<0){
         freeaddrinfo(res); close(fd); return -1;
@@ -3391,8 +3447,8 @@ static int http_fetch_der(const uint8_t *url, size_t url_len,
 
     /* Read entire response */
     size_t total=0;
-    while(total<sizeof(aia_buf)){
-        ssize_t n=read(fd,aia_buf+total,sizeof(aia_buf)-total);
+    while(total<buf_size){
+        ssize_t n=read(fd,buf+total,buf_size-total);
         if(n<=0) break;
         total+=(size_t)n;
     }
@@ -3402,19 +3458,26 @@ static int http_fetch_der(const uint8_t *url, size_t url_len,
     /* Skip HTTP headers: find \r\n\r\n */
     uint8_t *body=NULL;
     for(size_t i=0;i+3<total;i++){
-        if(aia_buf[i]=='\r'&&aia_buf[i+1]=='\n'&&
-           aia_buf[i+2]=='\r'&&aia_buf[i+3]=='\n'){
-            body=aia_buf+i+4;
+        if(buf[i]=='\r'&&buf[i+1]=='\n'&&
+           buf[i+2]=='\r'&&buf[i+3]=='\n'){
+            body=buf+i+4;
             break;
         }
     }
     if(!body) return -1;
-    size_t body_len=total-(size_t)(body-aia_buf);
+    size_t body_len=total-(size_t)(body-buf);
     if(body_len==0) return -1;
 
     *out=(const uint8_t *)body;
     *out_len=body_len;
     return 0;
+}
+
+static uint8_t aia_buf[8192];
+
+static int http_fetch_der(const uint8_t *url, size_t url_len,
+                           const uint8_t **out, size_t *out_len) {
+    return http_fetch(url,url_len,aia_buf,sizeof(aia_buf),AIA_READ_TIMEOUT_S,out,out_len);
 }
 
 /* DNS name constraint matching per RFC 5280 §4.2.1.10:
@@ -3852,6 +3915,244 @@ static int ct_verify_scts(const x509_cert *leaf, const uint8_t *issuer_key_hash)
 }
 
 /* ================================================================
+ * CRL (Certificate Revocation List) Check
+ * ================================================================ */
+static uint8_t crl_buf[16*1024*1024]; /* 16 MB for CRL */
+
+static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
+    if(!cert->crl_dp_url){
+        if(verbose) printf("    CRL: no distribution point URL\n");
+        return 0; /* soft-fail */
+    }
+
+    /* Extract cache filename from URL: skip "http://", flatten path with '_' */
+    char cache_path[PATH_MAX];
+    int have_cache_path=0;
+    {
+        const uint8_t *url=cert->crl_dp_url;
+        size_t url_len=cert->crl_dp_url_len;
+        /* Skip past "http://" or "https://" */
+        size_t start=0;
+        if(url_len>7&&memcmp(url,"http://",7)==0) start=7;
+        else if(url_len>8&&memcmp(url,"https://",8)==0) start=8;
+        if(start<url_len){
+            size_t remain=url_len-start;
+            if(remain>sizeof(cache_path)-6) remain=sizeof(cache_path)-6;
+            memcpy(cache_path,"crls/",5);
+            for(size_t i=0;i<remain;i++)
+                cache_path[5+i]=(url[start+i]=='/')?'_':(char)url[start+i];
+            cache_path[5+remain]='\0';
+            have_cache_path=1;
+        }
+    }
+
+    const uint8_t *crl_der=NULL; size_t crl_len=0;
+    int from_cache=0;
+
+    /* Try loading from disk cache */
+    if(have_cache_path){
+        FILE *cf=fopen(cache_path,"rb");
+        if(cf){
+            crl_len=fread(crl_buf,1,sizeof(crl_buf),cf);
+            fclose(cf);
+            if(crl_len>0){
+                crl_der=crl_buf;
+                /* Check freshness: quick partial parse for nextUpdate */
+                int fresh=0;
+                size_t tlen;
+                const uint8_t *cp=der_expect(crl_der,crl_der+crl_len,0x30,&tlen);
+                if(cp){
+                    const uint8_t *tp=der_expect(cp,cp+tlen,0x30,&tlen);
+                    if(tp){
+                        const uint8_t *tp_end=tp+tlen;
+                        if(tp<tp_end&&*tp==0x02) tp=der_skip(tp,tp_end);
+                        if(tp) tp=der_skip(tp,tp_end); /* signature AlgId */
+                        if(tp) tp=der_skip(tp,tp_end); /* issuer Name */
+                        if(tp) tp=der_skip(tp,tp_end); /* thisUpdate */
+                        if(tp&&tp<tp_end&&(*tp==0x17||*tp==0x18)){
+                            time_t nu=der_parse_time(tp,tp_end);
+                            if(nu>0&&time(NULL)<=nu) fresh=1;
+                        }
+                    }
+                }
+                if(fresh){
+                    if(verbose) printf("    CRL: using cached %s\n",cache_path);
+                    from_cache=1;
+                } else {
+                    if(verbose) printf("    CRL: cached %s expired, re-fetching\n",cache_path);
+                    crl_der=NULL;
+                    crl_len=0;
+                }
+            }
+        }
+    }
+
+    if(!from_cache){
+        if(verbose) printf("    CRL: fetching %.*s\n",
+               (int)cert->crl_dp_url_len,cert->crl_dp_url);
+        if(http_fetch(cert->crl_dp_url,cert->crl_dp_url_len,
+                      crl_buf,sizeof(crl_buf),CRL_READ_TIMEOUT_S,
+                      &crl_der,&crl_len)<0){
+            if(verbose) printf("    CRL: fetch failed (soft-fail)\n");
+            return 0;
+        }
+        /* Write to disk cache (best-effort) */
+        if(have_cache_path&&crl_len>0){
+            if(mkdir("crls",0755)<0&&errno!=EEXIST){
+                /* ignore mkdir failure */
+            } else {
+                FILE *wf=fopen(cache_path,"wb");
+                if(wf){
+                    fwrite(crl_der,1,crl_len,wf);
+                    fclose(wf);
+                    if(verbose) printf("    CRL: cached to %s\n",cache_path);
+                }
+            }
+        }
+    }
+
+    /* Parse CRL DER:
+     * CertificateList ::= SEQUENCE { tbsCertList, sigAlg, sig }
+     * TBSCertList ::= SEQUENCE { version?, sigAlg, issuer, thisUpdate,
+     *                             nextUpdate?, revokedCertificates?, extensions? } */
+    uint8_t tag; size_t len;
+    const uint8_t *p=der_expect(crl_der,crl_der+crl_len,0x30,&len);
+    if(!p){
+        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        return 0;
+    }
+    const uint8_t *crl_end=p+len;
+
+    /* TBSCertList */
+    const uint8_t *tbs_start=p;
+    const uint8_t *tbs=der_expect(p,crl_end,0x30,&len);
+    if(!tbs){
+        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        return 0;
+    }
+    const uint8_t *tbs_end_ptr=tbs+len;
+    size_t tbs_full_len=(size_t)(tbs_end_ptr-tbs_start);
+    p=tbs_end_ptr;
+
+    /* signatureAlgorithm */
+    const uint8_t *crl_sig_alg_start=p;
+    const uint8_t *sa=der_read_tl(p,crl_end,&tag,&len);
+    if(!sa||tag!=0x30){
+        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        return 0;
+    }
+    /* Extract the OID from the AlgorithmIdentifier SEQUENCE */
+    const uint8_t *sa_oid=der_expect(sa,sa+len,0x06,&len);
+    size_t crl_sig_alg_len=0;
+    const uint8_t *crl_sig_alg=NULL;
+    if(sa_oid){ crl_sig_alg=sa_oid; crl_sig_alg_len=len; }
+    p=der_skip(crl_sig_alg_start,crl_end);
+    if(!p){
+        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        return 0;
+    }
+
+    /* signatureValue BIT STRING */
+    const uint8_t *sig_bits=der_expect(p,crl_end,0x03,&len);
+    if(!sig_bits||len<2||sig_bits[0]!=0){
+        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        return 0;
+    }
+    const uint8_t *crl_sig=sig_bits+1;
+    size_t crl_sig_len=len-1;
+
+    /* Verify CRL signature against issuer's public key */
+    if(crl_sig_alg){
+        if(!verify_signature(tbs_start,tbs_full_len,
+                              crl_sig_alg,crl_sig_alg_len,
+                              crl_sig,crl_sig_len,
+                              issuer->key_type,
+                              issuer->pubkey,issuer->pubkey_len,
+                              issuer->rsa_n,issuer->rsa_n_len,
+                              issuer->rsa_e,issuer->rsa_e_len)){
+            if(verbose) printf("    CRL: signature verification failed (soft-fail)\n");
+            return 0;
+        }
+        if(verbose) printf("    CRL: signature verified\n");
+    }
+
+    /* Parse TBSCertList fields */
+    const uint8_t *tp=tbs;
+    /* version (optional INTEGER) */
+    if(tp<tbs_end_ptr&&*tp==0x02) tp=der_skip(tp,tbs_end_ptr);
+    /* signature AlgorithmIdentifier */
+    if(!tp) return 0;
+    tp=der_skip(tp,tbs_end_ptr);
+    /* issuer Name */
+    if(!tp) return 0;
+    tp=der_skip(tp,tbs_end_ptr);
+    /* thisUpdate */
+    if(!tp) return 0;
+    time_t this_update=der_parse_time(tp,tbs_end_ptr);
+    tp=der_skip(tp,tbs_end_ptr);
+    if(!tp) return 0;
+
+    /* nextUpdate is OPTIONAL per RFC 5280 §5.1.2.5; if absent, the next
+     * element is revokedCertificates (a SEQUENCE, tag 0x30).  We distinguish
+     * by checking for a Time tag (UTCTime 0x17 or GeneralizedTime 0x18). */
+    time_t next_update=0;
+    if(tp<tbs_end_ptr&&(*tp==0x17||*tp==0x18)){
+        next_update=der_parse_time(tp,tbs_end_ptr);
+        tp=der_skip(tp,tbs_end_ptr);
+        if(!tp) return 0;
+    }
+
+    /* Check validity */
+    time_t now=time(NULL);
+    if(this_update>0&&now<this_update){
+        if(verbose) printf("    CRL: not yet valid (soft-fail)\n");
+        return 0;
+    }
+    if(next_update>0&&now>next_update){
+        if(verbose) printf("    CRL: expired (soft-fail)\n");
+        return 0;
+    }
+
+    /* revokedCertificates is OPTIONAL per RFC 5280 §5.1.2.6; a conforming
+     * CA may omit it when there are no revoked certificates. */
+    if(tp>=tbs_end_ptr||*tp!=0x30){
+        if(verbose) printf("    CRL: no revoked certificates — not revoked\n");
+        return 0;
+    }
+    const uint8_t *revoked=der_expect(tp,tbs_end_ptr,0x30,&len);
+    if(!revoked){
+        if(verbose) printf("    CRL: not revoked\n");
+        return 0;
+    }
+    const uint8_t *revoked_end=revoked+len;
+
+    /* Extract cert serial value bytes (skip tag+length) */
+    uint8_t stag; size_t slen;
+    const uint8_t *cert_serial_val=der_read_tl(cert->serial,cert->serial+cert->serial_len,&stag,&slen);
+    if(!cert_serial_val||stag!=0x02) return 0;
+
+    /* Walk revokedCertificates entries */
+    const uint8_t *rp=revoked;
+    while(rp<revoked_end){
+        const uint8_t *entry=der_read_tl(rp,revoked_end,&tag,&len);
+        if(!entry||tag!=0x30) break;
+        const uint8_t *entry_end=entry+len;
+        rp=entry_end;
+        /* userCertificate INTEGER */
+        const uint8_t *rev_serial=der_read_tl(entry,entry_end,&tag,&len);
+        if(!rev_serial||tag!=0x02) continue;
+        /* Compare serial value bytes */
+        if(len==slen&&memcmp(rev_serial,cert_serial_val,slen)==0){
+            fprintf(stderr,"CRL: certificate serial number is REVOKED\n");
+            return -1;
+        }
+    }
+
+    if(verbose) printf("    CRL: certificate not revoked\n");
+    return 0;
+}
+
+/* ================================================================
  * Certificate Chain Validation
  * ================================================================ */
 static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
@@ -3956,6 +4257,23 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                         fprintf(stderr, "No embedded SCTs in leaf certificate\n");
                         return -1;
                     }
+                }
+                /* CRL revocation check for leaf certificate */
+                {
+                    x509_cert leaf_issuer;
+                    memset(&leaf_issuer,0,sizeof(leaf_issuer));
+                    if(i==0){
+                        leaf_issuer.key_type=trust_store[j].key_type;
+                        leaf_issuer.pubkey=trust_store[j].pubkey;
+                        leaf_issuer.pubkey_len=trust_store[j].pubkey_len;
+                        leaf_issuer.rsa_n=trust_store[j].rsa_n;
+                        leaf_issuer.rsa_n_len=trust_store[j].rsa_n_len;
+                        leaf_issuer.rsa_e=trust_store[j].rsa_e;
+                        leaf_issuer.rsa_e_len=trust_store[j].rsa_e_len;
+                    } else {
+                        leaf_issuer=certs[1];
+                    }
+                    if(crl_check(&certs[0],&leaf_issuer)<0) return -1;
                 }
                 return 0;
             }
