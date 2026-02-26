@@ -3743,7 +3743,7 @@ static int ct_verify_sct(const uint8_t *precert_tbs, size_t precert_tbs_len,
     memcpy(wp, precert_tbs, precert_tbs_len); wp += precert_tbs_len;
     *wp++ = (uint8_t)(ext_len >> 8);
     *wp++ = (uint8_t)(ext_len);
-    if(ext_len > 0) { memcpy(wp, ext_data, ext_len); wp += ext_len; }
+    if(ext_len > 0) { memcpy(wp, ext_data, ext_len); }
 
     uint8_t hash[32];
     sha256_hash(signed_data, signed_data_len, hash);
