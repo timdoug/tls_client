@@ -23,8 +23,8 @@ getcerts:
 		'./usr/share/ca-certificates/mozilla/*.crt'; \
 	echo "Installed $$(ls trust_store/*.crt | wc -l | tr -d ' ') certs into trust_store/"
 
-getlogs:
-	python3 gen_ct_logs.py > ct_log_table.inc
+ct_log_table.inc:
+	python3 gen_ct_logs.py > $@
 
 test: tls_client
 	bash test.sh -n 25
@@ -33,6 +33,7 @@ fulltest: tls_client
 	bash test.sh
 
 clean:
-	rm -f tls_client
+	rm -f tls_client ct_log_table.inc
+	rm -rf __pycache__
 
-.PHONY: getcerts getlogs test fulltest clean
+.PHONY: getcerts test fulltest clean

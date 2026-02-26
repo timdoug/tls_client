@@ -5,6 +5,8 @@ dependencies besides POSIX / C stdlib.
 
 ```
 $ make
+python3 gen_ct_logs.py > ct_log_table.inc
+// Extracted 54 logs from 8 operators
 cc -std=c17 -Wall -Wextra -Werror -pedantic -O2 -o tls_client tls_client.c
 $ ./tls_client https://www.example.com
 <!doctype html><html lang="en"><head><title>Example Domain</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href="https://iana.org/domains/example">Learn more</a></p></div></body></html>
@@ -91,13 +93,10 @@ make getcerts
 ## CT log table
 
 The CT log public keys and operator IDs are compiled in from
-`ct_log_table.inc`, generated from Chrome's
+`ct_log_table.inc`, auto-generated on first build by `gen_ct_logs.py`
+from Chrome's
 [log_list.json](https://www.gstatic.com/ct/log_list/v3/log_list.json).
-To regenerate:
-
-```
-make getlogs
-```
+Delete `ct_log_table.inc` and re-run `make` to refresh.
 
 ## Testing
 
