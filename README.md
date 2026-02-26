@@ -109,25 +109,33 @@ Delete `ct_log_table.inc` and re-run `make` to refresh.
 ## Testing
 
 ```
-make test      # compile, static analysis, 25 random domains + all xfail + local crypto
-make fulltest  # compile, static analysis, all 276 domains + all xfail + local crypto
-./tls_client -t # RFC test vectors for Ed25519, X448, Ed448
+make test           # compile, static analysis, 25 random sites + xfail + local crypto
+make fulltest       # compile, static analysis, all ~250 sites + xfail + local crypto
+make test-local     # local openssl s_server cipher suite tests only (25 tests)
+make test-static    # compile + static analysis only
+make test-sites     # 25 random site connection tests only
+make test-sites-all # all site connection tests (pass + xfail)
+make test-xfail     # expected-failure tests only
+./tls_client -t     # RFC test vectors for Ed25519, X448, Ed448
 ```
 
-Runs the compiler, static analysis (cppcheck + clang --analyze), then
-expected-pass and 31 expected-fail connection tests covering:
+The full suite covers:
 
-- badssl.com certificate/cipher edge cases + AIA incomplete chain
-- ~250 top domains (Google, Amazon, Cloudflare, banks, CDNs, etc.)
-- Local `openssl s_server` integration tests for Ed25519, X448, and Ed448
-  (auto-skipped if OpenSSL lacks support)
+- **Static analysis**: cppcheck + clang --analyze
+- **~250 site connections**: Google, Amazon, Cloudflare, banks, CDNs, etc.
+- **31 expected-failure tests**: badssl.com certificate/cipher edge cases
+- **25 local crypto tests**: `openssl s_server` integration tests covering
+  every supported cipher suite, key exchange group, and cert type, plus 5
+  negative tests (expired cert, wrong hostname, untrusted cert, TLS 1.0/1.1
+  rejection)
 
 Bails early after 10 failures.
 
-The local crypto tests exercise code paths that no public server currently
-offers: Ed25519/Ed448 certificate signatures and X448 key exchange. Each test
-generates a self-signed cert, starts a local `openssl s_server`, connects with
-`tls_client`, and verifies the handshake succeeds.
+The local crypto tests start a local `openssl s_server` for each combination
+and connect with `tls_client`. This exercises all 3 TLS 1.3 ciphers (with
+X25519, P-256, P-384 groups), all 10 TLS 1.2 ECDHE cipher suites (RSA and
+ECDSA auth), all 4 static RSA cipher suites, plus Ed25519/X448/Ed448
+(auto-skipped if OpenSSL lacks support).
 
 ## Building
 

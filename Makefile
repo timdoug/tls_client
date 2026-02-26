@@ -32,8 +32,23 @@ test: tls_client
 fulltest: tls_client
 	bash test.sh
 
+test-local: tls_client
+	bash test.sh -s local
+
+test-static:
+	bash test.sh -s compile,static
+
+test-sites-all: tls_client
+	bash test.sh -s pass,xfail
+
+test-sites: tls_client
+	bash test.sh -s pass -n 25
+
+test-xfail: tls_client
+	bash test.sh -s xfail
+
 clean:
 	rm -f tls_client ct_log_table.inc
 	rm -rf __pycache__
 
-.PHONY: getcerts test fulltest clean
+.PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail clean

@@ -5,13 +5,23 @@ set -euo pipefail
 TEST_TIMEOUT=30   # seconds per test (must exceed TLS_READ_TIMEOUT_S in tls_client.c)
 MAX_FAILURES=10   # bail early after this many failures in pass tests
 SAMPLE_SIZE=0     # 0 = run all; >0 = random sample of N pass tests
+SECTIONS=""       # comma-separated: compile,static,pass,xfail,local (empty = all)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n) SAMPLE_SIZE="$2"; shift 2 ;;
-        *)  echo "Usage: $0 [-n sample_size]" >&2; exit 1 ;;
+        -s) SECTIONS="$2"; shift 2 ;;
+        *)  echo "Usage: $0 [-n sample_size] [-s sections]" >&2
+            echo "  sections: compile,static,pass,xfail,local (default: all)" >&2
+            exit 1 ;;
     esac
 done
+
+# Section helpers
+run_section() {
+    [[ -z "$SECTIONS" ]] && return 0
+    [[ ",$SECTIONS," == *",$1,"* ]]
+}
 
 # -- Colors --
 RED='\033[0;31m'
@@ -27,6 +37,7 @@ xfail_unexpected_pass=0
 failures=()
 xfail_pass_list=()
 
+if run_section compile; then
 printf "${BLD}=== Compile ===${RST}\n"
 
 printf "  cc  ... "
@@ -37,7 +48,9 @@ printf "  gcc-15 ... "
 gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_client_gcc tls_client.c
 rm -f tls_client_gcc
 printf "${GRN}ok${RST}\n"
+fi
 
+if run_section static; then
 printf "\n${BLD}=== Static analysis ===${RST}\n"
 
 printf "  cppcheck ... "
@@ -54,6 +67,7 @@ else
     printf "${YLW}warnings (non-fatal)${RST}\n"
 fi
 rm -f tls_client.plist
+fi
 
 # -- Timeout helper (macOS lacks GNU timeout) --
 # Usage: run_with_timeout <seconds> <command> [args...]
@@ -406,6 +420,7 @@ xfail_tests=(
 # ================================================================
 # Run tests expected to PASS
 # ================================================================
+if run_section pass; then
 
 # Random sampling: shuffle indices and take first N
 if [[ $SAMPLE_SIZE -gt 0 && $SAMPLE_SIZE -lt ${#pass_tests[@]} ]]; then
@@ -461,10 +476,12 @@ for entry in "${pass_tests[@]}"; do
         fi
     fi
 done
+fi # run_section pass
 
 # ================================================================
 # Run tests expected to FAIL (xfail)
 # ================================================================
+if run_section xfail; then
 printf "\n${BLD}=== Connection tests (expected fail) ===${RST}\n"
 
 for entry in "${xfail_tests[@]}"; do
@@ -491,26 +508,29 @@ for entry in "${xfail_tests[@]}"; do
         xfail=$((xfail + 1))
     fi
 done
+fi # run_section xfail
 
 # ================================================================
 # Local crypto tests (openssl s_server)
 # ================================================================
-printf "\n${BLD}=== Local crypto tests ===${RST}\n"
-
 local_pass=0
 local_fail=0
 local_skip=0
+local_xfail=0
 
+if run_section local; then
+printf "\n${BLD}=== Local crypto tests ===${RST}\n"
+LOCAL_PORT=14433
 LOCAL_TMPDIR=$(mktemp -d)
 local_cleanup_pids=()
 
 cleanup_local() {
-    for pid in "${local_cleanup_pids[@]}"; do
+    for pid in ${local_cleanup_pids[@]+"${local_cleanup_pids[@]}"}; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
     rm -rf "$LOCAL_TMPDIR"
-    rm -f trust_store/ed25519_test.crt trust_store/x448_test.crt trust_store/ed448_test.crt
+    rm -f trust_store/local_test_*.crt
 }
 trap cleanup_local EXIT
 
@@ -526,27 +546,135 @@ wait_for_server() {
     return 1
 }
 
-# Run a local TLS test: start s_server, connect with tls_client, check result.
-# Usage: run_local_test <name> <port> <key> <cert> <trust_file> [extra s_server args...]
-run_local_test() {
-    local name="$1" port="$2" key="$3" cert="$4" trust_file="$5"
-    shift 5
+wait_for_port_free() {
+    local port=$1 i=0
+    while [[ $i -lt 30 ]]; do
+        if ! nc -z localhost "$port" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 1
+}
 
-    if nc -z localhost "$port" 2>/dev/null; then
-        printf "${YLW}SKIP${RST}  (port %s in use)\n" "$port"
-        local_skip=$((local_skip + 1))
-        return
-    fi
+# --- Generate certificates ---
+# RSA-2048 (always available)
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$LOCAL_TMPDIR/rsa_key.pem" 2>/dev/null
+openssl req -new -x509 -key "$LOCAL_TMPDIR/rsa_key.pem" \
+    -out "$LOCAL_TMPDIR/rsa_cert.pem" -days 1 \
+    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+RSA_KEY="$LOCAL_TMPDIR/rsa_key.pem"
+RSA_CERT="$LOCAL_TMPDIR/rsa_cert.pem"
 
-    cp "$cert" "$trust_file"
+# ECDSA P-256 (always available)
+openssl ecparam -name prime256v1 -genkey -noout \
+    -out "$LOCAL_TMPDIR/ec256_key.pem" 2>/dev/null
+openssl req -new -x509 -key "$LOCAL_TMPDIR/ec256_key.pem" \
+    -out "$LOCAL_TMPDIR/ec256_cert.pem" -days 1 \
+    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+EC256_KEY="$LOCAL_TMPDIR/ec256_key.pem"
+EC256_CERT="$LOCAL_TMPDIR/ec256_cert.pem"
 
-    openssl s_server -key "$key" -cert "$cert" -port "$port" -www \
+# ECDSA P-384 (always available)
+openssl ecparam -name secp384r1 -genkey -noout \
+    -out "$LOCAL_TMPDIR/ec384_key.pem" 2>/dev/null
+openssl req -new -x509 -key "$LOCAL_TMPDIR/ec384_key.pem" \
+    -out "$LOCAL_TMPDIR/ec384_cert.pem" -days 1 \
+    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+EC384_KEY="$LOCAL_TMPDIR/ec384_key.pem"
+EC384_CERT="$LOCAL_TMPDIR/ec384_cert.pem"
+
+# Ed25519 (may not be available)
+HAS_ED25519=false
+if openssl genpkey -algorithm Ed25519 -out "$LOCAL_TMPDIR/ed25519_key.pem" 2>/dev/null && \
+   openssl req -new -x509 -key "$LOCAL_TMPDIR/ed25519_key.pem" \
+       -out "$LOCAL_TMPDIR/ed25519_cert.pem" -days 1 \
+       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
+    HAS_ED25519=true
+    ED25519_KEY="$LOCAL_TMPDIR/ed25519_key.pem"
+    ED25519_CERT="$LOCAL_TMPDIR/ed25519_cert.pem"
+fi
+
+# Ed448 (may not be available)
+HAS_ED448=false
+if openssl genpkey -algorithm Ed448 -out "$LOCAL_TMPDIR/ed448_key.pem" 2>/dev/null && \
+   openssl req -new -x509 -key "$LOCAL_TMPDIR/ed448_key.pem" \
+       -out "$LOCAL_TMPDIR/ed448_cert.pem" -days 1 \
+       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
+    HAS_ED448=true
+    ED448_KEY="$LOCAL_TMPDIR/ed448_key.pem"
+    ED448_CERT="$LOCAL_TMPDIR/ed448_cert.pem"
+fi
+
+# X448 support check (uses EC-256 cert, just forces X448 group)
+HAS_X448=false
+if openssl genpkey -algorithm X448 -out /dev/null 2>/dev/null; then
+    HAS_X448=true
+fi
+
+# Expired cert (RSA, notAfter in the past)
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$LOCAL_TMPDIR/expired_key.pem" 2>/dev/null
+openssl req -new -x509 -key "$LOCAL_TMPDIR/expired_key.pem" \
+    -out "$LOCAL_TMPDIR/expired_cert.pem" -days 1 \
+    -not_before 20200101000000Z -not_after 20200102000000Z \
+    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+EXPIRED_KEY="$LOCAL_TMPDIR/expired_key.pem"
+EXPIRED_CERT="$LOCAL_TMPDIR/expired_cert.pem"
+
+# Wrong-hostname cert (RSA, CN and SAN mismatch)
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$LOCAL_TMPDIR/wronghost_key.pem" 2>/dev/null
+openssl req -new -x509 -key "$LOCAL_TMPDIR/wronghost_key.pem" \
+    -out "$LOCAL_TMPDIR/wronghost_cert.pem" -days 1 \
+    -subj "/CN=wrong.example.com" -addext "subjectAltName=DNS:wrong.example.com" 2>/dev/null
+WRONGHOST_KEY="$LOCAL_TMPDIR/wronghost_key.pem"
+WRONGHOST_CERT="$LOCAL_TMPDIR/wronghost_cert.pem"
+
+# Untrusted cert (RSA, valid CN=localhost but NOT copied to trust_store)
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$LOCAL_TMPDIR/untrusted_key.pem" 2>/dev/null
+openssl req -new -x509 -key "$LOCAL_TMPDIR/untrusted_key.pem" \
+    -out "$LOCAL_TMPDIR/untrusted_cert.pem" -days 1 \
+    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+UNTRUSTED_KEY="$LOCAL_TMPDIR/untrusted_key.pem"
+UNTRUSTED_CERT="$LOCAL_TMPDIR/untrusted_cert.pem"
+
+# --- Copy all certs to trust_store/ ---
+cp "$RSA_CERT"  trust_store/local_test_rsa.crt
+cp "$EC256_CERT" trust_store/local_test_ec256.crt
+cp "$EC384_CERT" trust_store/local_test_ec384.crt
+$HAS_ED25519 && cp "$ED25519_CERT" trust_store/local_test_ed25519.crt
+$HAS_ED448   && cp "$ED448_CERT"   trust_store/local_test_ed448.crt
+cp "$EXPIRED_CERT"   trust_store/local_test_expired.crt
+cp "$WRONGHOST_CERT" trust_store/local_test_wronghost.crt
+# NOTE: untrusted cert deliberately NOT copied to trust_store
+
+# --- Check for static RSA cipher availability (OpenSSL 3.x may disable them) ---
+HAS_STATIC_RSA=false
+if openssl ciphers AES128-GCM-SHA256 >/dev/null 2>&1; then
+    HAS_STATIC_RSA=true
+fi
+
+# --- Helper: run a single server test ---
+# Usage: run_server_test <name> <key> <cert> [extra s_server args...]
+run_server_test() {
+    local name="$1" key="$2" cert="$3"
+    shift 3
+
+    printf "  %-50s " "$name"
+
+    wait_for_port_free $LOCAL_PORT
+
+    openssl s_server -key "$key" -cert "$cert" -port $LOCAL_PORT -www \
         "$@" </dev/null >/dev/null 2>&1 &
     local srv_pid=$!
     local_cleanup_pids+=("$srv_pid")
 
-    if wait_for_server "$port"; then
-        run_with_timeout "$TEST_TIMEOUT" ./tls_client "https://localhost:$port/"
+    if wait_for_server $LOCAL_PORT; then
+        run_with_timeout "$TEST_TIMEOUT" ./tls_client "https://localhost:$LOCAL_PORT/"
         if [[ $TIMEOUT_RC -eq 0 ]]; then
             printf "${GRN}PASS${RST}\n"
             local_pass=$((local_pass + 1))
@@ -565,60 +693,198 @@ run_local_test() {
 
     kill "$srv_pid" 2>/dev/null || true
     wait "$srv_pid" 2>/dev/null || true
-    rm -f "$trust_file"
 }
 
-# --- Test: Ed25519 CertificateVerify ---
-printf "  %-50s " "Ed25519 CertificateVerify"
-if openssl genpkey -algorithm Ed25519 -out "$LOCAL_TMPDIR/ed25519_key.pem" 2>/dev/null && \
-   openssl req -new -x509 -key "$LOCAL_TMPDIR/ed25519_key.pem" \
-       -out "$LOCAL_TMPDIR/ed25519_cert.pem" -days 1 \
-       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
-    run_local_test "Ed25519" 14433 \
-        "$LOCAL_TMPDIR/ed25519_key.pem" "$LOCAL_TMPDIR/ed25519_cert.pem" \
-        trust_store/ed25519_test.crt
+# --- Helper: run a single expected-failure server test ---
+# Usage: run_server_xfail <name> <key> <cert> <expected_error> [extra s_server args...]
+run_server_xfail() {
+    local name="$1" key="$2" cert="$3" expected_err="$4"
+    shift 4
+
+    printf "  %-50s " "$name"
+
+    wait_for_port_free $LOCAL_PORT
+
+    openssl s_server -key "$key" -cert "$cert" -port $LOCAL_PORT -www \
+        "$@" </dev/null >/dev/null 2>&1 &
+    local srv_pid=$!
+    local_cleanup_pids+=("$srv_pid")
+
+    if wait_for_server $LOCAL_PORT; then
+        run_with_timeout "$TEST_TIMEOUT" ./tls_client "https://localhost:$LOCAL_PORT/"
+        if [[ $TIMEOUT_RC -eq 0 ]]; then
+            printf "${RED}XPASS${RST}  (unexpected success!)\n"
+            local_fail=$((local_fail + 1))
+            failures+=("local $name: expected failure but passed")
+        elif echo "$TIMEOUT_OUTPUT" | grep -qi "$expected_err"; then
+            printf "${GRN}XFAIL${RST}\n"
+            local_xfail=$((local_xfail + 1))
+        else
+            local reason
+            reason=$(echo "$TIMEOUT_OUTPUT" | grep 'FATAL:' | head -1 || true)
+            printf "${YLW}XFAIL${RST}  [%s]\n" "${reason:-timeout/unknown}"
+            local_xfail=$((local_xfail + 1))
+        fi
+    else
+        printf "${YLW}SKIP${RST}  server failed to start\n"
+        local_skip=$((local_skip + 1))
+    fi
+
+    kill "$srv_pid" 2>/dev/null || true
+    wait "$srv_pid" 2>/dev/null || true
+}
+
+# --- TLS 1.3 cipher suites ---
+run_server_test "TLS13 AES-128-GCM X25519" \
+    "$RSA_KEY" "$RSA_CERT" \
+    -tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256 -groups X25519
+
+run_server_test "TLS13 AES-256-GCM P-256" \
+    "$EC256_KEY" "$EC256_CERT" \
+    -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -groups P-256
+
+run_server_test "TLS13 ChaCha20-Poly1305 P-384" \
+    "$EC384_KEY" "$EC384_CERT" \
+    -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -groups P-384
+
+# --- TLS 1.2 ECDHE-RSA ---
+run_server_test "TLS12 ECDHE-RSA-AES128-GCM" \
+    "$RSA_KEY" "$RSA_CERT" \
+    -tls1_2 -cipher ECDHE-RSA-AES128-GCM-SHA256
+
+run_server_test "TLS12 ECDHE-RSA-AES256-GCM" \
+    "$RSA_KEY" "$RSA_CERT" \
+    -tls1_2 -cipher ECDHE-RSA-AES256-GCM-SHA384
+
+run_server_test "TLS12 ECDHE-RSA-AES128-CBC" \
+    "$RSA_KEY" "$RSA_CERT" \
+    -tls1_2 -cipher ECDHE-RSA-AES128-SHA
+
+run_server_test "TLS12 ECDHE-RSA-AES256-CBC" \
+    "$RSA_KEY" "$RSA_CERT" \
+    -tls1_2 -cipher ECDHE-RSA-AES256-SHA
+
+run_server_test "TLS12 ECDHE-RSA-CHACHA20" \
+    "$RSA_KEY" "$RSA_CERT" \
+    -tls1_2 -cipher ECDHE-RSA-CHACHA20-POLY1305
+
+# --- TLS 1.2 ECDHE-ECDSA ---
+run_server_test "TLS12 ECDHE-ECDSA-AES128-GCM" \
+    "$EC256_KEY" "$EC256_CERT" \
+    -tls1_2 -cipher ECDHE-ECDSA-AES128-GCM-SHA256
+
+run_server_test "TLS12 ECDHE-ECDSA-AES256-GCM" \
+    "$EC384_KEY" "$EC384_CERT" \
+    -tls1_2 -cipher ECDHE-ECDSA-AES256-GCM-SHA384
+
+run_server_test "TLS12 ECDHE-ECDSA-AES128-CBC" \
+    "$EC256_KEY" "$EC256_CERT" \
+    -tls1_2 -cipher ECDHE-ECDSA-AES128-SHA
+
+run_server_test "TLS12 ECDHE-ECDSA-AES256-CBC" \
+    "$EC384_KEY" "$EC384_CERT" \
+    -tls1_2 -cipher ECDHE-ECDSA-AES256-SHA
+
+run_server_test "TLS12 ECDHE-ECDSA-CHACHA20" \
+    "$EC256_KEY" "$EC256_CERT" \
+    -tls1_2 -cipher ECDHE-ECDSA-CHACHA20-POLY1305
+
+# --- TLS 1.2 Static RSA ---
+if $HAS_STATIC_RSA; then
+    run_server_test "TLS12 RSA-AES128-GCM" \
+        "$RSA_KEY" "$RSA_CERT" \
+        -tls1_2 -cipher AES128-GCM-SHA256
+
+    run_server_test "TLS12 RSA-AES256-GCM" \
+        "$RSA_KEY" "$RSA_CERT" \
+        -tls1_2 -cipher AES256-GCM-SHA384
+
+    run_server_test "TLS12 RSA-AES128-CBC" \
+        "$RSA_KEY" "$RSA_CERT" \
+        -tls1_2 -cipher AES128-SHA
+
+    run_server_test "TLS12 RSA-AES256-CBC" \
+        "$RSA_KEY" "$RSA_CERT" \
+        -tls1_2 -cipher AES256-SHA
 else
-    printf "${YLW}SKIP${RST}  (OpenSSL lacks Ed25519 support)\n"
+    for name in "TLS12 RSA-AES128-GCM" "TLS12 RSA-AES256-GCM" \
+                "TLS12 RSA-AES128-CBC" "TLS12 RSA-AES256-CBC"; do
+        printf "  %-50s ${YLW}SKIP${RST}  (static RSA ciphers unavailable)\n" "$name"
+        local_skip=$((local_skip + 1))
+    done
+fi
+
+# --- Ed25519 CertificateVerify ---
+if $HAS_ED25519; then
+    run_server_test "Ed25519 CertificateVerify" \
+        "$ED25519_KEY" "$ED25519_CERT"
+else
+    printf "  %-50s ${YLW}SKIP${RST}  (OpenSSL lacks Ed25519 support)\n" "Ed25519 CertificateVerify"
     local_skip=$((local_skip + 1))
 fi
 
-# --- Test: X448 key exchange ---
-printf "  %-50s " "X448 key exchange"
-if openssl genpkey -algorithm X448 -out /dev/null 2>/dev/null && \
-   openssl ecparam -name prime256v1 -genkey -noout \
-       -out "$LOCAL_TMPDIR/x448_key.pem" 2>/dev/null && \
-   openssl req -new -x509 -key "$LOCAL_TMPDIR/x448_key.pem" \
-       -out "$LOCAL_TMPDIR/x448_cert.pem" -days 1 \
-       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
-    run_local_test "X448" 14434 \
-        "$LOCAL_TMPDIR/x448_key.pem" "$LOCAL_TMPDIR/x448_cert.pem" \
-        trust_store/x448_test.crt -groups X448
+# --- X448 key exchange ---
+if $HAS_X448; then
+    run_server_test "X448 key exchange" \
+        "$EC256_KEY" "$EC256_CERT" \
+        -groups X448
 else
-    printf "${YLW}SKIP${RST}  (OpenSSL lacks X448 support)\n"
+    printf "  %-50s ${YLW}SKIP${RST}  (OpenSSL lacks X448 support)\n" "X448 key exchange"
     local_skip=$((local_skip + 1))
 fi
 
-# --- Test: Ed448 CertificateVerify ---
-printf "  %-50s " "Ed448 CertificateVerify"
-if openssl genpkey -algorithm Ed448 -out "$LOCAL_TMPDIR/ed448_key.pem" 2>/dev/null && \
-   openssl req -new -x509 -key "$LOCAL_TMPDIR/ed448_key.pem" \
-       -out "$LOCAL_TMPDIR/ed448_cert.pem" -days 1 \
-       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
-    run_local_test "Ed448" 14435 \
-        "$LOCAL_TMPDIR/ed448_key.pem" "$LOCAL_TMPDIR/ed448_cert.pem" \
-        trust_store/ed448_test.crt
+# --- Ed448 CertificateVerify ---
+if $HAS_ED448; then
+    run_server_test "Ed448 CertificateVerify" \
+        "$ED448_KEY" "$ED448_CERT"
 else
-    printf "${YLW}SKIP${RST}  (OpenSSL lacks Ed448 support)\n"
+    printf "  %-50s ${YLW}SKIP${RST}  (OpenSSL lacks Ed448 support)\n" "Ed448 CertificateVerify"
     local_skip=$((local_skip + 1))
 fi
+
+# --- Local expected-failure tests ---
+printf "\n  ${BLD}-- Negative tests --${RST}\n"
+
+run_server_xfail "Reject expired cert" \
+    "$EXPIRED_KEY" "$EXPIRED_CERT" "has expired"
+
+run_server_xfail "Reject wrong hostname" \
+    "$WRONGHOST_KEY" "$WRONGHOST_CERT" "Hostname verification failed"
+
+run_server_xfail "Reject untrusted cert" \
+    "$UNTRUSTED_KEY" "$UNTRUSTED_CERT" "Certificate verification failed"
+
+# TLS 1.0 (skip if openssl lacks -tls1)
+if openssl s_client -help 2>&1 | grep -q '\-tls1 '; then
+    run_server_xfail "Reject TLS 1.0" \
+        "$RSA_KEY" "$RSA_CERT" "SKE signature truncated" -tls1
+else
+    printf "  %-50s ${YLW}SKIP${RST}  (OpenSSL lacks TLS 1.0 support)\n" "Reject TLS 1.0"
+    local_skip=$((local_skip + 1))
+fi
+
+# TLS 1.1 (skip if openssl lacks -tls1_1)
+if openssl s_client -help 2>&1 | grep -q '\-tls1_1'; then
+    run_server_xfail "Reject TLS 1.1" \
+        "$RSA_KEY" "$RSA_CERT" "SKE signature truncated" -tls1_1
+else
+    printf "  %-50s ${YLW}SKIP${RST}  (OpenSSL lacks TLS 1.1 support)\n" "Reject TLS 1.1"
+    local_skip=$((local_skip + 1))
+fi
+
+fi # run_section local
 
 # -- Summary --
 printf "\n${BLD}=== Summary ===${RST}\n"
-printf "  ${GRN}Pass: %d${RST}   ${RED}Fail: %d${RST}   " "$pass" "$fail"
-printf "Expected-fail: %d   " "$xfail"
-printf "${RED}Unexpected-pass: %d${RST}\n" "$xfail_unexpected_pass"
-printf "  Local crypto: ${GRN}%d pass${RST} / ${RED}%d fail${RST} / ${YLW}%d skip${RST}\n" \
-    "$local_pass" "$local_fail" "$local_skip"
+if run_section pass || run_section xfail; then
+    printf "  ${GRN}Pass: %d${RST}   ${RED}Fail: %d${RST}   " "$pass" "$fail"
+    printf "Expected-fail: %d   " "$xfail"
+    printf "${RED}Unexpected-pass: %d${RST}\n" "$xfail_unexpected_pass"
+fi
+if run_section local; then
+    printf "  Local crypto: ${GRN}%d pass${RST} / ${RED}%d fail${RST} / %d xfail / ${YLW}%d skip${RST}\n" \
+        "$local_pass" "$local_fail" "$local_xfail" "$local_skip"
+fi
 
 exit_code=0
 
