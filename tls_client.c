@@ -1,15 +1,15 @@
 /*
  * tls_client.c — TLS 1.2/1.3 HTTPS client from scratch in C.
- * Implements: SHA-1, SHA-256, SHA-384, HMAC, HKDF, AES-128/256-GCM,
- *             AES-128/256-CBC, ChaCha20-Poly1305, ECDHE-P256/P384, X25519,
- *             TLS 1.2/1.3
+ * Implements: SHA-1, SHA-256, SHA-384, SHA-512, SHAKE256, HMAC, HKDF,
+ *             AES-128/256-GCM, AES-128/256-CBC, ChaCha20-Poly1305,
+ *             ECDHE-P256/P384, X25519, X448, Ed25519, Ed448, TLS 1.2/1.3
  * No external crypto libraries.
  *
  * Compile:  cc -O2 -o tls_client tls_client.c
  * Run:      ./tls_client
  *
  * Certificate verification: SHA-256/384/512, ECDSA-P256/P384,
- *   RSA PKCS#1 v1.5, RSA-PSS, X.509 chain.
+ *   RSA PKCS#1 v1.5, RSA-PSS, Ed25519, Ed448, X.509 chain.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +48,7 @@ typedef uint64_t limb_t;
 #define FP384_N    6
 #define FP256_N    4
 #define FP25519_N  4
+#define FP448_N    7
 #define BN_MAX_LIMBS 130
 #else
 typedef uint32_t limb_t;
@@ -56,6 +57,7 @@ typedef uint32_t limb_t;
 #define FP384_N    12
 #define FP256_N    8
 #define FP25519_N  8
+#define FP448_N    14
 #define BN_MAX_LIMBS 260
 #endif
 
@@ -179,13 +181,18 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 
 /* Named groups */
 #define TLS_GROUP_X25519    0x001D
+#define TLS_GROUP_X448      0x001E
 #define TLS_GROUP_SECP256R1 0x0017
 #define TLS_GROUP_SECP384R1 0x0018
 
-/* X25519 / ChaCha20-Poly1305 sizes */
+/* X25519 / X448 / ChaCha20-Poly1305 sizes */
 #define X25519_KEY_LEN            32
 #define X25519_A24                121665
+#define X448_KEY_LEN              56
+#define X448_A24                  39081
 #define CHACHA20_POLY1305_TAG_LEN 16
+#define ED25519_SIG_LEN           64
+#define ED448_SIG_LEN             114
 
 /* TLS plaintext / AES-CBC sizes */
 #define TLS_MAX_PLAINTEXT 16384
@@ -219,6 +226,8 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define TLS_SIG_RSA_PKCS1_SHA384       0x0501
 #define TLS_SIG_RSA_PSS_SHA256         0x0804
 #define TLS_SIG_RSA_PSS_SHA384         0x0805
+#define TLS_SIG_ED25519                0x0807
+#define TLS_SIG_ED448                  0x0808
 
 /* Buffer sizes */
 #define CH_BUF_SIZE   1024
@@ -519,6 +528,104 @@ static void sha384_final(sha384_ctx *ctx, uint8_t out[48]) {
 
 static void sha384_hash(const uint8_t *data, size_t len, uint8_t out[48]) {
     sha384_ctx c; sha384_init(&c); sha384_update(&c,data,len); sha384_final(&c,out);
+}
+
+/* ================================================================
+ * SHAKE256 (Keccak-based XOF, FIPS 202)
+ * Used by Ed448 signature verification.
+ * ================================================================ */
+static const uint64_t keccak_rc[24] = {
+    0x0000000000000001ULL,0x0000000000008082ULL,0x800000000000808AULL,0x8000000080008000ULL,
+    0x000000000000808BULL,0x0000000080000001ULL,0x8000000080008081ULL,0x8000000000008009ULL,
+    0x000000000000008AULL,0x0000000000000088ULL,0x0000000080008009ULL,0x000000008000000AULL,
+    0x000000008000808BULL,0x800000000000008BULL,0x8000000000008089ULL,0x8000000000008003ULL,
+    0x8000000000008002ULL,0x8000000000000080ULL,0x000000000000800AULL,0x800000008000000AULL,
+    0x8000000080008081ULL,0x8000000000008080ULL,0x0000000080000001ULL,0x8000000080008008ULL
+};
+
+static void keccak_f1600(uint64_t st[25]) {
+    for(int round=0;round<24;round++){
+        /* theta */
+        uint64_t c[5],d[5];
+        for(int x=0;x<5;x++) c[x]=st[x]^st[x+5]^st[x+10]^st[x+15]^st[x+20];
+        for(int x=0;x<5;x++){
+            d[x]=c[(x+4)%5]^((c[(x+1)%5]<<1)|(c[(x+1)%5]>>63));
+            for(int y=0;y<25;y+=5) st[y+x]^=d[x];
+        }
+        /* rho + pi */
+        uint64_t tmp=st[1];
+        static const int pi[24]={10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1};
+        static const int rho[24]={1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44};
+        for(int i=0;i<24;i++){
+            uint64_t r=st[pi[i]];
+            st[pi[i]]=(tmp<<rho[i])|(tmp>>(64-rho[i]));
+            tmp=r;
+        }
+        /* chi */
+        for(int y=0;y<25;y+=5){
+            uint64_t t0=st[y],t1=st[y+1],t2=st[y+2],t3=st[y+3],t4=st[y+4];
+            st[y]  =t0^((~t1)&t2);
+            st[y+1]=t1^((~t2)&t3);
+            st[y+2]=t2^((~t3)&t4);
+            st[y+3]=t3^((~t4)&t0);
+            st[y+4]=t4^((~t0)&t1);
+        }
+        /* iota */
+        st[0]^=keccak_rc[round];
+    }
+}
+
+#define SHAKE256_RATE 136 /* 1600 - 2*256 = 1088 bits = 136 bytes */
+
+typedef struct {
+    uint64_t st[25];
+    uint8_t buf[SHAKE256_RATE];
+    size_t buf_len;
+} shake256_ctx;
+
+static void shake256_init(shake256_ctx *ctx) {
+    memset(ctx,0,sizeof(*ctx));
+}
+
+static void shake256_update(shake256_ctx *ctx, const uint8_t *data, size_t len) {
+    while(len>0){
+        size_t space=SHAKE256_RATE-ctx->buf_len;
+        size_t chunk=len<space?len:space;
+        memcpy(ctx->buf+ctx->buf_len,data,chunk);
+        ctx->buf_len+=chunk; data+=chunk; len-=chunk;
+        if(ctx->buf_len==SHAKE256_RATE){
+            for(int i=0;i<SHAKE256_RATE/8;i++){
+                uint64_t w=0;
+                for(int j=0;j<8;j++) w|=(uint64_t)ctx->buf[8*i+j]<<(8*j);
+                ctx->st[i]^=w;
+            }
+            keccak_f1600(ctx->st);
+            ctx->buf_len=0;
+        }
+    }
+}
+
+static void shake256_final(shake256_ctx *ctx, uint8_t *out, size_t out_len) {
+    /* Pad: SHAKE domain separation 0x1F, then pad10*1 */
+    memset(ctx->buf+ctx->buf_len,0,SHAKE256_RATE-ctx->buf_len);
+    ctx->buf[ctx->buf_len]|=0x1F;
+    ctx->buf[SHAKE256_RATE-1]|=0x80;
+    for(int i=0;i<SHAKE256_RATE/8;i++){
+        uint64_t w=0;
+        for(int j=0;j<8;j++) w|=(uint64_t)ctx->buf[8*i+j]<<(8*j);
+        ctx->st[i]^=w;
+    }
+    keccak_f1600(ctx->st);
+    /* Squeeze */
+    size_t squeezed=0;
+    while(squeezed<out_len){
+        size_t avail=SHAKE256_RATE;
+        if(avail>out_len-squeezed) avail=out_len-squeezed;
+        for(size_t i=0;i<avail;i++)
+            out[squeezed+i]=(uint8_t)(ctx->st[i/8]>>(8*(i%8)));
+        squeezed+=avail;
+        if(squeezed<out_len) keccak_f1600(ctx->st);
+    }
 }
 
 /* Hash algorithm abstraction for unified HMAC/HKDF/PRF */
@@ -2404,6 +2511,923 @@ static int x25519_shared_secret(const uint8_t priv[X25519_KEY_LEN],
 }
 
 /* ================================================================
+ * Ed25519 Signature Verification (RFC 8032 §5.1)
+ * Edwards curve: -x² + y² = 1 + d·x²·y² over GF(2^255-19)
+ * ================================================================ */
+
+/* d = -121665/121666 mod p */
+/* Group order L = 2^252 + 27742317777372353535851937790883648493 */
+static const uint8_t ED25519_L[32] = {
+    0xED,0xD3,0xF5,0x5C,0x1A,0x63,0x12,0x58,0xD6,0x9C,0xF7,0xA2,0xDE,0xF9,0xDE,0x14,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x10
+};
+/* Basepoint B (compressed): y-coordinate little-endian, high bit = sign of x */
+static const uint8_t ED25519_B_COMPRESSED[32] = {
+    0x58,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,
+    0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66,0x66
+};
+
+/* d = -121665/121666 mod p */
+#if USE_64BIT_LIMBS
+static const fp25519 ED25519_D = {{
+    0x75EB4DCA135978A3ULL, 0x00700A4D4141D8ABULL,
+    0x8CC740797779E898ULL, 0x52036CEE2B6FFE73ULL
+}};
+/* 2*d */
+static const fp25519 ED25519_2D = {{
+    0xEBD69B9426B2F159ULL, 0x00E0149A8283B156ULL,
+    0x198E80F2EEF3D130ULL, 0x2406D9DC56DFFCE7ULL
+}};
+/* sqrt(-1) mod p */
+static const fp25519 ED25519_SQRTM1 = {{
+    0xC4EE1B274A0EA0B0ULL, 0x2F431806AD2FE478ULL,
+    0x2B4D00993DFBD7A7ULL, 0x2B8324804FC1DF0BULL
+}};
+#else
+static const fp25519 ED25519_D = {{
+    0x135978A3, 0x75EB4DCA, 0x4141D8AB, 0x00700A4D,
+    0x7779E898, 0x8CC74079, 0x2B6FFE73, 0x52036CEE
+}};
+static const fp25519 ED25519_2D = {{
+    0x26B2F159, 0xEBD69B94, 0x8283B156, 0x00E0149A,
+    0xEEF3D130, 0x198E80F2, 0x56DFFCE7, 0x2406D9DC
+}};
+static const fp25519 ED25519_SQRTM1 = {{
+    0x4A0EA0B0, 0xC4EE1B27, 0xAD2FE478, 0x2F431806,
+    0x3DFBD7A7, 0x2B4D0099, 0x4FC1DF0B, 0x2B832480
+}};
+#endif
+
+typedef struct { fp25519 x,y,z,t; } ed25519_pt;
+
+/* a^((p-5)/8) — used for square roots on GF(p), p = 2^255-19 ≡ 5 (mod 8) */
+static void fp25519_pow2523(fp25519 *r, const fp25519 *a) {
+    /* (p-5)/8 = 2^252 - 3, binary: 250 ones, 0, 1 */
+    /* Bit-scan from LSB, same approach as fp25519_inv */
+#if USE_64BIT_LIMBS
+    static const fp25519 exp={{
+        0xFFFFFFFFFFFFFFFD, 0xFFFFFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0x0FFFFFFFFFFFFFFF
+    }};
+#else
+    static const fp25519 exp={{
+        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x0FFFFFFF
+    }};
+#endif
+    fp25519 result={{0}}; result.v[0]=1;
+    fp25519 base=*a;
+    for(int i=0;i<252;i++){
+        if((exp.v[i/LIMB_BITS]>>(i%LIMB_BITS))&1)
+            fp25519_mul(&result,&result,&base);
+        fp25519_sqr(&base,&base);
+    }
+    *r=result;
+}
+
+/* Decompress 32-byte Ed25519 point → extended coordinates */
+static int ed25519_decompress(ed25519_pt *p, const uint8_t enc[32]) {
+    uint8_t tmp[32]; memcpy(tmp,enc,32);
+    int sign = tmp[31]>>7;
+    tmp[31]&=0x7F;
+    fp25519_from_le(&p->y,tmp);
+
+    /* u = y²-1, v = d·y²+1 */
+    fp25519 y2,u,v,one;
+    one=FP25519_ZERO; one.v[0]=1;
+    fp25519_sqr(&y2,&p->y);
+    fp25519_sub(&u,&y2,&one);
+    fp25519_mul(&v,&y2,&ED25519_D);
+    fp25519_add(&v,&v,&one);
+
+    /* x = u·v³·(u·v⁷)^((p-5)/8) */
+    fp25519 v3,uv3,uv7;
+    fp25519_sqr(&v3,&v); fp25519_mul(&v3,&v3,&v);         /* v³ */
+    fp25519_mul(&uv3,&u,&v3);                              /* u·v³ */
+    fp25519_sqr(&uv7,&v3); fp25519_mul(&uv7,&uv7,&v);     /* v⁷ */
+    fp25519_mul(&uv7,&u,&uv7);                              /* u·v⁷ */
+    fp25519 beta;
+    fp25519_pow2523(&beta,&uv7);
+    fp25519_mul(&p->x,&uv3,&beta);
+
+    /* Check: v·x² == u? */
+    fp25519 vx2,check;
+    fp25519_sqr(&vx2,&p->x); fp25519_mul(&vx2,&vx2,&v);
+    fp25519_sub(&check,&vx2,&u);
+    uint8_t c1[32]; fp25519_to_le(c1,&check);
+    int is_zero=1; for(int i=0;i<32;i++) if(c1[i]) {is_zero=0;break;}
+    if(!is_zero){
+        /* Try v·x² == -u */
+        fp25519_add(&check,&vx2,&u);
+        fp25519_to_le(c1,&check);
+        is_zero=1; for(int i=0;i<32;i++) if(c1[i]) {is_zero=0;break;}
+        if(!is_zero) return -1; /* not on curve */
+        fp25519_mul(&p->x,&p->x,&ED25519_SQRTM1);
+    }
+
+    /* Adjust sign */
+    uint8_t xb[32]; fp25519_to_le(xb,&p->x);
+    if((xb[0]&1)!=sign){
+        fp25519_sub(&p->x,&FP25519_ZERO,&p->x); /* negate */
+    }
+
+    /* Check x != 0 when sign bit is set */
+    fp25519_to_le(xb,&p->x);
+    is_zero=1; for(int i=0;i<32;i++) if(xb[i]) {is_zero=0;break;}
+    if(is_zero && sign) return -1;
+
+    /* z=1, t=x*y */
+    p->z=FP25519_ZERO; p->z.v[0]=1;
+    fp25519_mul(&p->t,&p->x,&p->y);
+    return 0;
+}
+
+/* Compress extended coordinates → 32 bytes */
+static void ed25519_compress(uint8_t out[32], const ed25519_pt *p) {
+    fp25519 zinv,x,y;
+    fp25519_inv(&zinv,&p->z);
+    fp25519_mul(&x,&p->x,&zinv);
+    fp25519_mul(&y,&p->y,&zinv);
+    fp25519_to_le(out,&y);
+    uint8_t xb[32]; fp25519_to_le(xb,&x);
+    out[31]|=(xb[0]&1)<<7;
+}
+
+/* Extended coordinates addition (unified formula) */
+static void ed25519_add(ed25519_pt *r, const ed25519_pt *p, const ed25519_pt *q) {
+    fp25519 a,b,c,d,e,f,g,h;
+    fp25519_sub(&a,&p->y,&p->x);
+    fp25519_sub(&b,&q->y,&q->x);
+    fp25519_mul(&a,&a,&b);
+    fp25519_add(&b,&p->y,&p->x);
+    fp25519_add(&c,&q->y,&q->x);
+    fp25519_mul(&b,&b,&c);
+    fp25519_mul(&c,&p->t,&q->t);
+    fp25519_mul(&c,&c,&ED25519_2D);
+    fp25519_mul(&d,&p->z,&q->z);
+    fp25519_add(&d,&d,&d);
+    fp25519_sub(&e,&b,&a);
+    fp25519_sub(&f,&d,&c);
+    fp25519_add(&g,&d,&c);
+    fp25519_add(&h,&b,&a);
+    fp25519_mul(&r->x,&e,&f);
+    fp25519_mul(&r->y,&g,&h);
+    fp25519_mul(&r->t,&e,&h);
+    fp25519_mul(&r->z,&f,&g);
+}
+
+/* Point doubling: a=-1 twisted Edwards extended coordinates
+   A=X², B=Y², C=2Z², D=-A, E=(X+Y)²-A-B, G=D+B, F=G-C, H=D-B */
+static void ed25519_double(ed25519_pt *r, const ed25519_pt *p) {
+    fp25519 a,b,c,dd,e,f,g,h;
+    fp25519_sqr(&a,&p->x);
+    fp25519_sqr(&b,&p->y);
+    fp25519_sqr(&c,&p->z); fp25519_add(&c,&c,&c);
+    fp25519_sub(&dd,&FP25519_ZERO,&a);
+    fp25519_add(&e,&p->x,&p->y);
+    fp25519_sqr(&e,&e); fp25519_sub(&e,&e,&a); fp25519_sub(&e,&e,&b);
+    fp25519_add(&g,&dd,&b);
+    fp25519_sub(&f,&g,&c);
+    fp25519_sub(&h,&dd,&b);
+    fp25519_mul(&r->x,&e,&f);
+    fp25519_mul(&r->y,&g,&h);
+    fp25519_mul(&r->t,&e,&h);
+    fp25519_mul(&r->z,&f,&g);
+}
+
+/* Identity point */
+static void ed25519_identity(ed25519_pt *p) {
+    memset(p,0,sizeof(*p));
+    p->y.v[0]=1; p->z.v[0]=1; /* (0,1,1,0) */
+}
+
+/* Variable-time double scalar multiplication: [s]B + [k]A (Strauss/Shamir) */
+static void ed25519_double_scalar_mul_vartime(ed25519_pt *r,
+    const uint8_t s[32], const ed25519_pt *B,
+    const uint8_t k[32], const ed25519_pt *A) {
+    /* Precompute A+B */
+    ed25519_pt AB;
+    ed25519_add(&AB,A,B);
+
+    ed25519_identity(r);
+    for(int i=255;i>=0;i--){
+        ed25519_double(r,r);
+        int sb=(s[i/8]>>(i%8))&1;
+        int kb=(k[i/8]>>(i%8))&1;
+        if(sb && kb) ed25519_add(r,r,&AB);
+        else if(sb) ed25519_add(r,r,B);
+        else if(kb) ed25519_add(r,r,A);
+    }
+}
+
+/* Reduce 64-byte (512-bit) value mod L (TweetNaCl approach).
+   L = 2^252 + 27742317777372353535851937790883648493 */
+static void ed25519_reduce_l(uint8_t out[32], const uint8_t in[64]) {
+    static const int64_t L[32] = {
+        0xED,0xD3,0xF5,0x5C,0x1A,0x63,0x12,0x58,
+        0xD6,0x9C,0xF7,0xA2,0xDE,0xF9,0xDE,0x14,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x10
+    };
+    int64_t x[64];
+    int i,j;
+    int64_t carry;
+    for(i=0;i<64;i++) x[i]=(int64_t)in[i];
+    /* Reduce high bytes: subtract 16*x[i] copies of L (compensates for L[31]=0x10) */
+    for(i=63;i>=32;i--){
+        carry=0;
+        for(j=i-32;j<i-12;j++){
+            x[j]+=carry-16*x[i]*L[j-(i-32)];
+            carry=(x[j]+128)>>8;
+            x[j]-=carry*256;
+        }
+        x[j]+=carry;
+        x[i]=0;
+    }
+    /* Final reduction: handle x[31]'s high nibble (above 2^252 boundary) */
+    carry=0;
+    for(j=0;j<32;j++){
+        x[j]+=carry-(x[31]>>4)*L[j];
+        carry=x[j]>>8;
+        x[j]&=255;
+    }
+    for(j=0;j<32;j++) x[j]-=carry*L[j];
+    for(i=0;i<32;i++){
+        x[i+1]+=x[i]>>8;
+        out[i]=(uint8_t)(x[i]&255);
+    }
+}
+
+/* Ed25519 verify (RFC 8032 §5.1.7, cofactorless) */
+static int ed25519_verify(const uint8_t pubkey[32], const uint8_t *msg, size_t msg_len,
+                           const uint8_t sig[64]) {
+    ed25519_pt A;
+    if(ed25519_decompress(&A,pubkey)<0) return 0;
+    ed25519_pt R;
+    if(ed25519_decompress(&R,sig)<0) return 0;
+
+    /* Check s < L (local copy so static analyzers can track bounds) */
+    uint8_t s_scalar[32];
+    memcpy(s_scalar,sig+32,32);
+    for(int i=31;i>=0;i--){
+        if(s_scalar[i]<ED25519_L[i]) break;
+        if(s_scalar[i]>ED25519_L[i]) return 0;
+    }
+
+    /* k = SHA-512(R || A || msg) mod L */
+    uint8_t h[64];
+    {
+        sha512_ctx ctx; sha512_init(&ctx);
+        sha512_update(&ctx,sig,32);
+        sha512_update(&ctx,pubkey,32);
+        sha512_update(&ctx,msg,msg_len);
+        sha512_final(&ctx,h);
+    }
+    uint8_t k[32];
+    ed25519_reduce_l(k,h);
+
+    ed25519_pt B;
+    if(ed25519_decompress(&B,ED25519_B_COMPRESSED)<0) return 0;
+
+    /* [s]B - [k]A */
+    ed25519_pt neg_A;
+    fp25519_sub(&neg_A.x,&FP25519_ZERO,&A.x);
+    neg_A.y=A.y; neg_A.z=A.z;
+    fp25519_sub(&neg_A.t,&FP25519_ZERO,&A.t);
+
+    ed25519_pt result;
+    ed25519_double_scalar_mul_vartime(&result,s_scalar,&B,k,&neg_A);
+
+    uint8_t result_enc[32];
+    ed25519_compress(result_enc,&result);
+    return ct_memeq(result_enc,sig,32);
+}
+
+/* ================================================================
+ * fp448 Field Arithmetic — GF(2^448 - 2^224 - 1) "Goldilocks"
+ * Used by X448 key exchange and Ed448 signatures.
+ * ================================================================ */
+typedef struct { limb_t v[FP448_N]; } fp448;
+
+#if USE_64BIT_LIMBS
+static const fp448 FP448_ZERO = {{0,0,0,0,0,0,0}};
+static const fp448 FP448_P = {{
+    0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFEFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
+}};
+#else
+static const fp448 FP448_ZERO = {{0,0,0,0,0,0,0,0,0,0,0,0,0,0}};
+static const fp448 FP448_P = {{
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFEFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+}};
+#endif
+
+static limb_t fp448_add_raw(fp448 *r, const fp448 *a, const fp448 *b) {
+    limb_t c=0;
+    for(int i=0;i<FP448_N;i++){c=adc_limb(a->v[i],b->v[i],c,&r->v[i]);}
+    return c;
+}
+
+static limb_t fp448_sub_raw(fp448 *r, const fp448 *a, const fp448 *b) {
+    limb_t borrow=0;
+    for(int i=0;i<FP448_N;i++){borrow=sbb_limb(a->v[i],b->v[i],borrow,&r->v[i]);}
+    return borrow;
+}
+
+static void fp448_add(fp448 *r, const fp448 *a, const fp448 *b) {
+    limb_t carry=fp448_add_raw(r,a,b);
+    fp448 t; limb_t borrow=fp448_sub_raw(&t,r,&FP448_P);
+    limb_t mask=-(limb_t)(carry|(1-borrow));
+    FP_CSEL(r, &t, mask, FP448_N);
+}
+
+static void fp448_sub(fp448 *r, const fp448 *a, const fp448 *b) {
+    limb_t borrow=fp448_sub_raw(r,a,b);
+    fp448 t; fp448_add_raw(&t,r,&FP448_P);
+    limb_t mask=-(limb_t)borrow;
+    FP_CSEL(r, &t, mask, FP448_N);
+}
+
+#if USE_64BIT_LIMBS
+static void fp448_mul(fp448 *r, const fp448 *a, const fp448 *b) {
+    /* Schoolbook 7×7 → 14 limbs, then reduce via 2^448 ≡ 2^224 + 1.
+       Convert to 32-bit limbs for reduction where 224/32=7 aligns cleanly. */
+    uint64_t w[14]; memset(w,0,sizeof(w));
+    for(int i=0;i<7;i++){
+        uint64_t carry=0;
+        for(int j=0;j<7;j++){
+            mac64(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
+        }
+        w[i+7]=carry;
+    }
+    /* Split 14 x 64-bit limbs into 28 x 32-bit limbs */
+    uint32_t t[28];
+    for(int i=0;i<14;i++){
+        t[2*i]=(uint32_t)w[i]; t[2*i+1]=(uint32_t)(w[i]>>32);
+    }
+    /* Reduce mod p using 32-bit limbs: acc = t[0..13] + t[14..27]*(2^224+1) */
+    uint64_t acc[21]; memset(acc,0,sizeof(acc));
+    for(int i=0;i<14;i++) acc[i]=t[i];
+    for(int i=0;i<14;i++) acc[i]+=(uint64_t)t[i+14];     /* +1 part */
+    for(int i=0;i<14;i++) acc[i+7]+=(uint64_t)t[i+14];   /* +2^224 part */
+    /* Fold positions 14..20 back: 2^448 ≡ 2^224+1 */
+    for(int i=14;i<=20;i++){
+        acc[i-14]+=acc[i]; acc[i-14+7]+=acc[i]; acc[i]=0;
+    }
+    /* Carry propagation */
+    for(int i=0;i<14;i++){ acc[i+1]+=acc[i]>>32; acc[i]&=0xFFFFFFFF; }
+    /* Fold acc[14] */
+    if(acc[14]){
+        uint64_t top=acc[14]; acc[14]=0;
+        acc[0]+=top; acc[7]+=top;
+        for(int i=0;i<14;i++){ acc[i+1]+=acc[i]>>32; acc[i]&=0xFFFFFFFF; }
+        if(acc[14]){ top=acc[14]; acc[14]=0; acc[0]+=top; acc[7]+=top;
+            for(int i=0;i<14;i++){ acc[i+1]+=acc[i]>>32; acc[i]&=0xFFFFFFFF; }
+        }
+    }
+    /* Convert back to 7 x 64-bit limbs */
+    fp448 res;
+    for(int i=0;i<7;i++) res.v[i]=(uint64_t)acc[2*i]|((uint64_t)acc[2*i+1]<<32);
+    fp448 tmp; limb_t borrow=fp448_sub_raw(&tmp,&res,&FP448_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    FP_CSEL(&res, &tmp, mask, FP448_N);
+    *r=res;
+}
+#else /* 32-bit */
+static void fp448_mul(fp448 *r, const fp448 *a, const fp448 *b) {
+    uint32_t w[28]; memset(w,0,sizeof(w));
+    for(int i=0;i<14;i++){
+        uint32_t carry=0;
+        for(int j=0;j<14;j++){
+            mac_limb(a->v[i], b->v[j], w[i+j], carry, &carry, &w[i+j]);
+        }
+        w[i+14]=carry;
+    }
+    /* Reduce: 2^448 ≡ 2^224 + 1. 224/32=7 limbs, clean alignment. */
+    uint64_t acc[21]; memset(acc,0,sizeof(acc));
+    for(int i=0;i<14;i++) acc[i]=w[i];
+    for(int i=0;i<14;i++) acc[i]+=(uint64_t)w[i+14];     /* +1 part */
+    for(int i=0;i<14;i++) acc[i+7]+=(uint64_t)w[i+14];   /* +2^224 part */
+    /* Fold positions 14..20 back */
+    for(int i=14;i<=20;i++){
+        acc[i-14]+=acc[i]; acc[i-14+7]+=acc[i]; acc[i]=0;
+    }
+    for(int i=0;i<14;i++){ acc[i+1]+=acc[i]>>32; acc[i]&=0xFFFFFFFF; }
+    if(acc[14]){
+        uint64_t top=acc[14]; acc[14]=0;
+        acc[0]+=top; acc[7]+=top;
+        for(int i=0;i<14;i++){ acc[i+1]+=acc[i]>>32; acc[i]&=0xFFFFFFFF; }
+        if(acc[14]){ top=acc[14]; acc[14]=0; acc[0]+=top; acc[7]+=top;
+            for(int i=0;i<14;i++){ acc[i+1]+=acc[i]>>32; acc[i]&=0xFFFFFFFF; }
+        }
+    }
+    fp448 res;
+    for(int i=0;i<14;i++) res.v[i]=(uint32_t)acc[i];
+    fp448 t; limb_t borrow=fp448_sub_raw(&t,&res,&FP448_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    FP_CSEL(&res, &t, mask, FP448_N);
+    *r=res;
+}
+#endif
+
+static void fp448_sqr(fp448 *r, const fp448 *a) { fp448_mul(r,a,a); }
+
+static void fp448_inv(fp448 *r, const fp448 *a) {
+    /* Fermat: a^(p-2), p-2 = 2^448 - 2^224 - 3.
+       Binary of p-2 (MSB first): 223 ones, 0, 222 ones, 0, 1.
+       Use addition chain to build a^(2^k-1) for needed k values. */
+    int i;
+    fp448 pow2,pow4,pow6,pow8,pow14,pow16,pow30,pow32,pow64,pow128,pow192,pow222;
+
+    /* a^(2^2-1) = a^3 */
+    fp448_sqr(&pow2,a); fp448_mul(&pow2,&pow2,a);
+    /* a^(2^4-1) */
+    pow4=pow2; for(i=0;i<2;i++) fp448_sqr(&pow4,&pow4);
+    fp448_mul(&pow4,&pow4,&pow2);
+    /* a^(2^6-1) */
+    pow6=pow4; for(i=0;i<2;i++) fp448_sqr(&pow6,&pow6);
+    fp448_mul(&pow6,&pow6,&pow2);
+    /* a^(2^8-1) */
+    pow8=pow4; for(i=0;i<4;i++) fp448_sqr(&pow8,&pow8);
+    fp448_mul(&pow8,&pow8,&pow4);
+    /* a^(2^14-1) */
+    pow14=pow8; for(i=0;i<6;i++) fp448_sqr(&pow14,&pow14);
+    fp448_mul(&pow14,&pow14,&pow6);
+    /* a^(2^16-1) */
+    pow16=pow8; for(i=0;i<8;i++) fp448_sqr(&pow16,&pow16);
+    fp448_mul(&pow16,&pow16,&pow8);
+    /* a^(2^30-1) */
+    pow30=pow16; for(i=0;i<14;i++) fp448_sqr(&pow30,&pow30);
+    fp448_mul(&pow30,&pow30,&pow14);
+    /* a^(2^32-1) */
+    pow32=pow16; for(i=0;i<16;i++) fp448_sqr(&pow32,&pow32);
+    fp448_mul(&pow32,&pow32,&pow16);
+    /* a^(2^64-1) */
+    pow64=pow32; for(i=0;i<32;i++) fp448_sqr(&pow64,&pow64);
+    fp448_mul(&pow64,&pow64,&pow32);
+    /* a^(2^128-1) */
+    pow128=pow64; for(i=0;i<64;i++) fp448_sqr(&pow128,&pow128);
+    fp448_mul(&pow128,&pow128,&pow64);
+    /* a^(2^192-1) */
+    pow192=pow128; for(i=0;i<64;i++) fp448_sqr(&pow192,&pow192);
+    fp448_mul(&pow192,&pow192,&pow64);
+    /* a^(2^222-1) */
+    pow222=pow192; for(i=0;i<30;i++) fp448_sqr(&pow222,&pow222);
+    fp448_mul(&pow222,&pow222,&pow30);
+
+    /* Now compute a^(p-2) using the bit pattern 223 ones, 0, 222 ones, 0, 1:
+       pow223 = pow222^2 * a = a^(2^223-1) */
+    fp448 result;
+    fp448_sqr(&result,&pow222); fp448_mul(&result,&result,a);
+    /* bit 224 = 0: square only → a^(2^224-2) */
+    fp448_sqr(&result,&result);
+    /* 222 ones: square 222 times then multiply by pow222 */
+    for(i=0;i<222;i++) fp448_sqr(&result,&result);
+    fp448_mul(&result,&result,&pow222);
+    /* bit 1 = 0: square only */
+    fp448_sqr(&result,&result);
+    /* bit 0 = 1: square and multiply by a */
+    fp448_sqr(&result,&result);
+    fp448_mul(&result,&result,a);
+    *r=result;
+}
+
+#if USE_64BIT_LIMBS
+static void fp448_mul_a24(fp448 *r, const fp448 *a) {
+    /* Multiply by a24 = 39081 */
+    uint64_t c_hi=0, c_lo=0;
+    for(int i=0;i<7;i++){
+        uint64_t ph, pl;
+        mul64(a->v[i], (uint64_t)X448_A24, &ph, &pl);
+        c_hi += ph;
+        c_hi += addcarry64(c_lo, pl, &c_lo);
+        r->v[i] = c_lo;
+        c_lo = c_hi;
+        c_hi = 0;
+    }
+    /* Reduce carry: carry * (2^224 + 1) */
+    uint64_t top = c_lo;
+    uint64_t carry;
+    carry = adc64(r->v[0], top, 0, &r->v[0]);
+    for(int i=1;i<3&&carry;i++) carry=adc64(r->v[i], 0, carry, &r->v[i]);
+    carry = adc64(r->v[3], top<<32, carry, &r->v[3]);
+    carry = adc64(r->v[4], top>>32, carry, &r->v[4]);
+    for(int i=5;i<7&&carry;i++) carry=adc64(r->v[i], 0, carry, &r->v[i]);
+    /* Conditional subtraction */
+    fp448 t; limb_t borrow=fp448_sub_raw(&t,r,&FP448_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    FP_CSEL(r, &t, mask, FP448_N);
+}
+#else
+static void fp448_mul_a24(fp448 *r, const fp448 *a) {
+    uint64_t carry=0;
+    for(int i=0;i<14;i++){
+        uint64_t s = (uint64_t)a->v[i] * X448_A24 + carry;
+        r->v[i] = (uint32_t)s;
+        carry = s >> 32;
+    }
+    /* Reduce carry: carry * (2^224 + 1). 224/32 = 7 limbs offset. */
+    uint32_t top = (uint32_t)carry;
+    uint64_t c;
+    c = (uint64_t)r->v[0] + top; r->v[0]=(uint32_t)c; c>>=32;
+    for(int i=1;i<7&&c;i++){uint64_t s=(uint64_t)r->v[i]+c;r->v[i]=(uint32_t)s;c=s>>32;}
+    c = (uint64_t)r->v[7] + top + c; r->v[7]=(uint32_t)c; c>>=32;
+    for(int i=8;i<14&&c;i++){uint64_t s=(uint64_t)r->v[i]+c;r->v[i]=(uint32_t)s;c=s>>32;}
+    fp448 t; limb_t borrow=fp448_sub_raw(&t,r,&FP448_P);
+    limb_t mask=-(limb_t)(1-borrow);
+    FP_CSEL(r, &t, mask, FP448_N);
+}
+#endif
+
+static void fp448_cswap(fp448 *a, fp448 *b, limb_t bit) {
+    limb_t mask=-(limb_t)bit;
+    for(int i=0;i<FP448_N;i++){
+        limb_t d=mask&(a->v[i]^b->v[i]);
+        a->v[i]^=d; b->v[i]^=d;
+    }
+}
+
+static void fp448_from_le(fp448 *r, const uint8_t b[56]) {
+    for(int i=0;i<FP448_N;i++){
+        r->v[i]=0;
+        for(int j=0;j<LIMB_BYTES;j++)
+            r->v[i]|=(limb_t)b[i*LIMB_BYTES+j]<<(8*j);
+    }
+}
+
+static void fp448_to_le(uint8_t b[56], const fp448 *a) {
+    fp448 t=*a;
+    for(int pass=0;pass<2;pass++){
+        fp448 s; limb_t borrow=fp448_sub_raw(&s,&t,&FP448_P);
+        limb_t mask=-(limb_t)(1-borrow);
+        FP_CSEL(&t, &s, mask, FP448_N);
+    }
+    for(int i=0;i<FP448_N;i++)
+        for(int j=0;j<LIMB_BYTES;j++)
+            b[i*LIMB_BYTES+j]=(uint8_t)((t.v[i]>>(8*j))&0xFF);
+}
+
+/* X448 Montgomery ladder (RFC 7748 §5) — u-coordinate only */
+static void x448_scalar_mult(const uint8_t scalar[56],
+    const uint8_t u_in[56], uint8_t u_out[56]) {
+    fp448 u; fp448_from_le(&u,u_in);
+    uint8_t s[56]; memcpy(s,scalar,56);
+    /* Clamp */
+    s[0]&=252; s[55]|=128;
+    /* Montgomery ladder */
+    fp448 x_2=FP448_ZERO, z_2=FP448_ZERO; x_2.v[0]=1;
+    fp448 x_3=u, z_3=FP448_ZERO; z_3.v[0]=1;
+    limb_t swap=0;
+    for(int t=447;t>=0;t--){
+        limb_t kt=(s[t/8]>>(t%8))&1;
+        swap^=kt;
+        fp448_cswap(&x_2,&x_3,swap);
+        fp448_cswap(&z_2,&z_3,swap);
+        swap=kt;
+
+        fp448 A,B,C,D,AA,BB,E,DA,CB;
+        fp448_add(&A,&x_2,&z_2);
+        fp448_sqr(&AA,&A);
+        fp448_sub(&B,&x_2,&z_2);
+        fp448_sqr(&BB,&B);
+        fp448_sub(&E,&AA,&BB);
+        fp448_add(&C,&x_3,&z_3);
+        fp448_sub(&D,&x_3,&z_3);
+        fp448_mul(&DA,&D,&A);
+        fp448_mul(&CB,&C,&B);
+
+        fp448 sum,diff;
+        fp448_add(&sum,&DA,&CB);
+        fp448_sqr(&x_3,&sum);
+        fp448_sub(&diff,&DA,&CB);
+        fp448_sqr(&z_3,&diff);
+        fp448_mul(&z_3,&z_3,&u);
+
+        fp448_mul(&x_2,&AA,&BB);
+        fp448 a24e;
+        fp448_mul_a24(&a24e,&E);
+        fp448 t2; fp448_add(&t2,&AA,&a24e);
+        fp448_mul(&z_2,&E,&t2);
+    }
+    fp448_cswap(&x_2,&x_3,swap);
+    fp448_cswap(&z_2,&z_3,swap);
+    fp448 inv_z; fp448_inv(&inv_z,&z_2);
+    fp448 result; fp448_mul(&result,&x_2,&inv_z);
+    fp448_to_le(u_out,&result);
+}
+
+static void x448_keygen(uint8_t priv[X448_KEY_LEN], uint8_t pub[X448_KEY_LEN]) {
+    random_bytes(priv,X448_KEY_LEN);
+    uint8_t basepoint[56]={5}; /* u=5 */
+    x448_scalar_mult(priv,basepoint,pub);
+}
+
+static int x448_shared_secret(const uint8_t priv[X448_KEY_LEN],
+    const uint8_t peer[X448_KEY_LEN], uint8_t out[X448_KEY_LEN]) {
+    x448_scalar_mult(priv,peer,out);
+    uint8_t z=0; for(int i=0;i<56;i++) z|=out[i];
+    return z!=0 ? 0 : -1;
+}
+
+/* ================================================================
+ * Ed448-Goldilocks Signature Verification (RFC 8032 §5.2)
+ * Edwards curve: x² + y² = 1 - 39081·x²·y² over GF(2^448-2^224-1)
+ * ================================================================ */
+
+/* d = -39081 mod p */
+#if USE_64BIT_LIMBS
+static const fp448 ED448_D = {{
+    0xFFFFFFFFFFFF6756ULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFEFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
+}};
+#else
+static const fp448 ED448_D = {{
+    0xFFFF6756, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFEFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+}};
+#endif
+
+/* Group order L for Ed448:
+   L = 2^446 - 13818066809895115352007386748515426880336692474882178609894547503885
+   (a 446-bit prime) */
+static const uint8_t ED448_L[57] = {
+    0xF3,0x44,0x58,0xAB,0x92,0xC2,0x78,0x23,0x55,0x8F,0xC5,0x8D,0x72,0xC2,0x6C,0x21,
+    0x90,0x36,0xD6,0xAE,0x49,0xDB,0x4E,0xC4,0xE9,0x23,0xCA,0x7C,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x3F,0x00
+};
+
+/* Basepoint B (compressed, 57 bytes) — y-coordinate LE, sign bit in byte 56 */
+static const uint8_t ED448_B_COMPRESSED[57] = {
+    0x14,0xFA,0x30,0xF2,0x5B,0x79,0x08,0x98,0xAD,0xC8,0xD7,0x4E,0x2C,0x13,0xBD,0xFD,
+    0xC4,0x39,0x7C,0xE6,0x1C,0xFF,0xD3,0x3A,0xD7,0xC2,0xA0,0x05,0x1E,0x9C,0x78,0x87,
+    0x40,0x98,0xA3,0x6C,0x73,0x73,0xEA,0x4B,0x62,0xC7,0xC9,0x56,0x37,0x20,0x76,0x88,
+    0x24,0xBC,0xB6,0x6E,0x71,0x46,0x3F,0x69,0x00
+};
+
+typedef struct { fp448 x,y,z,t; } ed448_pt;
+
+static void ed448_identity(ed448_pt *p) {
+    memset(p,0,sizeof(*p));
+    p->y.v[0]=1; p->z.v[0]=1;
+}
+
+/* Decompress 57-byte Ed448 point → extended coordinates */
+static int ed448_decompress(ed448_pt *p, const uint8_t enc[57]) {
+    uint8_t tmp[56]; memcpy(tmp,enc,56);
+    int sign = (enc[56]&0x80)>>7;
+    /* The y-coordinate is in bytes 0..55, the sign of x is in the high bit of byte 56.
+       But byte 56 should have its low 7 bits all zero (y is 448 bits = 56 bytes). */
+    fp448_from_le(&p->y,tmp);
+
+    /* x² = (y²-1)/(d·y²-1) from curve equation x²+y²=1+d·x²·y² */
+    fp448 y2,u,v,one;
+    one=FP448_ZERO; one.v[0]=1;
+    fp448_sqr(&y2,&p->y);
+    fp448_sub(&u,&y2,&one);
+    fp448_mul(&v,&y2,&ED448_D);
+    fp448_sub(&v,&v,&one);
+
+    /* sqrt(u/v) = (u/v)^((p+1)/4), (p+1)/4 = 2^222·(2^224-1) */
+    fp448 v_inv, uv;
+    fp448_inv(&v_inv,&v);
+    fp448_mul(&uv,&u,&v_inv);
+
+    /* Compute uv^(2^224-1) via addition chain, then square 222 times */
+    fp448 a2, a4, a8, a16, a32, a64, a96, a128, a224;
+    fp448_sqr(&a2,&uv); fp448_mul(&a2,&a2,&uv);
+    a4=a2; for(int i=0;i<2;i++) fp448_sqr(&a4,&a4); fp448_mul(&a4,&a4,&a2);
+    a8=a4; for(int i=0;i<4;i++) fp448_sqr(&a8,&a8); fp448_mul(&a8,&a8,&a4);
+    a16=a8; for(int i=0;i<8;i++) fp448_sqr(&a16,&a16); fp448_mul(&a16,&a16,&a8);
+    a32=a16; for(int i=0;i<16;i++) fp448_sqr(&a32,&a32); fp448_mul(&a32,&a32,&a16);
+    a64=a32; for(int i=0;i<32;i++) fp448_sqr(&a64,&a64); fp448_mul(&a64,&a64,&a32);
+    a128=a64; for(int i=0;i<64;i++) fp448_sqr(&a128,&a128); fp448_mul(&a128,&a128,&a64);
+    a96=a64; for(int i=0;i<32;i++) fp448_sqr(&a96,&a96); fp448_mul(&a96,&a96,&a32);
+    a224=a128; for(int i=0;i<96;i++) fp448_sqr(&a224,&a224); fp448_mul(&a224,&a224,&a96);
+    fp448 sq = a224;
+    for(int i=0;i<222;i++) fp448_sqr(&sq,&sq);
+    p->x = sq;
+
+    /* Verify: x² == u/v */
+    fp448 x2_check;
+    fp448_sqr(&x2_check,&p->x);
+    fp448_sub(&x2_check,&x2_check,&uv);
+    uint8_t chk[56]; fp448_to_le(chk,&x2_check);
+    int is_zero=1; for(int i=0;i<56;i++) if(chk[i]) {is_zero=0;break;}
+    if(!is_zero) return -1;
+
+    /* Adjust sign */
+    uint8_t xb[56]; fp448_to_le(xb,&p->x);
+    if((xb[0]&1)!=sign){
+        fp448_sub(&p->x,&FP448_ZERO,&p->x);
+    }
+
+    /* z=1, t=x*y */
+    p->z=FP448_ZERO; p->z.v[0]=1;
+    fp448_mul(&p->t,&p->x,&p->y);
+    return 0;
+}
+
+static void ed448_compress(uint8_t out[57], const ed448_pt *p) {
+    fp448 zinv,x,y;
+    fp448_inv(&zinv,&p->z);
+    fp448_mul(&x,&p->x,&zinv);
+    fp448_mul(&y,&p->y,&zinv);
+    fp448_to_le(out,&y);
+    uint8_t xb[56]; fp448_to_le(xb,&x);
+    out[56]=(xb[0]&1)<<7;
+}
+
+/* Extended coordinates addition for a=1 twisted Edwards: x²+y²=1+d·x²·y²
+   A=X1·X2, B=Y1·Y2, C=T1·d·T2, D=Z1·Z2,
+   E=(X1+Y1)·(X2+Y2)-A-B, F=D-C, G=D+C, H=B-A */
+static void ed448_add(ed448_pt *r, const ed448_pt *p, const ed448_pt *q) {
+    fp448 a,b,c,d,e,f,g,h;
+    fp448_mul(&a,&p->x,&q->x);
+    fp448_mul(&b,&p->y,&q->y);
+    fp448_mul(&c,&p->t,&q->t);
+    fp448_mul(&c,&c,&ED448_D);
+    fp448_mul(&d,&p->z,&q->z);
+    fp448_add(&e,&p->x,&p->y);
+    fp448_add(&f,&q->x,&q->y);
+    fp448_mul(&e,&e,&f);
+    fp448_sub(&e,&e,&a);
+    fp448_sub(&e,&e,&b);
+    fp448_sub(&f,&d,&c);
+    fp448_add(&g,&d,&c);
+    fp448_sub(&h,&b,&a);
+    fp448_mul(&r->x,&e,&f);
+    fp448_mul(&r->y,&g,&h);
+    fp448_mul(&r->t,&e,&h);
+    fp448_mul(&r->z,&f,&g);
+}
+
+/* Point doubling: a=1 twisted Edwards extended coordinates
+   A=X², B=Y², C=2Z², D=A, E=(X+Y)²-A-B, G=D+B, F=G-C, H=D-B */
+static void ed448_double(ed448_pt *r, const ed448_pt *p) {
+    fp448 a,b,c,d,e,f,g,h;
+    fp448_sqr(&a,&p->x);
+    fp448_sqr(&b,&p->y);
+    fp448_sqr(&c,&p->z); fp448_add(&c,&c,&c);
+    d=a;
+    fp448_add(&e,&p->x,&p->y);
+    fp448_sqr(&e,&e);
+    fp448_sub(&e,&e,&a);
+    fp448_sub(&e,&e,&b);
+    fp448_add(&g,&d,&b);
+    fp448_sub(&f,&g,&c);
+    fp448_sub(&h,&d,&b);
+    fp448_mul(&r->x,&e,&f);
+    fp448_mul(&r->y,&g,&h);
+    fp448_mul(&r->t,&e,&h);
+    fp448_mul(&r->z,&f,&g);
+}
+
+static void ed448_double_scalar_mul_vartime(ed448_pt *r,
+    const uint8_t *s, int s_bits,
+    const ed448_pt *B,
+    const uint8_t *k, int k_bits,
+    const ed448_pt *A) {
+    ed448_pt AB;
+    ed448_add(&AB,A,B);
+    ed448_identity(r);
+    int max_bits = s_bits > k_bits ? s_bits : k_bits;
+    for(int i=max_bits-1;i>=0;i--){
+        ed448_double(r,r);
+        int sb = (i < s_bits) ? (s[i/8]>>(i%8))&1 : 0;
+        int kb = (i < k_bits) ? (k[i/8]>>(i%8))&1 : 0;
+        if(sb && kb) ed448_add(r,r,&AB);
+        else if(sb) ed448_add(r,r,B);
+        else if(kb) ed448_add(r,r,A);
+    }
+}
+
+/* Reduce 114-byte little-endian SHAKE256 output mod L for Ed448.
+   Uses iterative reduction: 2^446 ≡ c (mod L) where c = 2^446 - L (224 bits). */
+static void ed448_reduce_l(uint8_t out[57], const uint8_t in[114]) {
+    /* c = 2^446 - L, 28 bytes little-endian */
+    static const uint8_t C[28] = {
+        0x0D,0xBB,0xA7,0x54,0x6D,0x3D,0x87,0xDC,
+        0xAA,0x70,0x3A,0x72,0x8D,0x3D,0x93,0xDE,
+        0x6F,0xC9,0x29,0x51,0xB6,0x24,0xB1,0x3B,
+        0x16,0xDC,0x35,0x83
+    };
+    /* 16-bit limbs in uint64_t; split at bit 446 (limb 27, bit 14) */
+    uint64_t x[72];
+    int i,j;
+    for(i=0;i<57;i++) x[i]=((uint64_t)in[2*i]) | ((uint64_t)in[2*i+1]<<8);
+    for(i=57;i<72;i++) x[i]=0;
+
+    uint64_t cl[14];
+    for(i=0;i<14;i++) cl[i]=((uint64_t)C[2*i]) | ((uint64_t)C[2*i+1]<<8);
+
+    /* 3 iterations: extract x_hi = x >> 446, replace x with x_lo + x_hi * c */
+    for(int iter=0;iter<3;iter++){
+        int hi_limbs = (iter==0) ? 30 : (iter==1) ? 16 : 4;
+        uint64_t hi[32];
+        for(i=0;i<32;i++) hi[i]=0;
+        for(i=0;i<hi_limbs;i++){
+            uint64_t lo_part = (i+27 < 72) ? x[i+27] : 0;
+            uint64_t hi_part = (i+28 < 72) ? x[i+28] : 0;
+            hi[i] = (lo_part >> 14) | ((hi_part & 0x3FFF) << 2);
+        }
+
+        x[27] &= 0x3FFF;
+        for(i=28;i<72;i++) x[i]=0;
+
+        for(i=0;i<hi_limbs;i++){
+            if(hi[i]==0) continue;
+            uint64_t carry=0;
+            for(j=0;j<14;j++){
+                uint64_t v = x[i+j] + hi[i]*cl[j] + carry;
+                x[i+j] = v & 0xFFFF;
+                carry = v >> 16;
+            }
+            for(j=i+14; carry && j<72; j++){
+                uint64_t v = x[j] + carry;
+                x[j] = v & 0xFFFF;
+                carry = v >> 16;
+            }
+        }
+    }
+
+    /* Conditional subtract of L */
+    uint64_t ll[28];
+    for(i=0;i<28;i++) ll[i]=((uint64_t)ED448_L[2*i]) | ((uint64_t)ED448_L[2*i+1]<<8);
+    ll[27] &= 0x3FFF;
+
+    uint64_t borrow=0;
+    uint64_t b[28];
+    for(i=0;i<28;i++){
+        uint64_t v = x[i] - ll[i] - borrow;
+        b[i] = v & 0xFFFF;
+        borrow = (v >> 63) & 1;
+    }
+    if(!borrow){
+        for(i=0;i<28;i++) x[i]=b[i];
+    }
+
+    for(i=0;i<28;i++){
+        out[2*i]   = (uint8_t)(x[i] & 0xFF);
+        out[2*i+1] = (uint8_t)((x[i]>>8) & 0xFF);
+    }
+    out[56]=0;
+}
+
+/* Ed448 verify (RFC 8032 §5.2.7, cofactorless) */
+static int ed448_verify(const uint8_t pubkey[57], const uint8_t *msg, size_t msg_len,
+                         const uint8_t sig[114]) {
+    ed448_pt A;
+    if(ed448_decompress(&A,pubkey)<0) return 0;
+    ed448_pt R;
+    if(ed448_decompress(&R,sig)<0) return 0;
+
+    /* Check s < L */
+    const uint8_t *s_bytes=sig+57;
+    for(int i=56;i>=0;i--){
+        if(s_bytes[i]<ED448_L[i]) break;
+        if(s_bytes[i]>ED448_L[i]) return 0;
+    }
+
+    /* k = SHAKE256(dom4(0,0) || R || A || msg, 114) mod L */
+    uint8_t h[114];
+    {
+        shake256_ctx ctx; shake256_init(&ctx);
+        static const uint8_t dom4[10] = {'S','i','g','E','d','4','4','8',0x00,0x00};
+        shake256_update(&ctx,dom4,10);
+        shake256_update(&ctx,sig,57);
+        shake256_update(&ctx,pubkey,57);
+        shake256_update(&ctx,msg,msg_len);
+        shake256_final(&ctx,h,114);
+    }
+    uint8_t k[57];
+    ed448_reduce_l(k,h);
+
+    ed448_pt B;
+    if(ed448_decompress(&B,ED448_B_COMPRESSED)<0) return 0;
+
+    /* [s]B - [k]A */
+    ed448_pt neg_A;
+    fp448_sub(&neg_A.x,&FP448_ZERO,&A.x);
+    neg_A.y=A.y; neg_A.z=A.z;
+    fp448_sub(&neg_A.t,&FP448_ZERO,&A.t);
+
+    ed448_pt result;
+    ed448_double_scalar_mul_vartime(&result,s_bytes,446,&B,k,446,&neg_A);
+
+    uint8_t result_enc[57], R_enc[57];
+    ed448_compress(result_enc,&result);
+    memcpy(R_enc,sig,57);
+    return ct_memeq(result_enc,R_enc,57);
+}
+
+/* ================================================================
  * Base64 / PEM Decoder
  * ================================================================ */
 static int b64val(uint8_t c) {
@@ -2844,6 +3868,8 @@ static const uint8_t OID_NAME_CONSTRAINTS[]   = {0x55,0x1D,0x1E};
 static const uint8_t OID_POLICY_CONSTRAINTS[] = {0x55,0x1D,0x24};
 static const uint8_t OID_SCT_LIST[] = {0x2B,0x06,0x01,0x04,0x01,0xD6,0x79,0x02,0x04,0x02};
 static const uint8_t OID_CRL_DIST_POINTS[] = {0x55,0x1D,0x1F};
+static const uint8_t OID_ED25519[]  = {0x2B,0x65,0x70}; /* 1.3.101.112 */
+static const uint8_t OID_ED448[]    = {0x2B,0x65,0x71}; /* 1.3.101.113 */
 
 #include "ct_log_table.inc"
 
@@ -3146,12 +4172,22 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     if(!pk_oid) return -1;
     int is_ec=oid_eq(pk_oid,len,OID_EC_PUBKEY,sizeof(OID_EC_PUBKEY));
     int is_rsa=oid_eq(pk_oid,len,OID_RSA_ENC,sizeof(OID_RSA_ENC));
+    int is_ed25519=oid_eq(pk_oid,len,OID_ED25519,sizeof(OID_ED25519));
+    int is_ed448=oid_eq(pk_oid,len,OID_ED448,sizeof(OID_ED448));
 
     /* BIT STRING with public key follows AlgorithmIdentifier */
     const uint8_t *bs_val=der_read_tl(alg_end,spki_end,&tag,&len);
     if(!bs_val||tag!=0x03||len<2) return -1;
 
-    if(is_ec){
+    if(is_ed25519){
+        cert->key_type=3;
+        cert->pubkey=bs_val+1; /* skip unused-bits byte */
+        cert->pubkey_len=len-1;
+    } else if(is_ed448){
+        cert->key_type=3;
+        cert->pubkey=bs_val+1;
+        cert->pubkey_len=len-1;
+    } else if(is_ec){
         cert->key_type=1;
         cert->pubkey=bs_val+1; /* skip unused-bits byte */
         cert->pubkey_len=len-1;
@@ -3308,7 +4344,7 @@ static void load_trust_store(const char *dir) {
         memcpy(tc->subject,cert.subject,cert.subject_len);
         tc->subject_len=cert.subject_len;
         tc->key_type=cert.key_type;
-        if(cert.key_type==1&&cert.pubkey_len<=sizeof(tc->pubkey)){
+        if((cert.key_type==1||cert.key_type==3)&&cert.pubkey_len<=sizeof(tc->pubkey)){
             memcpy(tc->pubkey,cert.pubkey,cert.pubkey_len);
             tc->pubkey_len=cert.pubkey_len;
         } else if(cert.key_type==2){
@@ -3374,6 +4410,16 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
         uint8_t h[64]; sha512_hash(tbs,tbs_len,h);
         return rsa_pkcs1_verify(h,64,DI_SHA512,sizeof(DI_SHA512),
             sig,sig_len,rsa_n,rsa_n_len,rsa_e,rsa_e_len);
+    }
+    /* Ed25519: pure signature, no separate hash */
+    if(oid_eq(sig_alg,sig_alg_len,OID_ED25519,sizeof(OID_ED25519))){
+        if(key_type!=3||pubkey_len!=32||sig_len!=ED25519_SIG_LEN) return 0;
+        return ed25519_verify(pubkey,tbs,tbs_len,sig);
+    }
+    /* Ed448: pure signature, no separate hash */
+    if(oid_eq(sig_alg,sig_alg_len,OID_ED448,sizeof(OID_ED448))){
+        if(key_type!=3||pubkey_len!=57||sig_len!=ED448_SIG_LEN) return 0;
+        return ed448_verify(pubkey,tbs,tbs_len,sig);
     }
     return 0;
 }
@@ -3456,7 +4502,7 @@ static int http_fetch(const uint8_t *url, size_t url_len,
     if(total==0) return -1;
 
     /* Skip HTTP headers: find \r\n\r\n */
-    uint8_t *body=NULL;
+    const uint8_t *body=NULL;
     for(size_t i=0;i+3<total;i++){
         if(buf[i]=='\r'&&buf[i+1]=='\n'&&
            buf[i+2]=='\r'&&buf[i+3]=='\n'){
@@ -3468,7 +4514,7 @@ static int http_fetch(const uint8_t *url, size_t url_len,
     size_t body_len=total-(size_t)(body-buf);
     if(body_len==0) return -1;
 
-    *out=(const uint8_t *)body;
+    *out=body;
     *out_len=body_len;
     return 0;
 }
@@ -4245,12 +5291,11 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                                  trust_store[j].rsa_e,trust_store[j].rsa_e_len)){
                 if(verbose) printf("    Certificate %d root signature verified\n",i);
                 if(verbose) printf("    Certificate chain verified successfully!\n");
-                {
+                /* CT verification — skip for directly-trusted certs (e.g. self-signed
+                   in trust store); CT is a public WebPKI mechanism only */
+                if(i > 0) {
                     uint8_t ikh[32];
-                    if(i==0)
-                        memcpy(ikh, trust_store[j].spki_hash, 32);
-                    else
-                        sha256_hash(certs[1].spki, certs[1].spki_len, ikh);
+                    sha256_hash(certs[1].spki, certs[1].spki_len, ikh);
                     if(certs[0].sct_list) {
                         if(ct_verify_scts(&certs[0], ikh) < 0) return -1;
                     } else {
@@ -4426,6 +5471,7 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
 static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT_LEN],
                                   const uint8_t p384_pub[P384_POINT_LEN],
                                   const uint8_t x25519_pub[X25519_KEY_LEN],
+                                  const uint8_t x448_pub[X448_KEY_LEN],
                                   const char *host,
                                   uint8_t client_random[32],
                                   const uint8_t *session_id,
@@ -4502,18 +5548,21 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 
     /* supported_groups */
     buf[p++]=0x00;buf[p++]=0x0a;
-    buf[p++]=0x00;buf[p++]=0x08; /* ext len */
-    buf[p++]=0x00;buf[p++]=0x06; /* list len = 3 groups * 2 bytes */
+    buf[p++]=0x00;buf[p++]=0x0a; /* ext len = 4 groups * 2 + 2 */
+    buf[p++]=0x00;buf[p++]=0x08; /* list len = 4 groups * 2 bytes */
     buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF); /* x25519 (preferred) */
+    buf[p++]=(TLS_GROUP_X448>>8);buf[p++]=(TLS_GROUP_X448&0xFF); /* x448 */
     buf[p++]=(TLS_GROUP_SECP256R1>>8);buf[p++]=(TLS_GROUP_SECP256R1&0xFF); /* secp256r1 */
     buf[p++]=(TLS_GROUP_SECP384R1>>8);buf[p++]=(TLS_GROUP_SECP384R1&0xFF); /* secp384r1 */
 
     /* signature_algorithms */
     buf[p++]=0x00;buf[p++]=0x0d;
-    buf[p++]=0x00;buf[p++]=0x0e; /* ext len */
-    buf[p++]=0x00;buf[p++]=0x0c; /* list len */
+    buf[p++]=0x00;buf[p++]=0x12; /* ext len = 8 algos * 2 + 2 */
+    buf[p++]=0x00;buf[p++]=0x10; /* list len = 8 algos * 2 bytes */
     PUT16(buf+p, TLS_SIG_ECDSA_SECP384R1_SHA384); p+=2;
     PUT16(buf+p, TLS_SIG_ECDSA_SECP256R1_SHA256); p+=2;
+    PUT16(buf+p, TLS_SIG_ED25519); p+=2;
+    PUT16(buf+p, TLS_SIG_ED448); p+=2;
     PUT16(buf+p, TLS_SIG_RSA_PSS_SHA384); p+=2;
     PUT16(buf+p, TLS_SIG_RSA_PSS_SHA256); p+=2;
     PUT16(buf+p, TLS_SIG_RSA_PKCS1_SHA384); p+=2;
@@ -4539,14 +5588,23 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
         buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF);
         PUT16(buf+p,X25519_KEY_LEN);p+=2;
         memcpy(buf+p,x25519_pub,X25519_KEY_LEN);p+=X25519_KEY_LEN;
+    } else if(only_group==TLS_GROUP_X448) {
+        PUT16(buf+p,(uint16_t)(X448_KEY_LEN+4+2));p+=2;
+        PUT16(buf+p,(uint16_t)(X448_KEY_LEN+4));p+=2;
+        buf[p++]=(TLS_GROUP_X448>>8);buf[p++]=(TLS_GROUP_X448&0xFF);
+        PUT16(buf+p,X448_KEY_LEN);p+=2;
+        memcpy(buf+p,x448_pub,X448_KEY_LEN);p+=X448_KEY_LEN;
     } else {
-        /* Emit X25519 first (most preferred), then P-256, then P-384 */
-        uint16_t shares_len=X25519_KEY_LEN+4+P256_POINT_LEN+4+P384_POINT_LEN+4;
+        /* Emit X25519 first (most preferred), then X448, P-256, P-384 */
+        uint16_t shares_len=X25519_KEY_LEN+4+X448_KEY_LEN+4+P256_POINT_LEN+4+P384_POINT_LEN+4;
         PUT16(buf+p,(uint16_t)(shares_len+2));p+=2;
         PUT16(buf+p,shares_len);p+=2;
         buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF);
         PUT16(buf+p,X25519_KEY_LEN);p+=2;
         memcpy(buf+p,x25519_pub,X25519_KEY_LEN);p+=X25519_KEY_LEN;
+        buf[p++]=(TLS_GROUP_X448>>8);buf[p++]=(TLS_GROUP_X448&0xFF);
+        PUT16(buf+p,X448_KEY_LEN);p+=2;
+        memcpy(buf+p,x448_pub,X448_KEY_LEN);p+=X448_KEY_LEN;
         buf[p++]=(TLS_GROUP_SECP256R1>>8);buf[p++]=(TLS_GROUP_SECP256R1&0xFF);
         PUT16(buf+p,P256_POINT_LEN);p+=2;
         memcpy(buf+p,p256_pub,P256_POINT_LEN);p+=P256_POINT_LEN;
@@ -4639,6 +5697,9 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
                 if(group==TLS_GROUP_X25519 && klen==X25519_KEY_LEN && elen>=4+X25519_KEY_LEN) {
                     memcpy(server_pub,b+4,X25519_KEY_LEN);
                     *pub_len=X25519_KEY_LEN;
+                } else if(group==TLS_GROUP_X448 && klen==X448_KEY_LEN && elen>=4+X448_KEY_LEN) {
+                    memcpy(server_pub,b+4,X448_KEY_LEN);
+                    *pub_len=X448_KEY_LEN;
                 } else if(group==TLS_GROUP_SECP256R1 && klen==P256_POINT_LEN
                           && elen>=4+P256_POINT_LEN) {
                     memcpy(server_pub,b+4,P256_POINT_LEN);
@@ -5092,6 +6153,13 @@ static int verify_sig_algo(uint16_t algo, const uint8_t *data, size_t data_len,
         if(leaf->key_type==2)
             return rsa_pkcs1_verify(h,SHA384_DIGEST_LEN,DI_SHA384,sizeof(DI_SHA384),
                 sig,sig_len,leaf->rsa_n,leaf->rsa_n_len,leaf->rsa_e,leaf->rsa_e_len);
+    } else if(algo==TLS_SIG_ED25519) {
+        /* Ed25519 is a pure signature scheme — pass raw content, no pre-hash */
+        if(leaf->key_type!=3||leaf->pubkey_len!=32) return 0;
+        return ed25519_verify(leaf->pubkey,data,data_len,sig);
+    } else if(algo==TLS_SIG_ED448) {
+        if(leaf->key_type!=3||leaf->pubkey_len!=57) return 0;
+        return ed448_verify(leaf->pubkey,data,data_len,sig);
     }
     return 0;
 }
@@ -5106,6 +6174,7 @@ typedef struct {
     uint8_t p256_priv[P256_SCALAR_LEN], p256_pub[P256_POINT_LEN];
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
     uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub[X25519_KEY_LEN];
+    uint8_t x448_priv[X448_KEY_LEN], x448_pub[X448_KEY_LEN];
     uint8_t server_pub[P384_POINT_LEN]; size_t server_pub_len;
     uint16_t cipher_suite;
     sha256_ctx transcript;
@@ -5246,6 +6315,9 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                     if(out->ske_curve==TLS_GROUP_X25519) {
                         if(pk_len!=X25519_KEY_LEN)
                             die("expected 32-byte X25519 key");
+                    } else if(out->ske_curve==TLS_GROUP_X448) {
+                        if(pk_len!=X448_KEY_LEN)
+                            die("expected 56-byte X448 key");
                     } else if(out->ske_curve==TLS_GROUP_SECP256R1) {
                         if(pk_len!=P256_POINT_LEN)
                             die("expected uncompressed P-256 point");
@@ -5270,7 +6342,9 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                        sig_algo!=TLS_SIG_RSA_PSS_SHA256 &&
                        sig_algo!=TLS_SIG_RSA_PSS_SHA384 &&
                        sig_algo!=TLS_SIG_RSA_PKCS1_SHA256 &&
-                       sig_algo!=TLS_SIG_RSA_PKCS1_SHA384)
+                       sig_algo!=TLS_SIG_RSA_PKCS1_SHA384 &&
+                       sig_algo!=TLS_SIG_ED25519 &&
+                       sig_algo!=TLS_SIG_ED448)
                         die("SKE signature algorithm not in offered list");
 
                     uint8_t signed_data[256];
@@ -5341,10 +6415,12 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
                                    const uint8_t p384_pub[P384_POINT_LEN],
                                    uint8_t x25519_priv[X25519_KEY_LEN],
                                    const uint8_t x25519_pub[X25519_KEY_LEN],
+                                   uint8_t x448_priv[X448_KEY_LEN],
+                                   const uint8_t x448_pub[X448_KEY_LEN],
                                    const uint8_t client_random[32],
                                    const uint8_t server_random[32],
                                    tls12_keys *tk) {
-    uint8_t ss12[P384_SCALAR_LEN]; size_t ss12_len;
+    uint8_t ss12[X448_KEY_LEN]; size_t ss12_len; /* X448_KEY_LEN=56 is largest */
     if(is_rsa_kex) {
         if(!srv->cert_msg) die("No certificate for RSA key exchange");
         if(srv->cert_msg_len<6) die("Certificate message too short");
@@ -5400,6 +6476,19 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         ss12_len=X25519_KEY_LEN;
         if(verbose) printf("Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (X25519)\n");
+    } else if(srv->ske_curve==TLS_GROUP_X448) {
+        uint8_t cke[5+X448_KEY_LEN];
+        cke[0]=0x10; cke[1]=0; cke[2]=0;
+        cke[3]=X448_KEY_LEN+1; cke[4]=X448_KEY_LEN;
+        memcpy(cke+5, x448_pub, X448_KEY_LEN);
+        tls_send_record(fd,TLS_RT_HANDSHAKE,cke,sizeof(cke));
+        sha256_update(transcript, cke, sizeof(cke));
+        sha384_update(transcript384, cke, sizeof(cke));
+        if(x448_shared_secret(x448_priv, srv->ske_pubkey, ss12)<0)
+            die("X448 shared secret is zero");
+        ss12_len=X448_KEY_LEN;
+        if(verbose) printf("Sent ClientKeyExchange\n"
+               "Computed ECDHE shared secret (X448)\n");
     } else if(srv->ske_curve==TLS_GROUP_SECP256R1) {
         uint8_t cke[5+P256_POINT_LEN];
         cke[0]=0x10; cke[1]=0; cke[2]=0;
@@ -5428,6 +6517,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
     secure_zero(p256_priv,P256_SCALAR_LEN);
     secure_zero(p384_priv,P384_SCALAR_LEN);
     secure_zero(x25519_priv,X25519_KEY_LEN);
+    secure_zero(x448_priv,X448_KEY_LEN);
 
     tls12_derive_keys(tk, cipher_suite, mode, ss12, ss12_len,
                       client_random, server_random);
@@ -5673,6 +6763,9 @@ static void tls12_handshake(const tls_conn *conn) {
     uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub[X25519_KEY_LEN];
     memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
     memcpy(x25519_pub, conn->x25519_pub, X25519_KEY_LEN);
+    uint8_t x448_priv[X448_KEY_LEN], x448_pub[X448_KEY_LEN];
+    memcpy(x448_priv, conn->x448_priv, X448_KEY_LEN);
+    memcpy(x448_pub, conn->x448_pub, X448_KEY_LEN);
     sha256_ctx transcript = conn->transcript;
     sha384_ctx transcript384 = conn->transcript384;
 
@@ -5697,7 +6790,8 @@ static void tls12_handshake(const tls_conn *conn) {
     tls12_do_key_exchange(fd, &transcript, &transcript384, &srv,
         cipher_suite, mode, is_rsa_kex,
         p256_priv, p256_pub, p384_priv, p384_pub,
-        x25519_priv, x25519_pub, client_random, server_random, &tk);
+        x25519_priv, x25519_pub, x448_priv, x448_pub,
+        client_random, server_random, &tk);
 
     /* Phase 3: Exchange CCS and Finished */
     tls12_exchange_finished(fd, mode, &tk, &transcript, &transcript384);
@@ -5865,7 +6959,9 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     if(cv_algo!=TLS_SIG_ECDSA_SECP256R1_SHA256 &&
                        cv_algo!=TLS_SIG_ECDSA_SECP384R1_SHA384 &&
                        cv_algo!=TLS_SIG_RSA_PSS_SHA256 &&
-                       cv_algo!=TLS_SIG_RSA_PSS_SHA384)
+                       cv_algo!=TLS_SIG_RSA_PSS_SHA384 &&
+                       cv_algo!=TLS_SIG_ED25519 &&
+                       cv_algo!=TLS_SIG_ED448)
                         die("CertificateVerify uses sig algo not in offered list");
 
                     uint8_t th_cv[SHA384_DIGEST_LEN];
@@ -6128,20 +7224,27 @@ static void tls13_handshake(const tls_conn *conn) {
     memcpy(p384_priv, conn->p384_priv, P384_SCALAR_LEN);
     uint8_t x25519_priv[X25519_KEY_LEN];
     memcpy(x25519_priv, conn->x25519_priv, X25519_KEY_LEN);
+    uint8_t x448_priv[X448_KEY_LEN];
+    memcpy(x448_priv, conn->x448_priv, X448_KEY_LEN);
 
     uint16_t selected_group;
     if(server_pub_len==X25519_KEY_LEN) selected_group=TLS_GROUP_X25519;
+    else if(server_pub_len==X448_KEY_LEN) selected_group=TLS_GROUP_X448;
     else if(server_pub_len==P256_POINT_LEN) selected_group=TLS_GROUP_SECP256R1;
     else selected_group=TLS_GROUP_SECP384R1;
     if(verbose) printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",
         cipher_suite,selected_group);
 
     /* Compute shared secret */
-    uint8_t shared[P384_SCALAR_LEN]; size_t shared_len;
+    uint8_t shared[X448_KEY_LEN]; size_t shared_len; /* X448_KEY_LEN=56 is largest */
     if(selected_group==TLS_GROUP_X25519) {
         if(x25519_shared_secret(x25519_priv,server_pub,shared)<0)
             die("X25519 shared secret is zero");
         shared_len=X25519_KEY_LEN;
+    } else if(selected_group==TLS_GROUP_X448) {
+        if(x448_shared_secret(x448_priv,server_pub,shared)<0)
+            die("X448 shared secret is zero");
+        shared_len=X448_KEY_LEN;
     } else if(selected_group==TLS_GROUP_SECP256R1) {
         uint8_t ss[P256_SCALAR_LEN];
         ecdhe_p256_shared_secret(p256_priv,server_pub,ss);
@@ -6155,6 +7258,7 @@ static void tls13_handshake(const tls_conn *conn) {
     secure_zero(p256_priv,sizeof(p256_priv));
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(x25519_priv,sizeof(x25519_priv));
+    secure_zero(x448_priv,sizeof(x448_priv));
     if(verbose) printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Phase 1: Derive handshake keys */
@@ -6189,6 +7293,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
                                const uint8_t p256_pub[P256_POINT_LEN],
                                const uint8_t p384_pub[P384_POINT_LEN],
                                const uint8_t x25519_pub[X25519_KEY_LEN],
+                               const uint8_t x448_pub[X448_KEY_LEN],
                                const char *host,
                                uint8_t *server_pub, size_t *server_pub_len,
                                uint8_t server_random[32],
@@ -6220,8 +7325,8 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
             }
         }
     }
-    if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_SECP256R1
-       && hrr_group!=TLS_GROUP_SECP384R1)
+    if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_X448
+       && hrr_group!=TLS_GROUP_SECP256R1 && hrr_group!=TLS_GROUP_SECP384R1)
         die("HRR selected unsupported group");
     if(verbose) printf("  HRR selected group 0x%04x\n",hrr_group);
 
@@ -6250,7 +7355,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
        Reuse client_random and session_id per RFC 8446 §4.1.2. */
     uint8_t ch[CH_BUF_SIZE];
     uint8_t cr_copy[32]; memcpy(cr_copy, client_random, 32);
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,host,
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,x448_pub,host,
         cr_copy,session_id,hrr_group);
     if(hrr_aes256)
         sha384_update(transcript384,ch,ch_len);
@@ -6297,12 +7402,14 @@ static void do_https_get(const char *host, int port, const char *path) {
     ecdhe_p256_keygen(p256_priv,p256_pub);
     uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub_key[X25519_KEY_LEN];
     x25519_keygen(x25519_priv,x25519_pub_key);
-    if(verbose) printf("Generated ECDHE keypairs (X25519 + P-256 + P-384)\n");
+    uint8_t x448_priv[X448_KEY_LEN], x448_pub_key[X448_KEY_LEN];
+    x448_keygen(x448_priv,x448_pub_key);
+    if(verbose) printf("Generated ECDHE keypairs (X25519 + X448 + P-256 + P-384)\n");
 
     /* Build & send ClientHello */
     uint8_t ch[CH_BUF_SIZE];
     uint8_t client_random[32];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,host,client_random,NULL,0);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,host,client_random,NULL,0);
     /* Save session_id from ClientHello for HRR reuse (RFC 8446 §4.1.2) */
     const uint8_t *saved_session_id=ch+6+32+1; /* past: type(1)+len(3)+version(2)+random(32)+sid_len(1) */
     /* For the record layer, first ClientHello uses version 0x0301.
@@ -6346,7 +7453,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     /* HelloRetryRequest handling */
     if(memcmp(server_random,HRR_RANDOM,32)==0) {
         handle_hello_retry(fd,rec,&rec_len,&cipher_suite,client_random,
-            saved_session_id,p256_pub,p384_pub,x25519_pub_key,host,server_pub,&server_pub_len,
+            saved_session_id,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,host,server_pub,&server_pub_len,
             server_random,&version,&transcript,&transcript384,&sh_leftover);
         sh_msg_len=4+GET24(rec+1); /* rec now holds real ServerHello */
     }
@@ -6375,6 +7482,8 @@ static void do_https_get(const char *host, int port, const char *path) {
     memcpy(conn.p384_pub, p384_pub, P384_POINT_LEN);
     memcpy(conn.x25519_priv, x25519_priv, X25519_KEY_LEN);
     memcpy(conn.x25519_pub, x25519_pub_key, X25519_KEY_LEN);
+    memcpy(conn.x448_priv, x448_priv, X448_KEY_LEN);
+    memcpy(conn.x448_pub, x448_pub_key, X448_KEY_LEN);
     memcpy(conn.server_pub, server_pub, server_pub_len);
     conn.server_pub_len = server_pub_len;
     conn.cipher_suite = cipher_suite;
@@ -6385,11 +7494,11 @@ static void do_https_get(const char *host, int port, const char *path) {
         memcpy(conn.sh_leftover_data, rec + sh_msg_len, sh_leftover);
     }
 
-
     /* Clear local secret material */
     secure_zero(p256_priv, sizeof(p256_priv));
     secure_zero(p384_priv, sizeof(p384_priv));
     secure_zero(x25519_priv, sizeof(x25519_priv));
+    secure_zero(x448_priv, sizeof(x448_priv));
 
     if(version == TLS_VERSION_12) {
         tls12_handshake(&conn);
@@ -6402,10 +7511,130 @@ static void do_https_get(const char *host, int port, const char *path) {
 }
 
 
+/* ================================================================
+ * Self-tests: RFC test vectors for Ed25519, X448, Ed448
+ * ================================================================ */
+static int hex2bin(const char *hex, uint8_t *bin, size_t bin_len) {
+    for(size_t i=0;i<bin_len;i++){
+        unsigned hi,lo;
+        if(sscanf(hex+2*i,"%1x%1x",&hi,&lo)!=2) return -1;
+        bin[i]=(uint8_t)((hi<<4)|lo);
+    }
+    return 0;
+}
+
+static int run_self_tests(void) {
+    int pass=0,fail=0;
+
+    /* ---- Ed25519 RFC 8032 §7.1 Test Vector 1: empty message ---- */
+    {
+        uint8_t sk[32],pk[32],sig[64];
+        hex2bin("9d61b19deffd5a60ba844af492ec2cc4"
+                "4449c5697b326919703bac031cae7f60",sk,32);
+        hex2bin("d75a980182b10ab7d54bfed3c964073a"
+                "0ee172f3daa62325af021a68f707511a",pk,32);
+        hex2bin("e5564300c360ac729086e2cc806e828a"
+                "84877f1eb8e5d974d873e06522490155"
+                "5fb8821590a33bacc61e39701cf9b46b"
+                "d25bf5f0595bbe24655141438e7a100b",sig,64);
+        int ok=ed25519_verify(pk,(const uint8_t*)"",0,sig);
+        if(ok){pass++;printf("  Ed25519 test 1 (empty msg): PASS\n");}
+        else{fail++;printf("  Ed25519 test 1 (empty msg): FAIL\n");}
+    }
+    /* ---- Ed25519 RFC 8032 §7.1 Test Vector 2: 1-byte message (0x72) ---- */
+    {
+        uint8_t pk[32],sig[64];
+        hex2bin("3d4017c3e843895a92b70aa74d1b7ebc"
+                "9c982ccf2ec4968cc0cd55f12af4660c",pk,32);
+        hex2bin("92a009a9f0d4cab8720e820b5f642540"
+                "a2b27b5416503f8fb3762223ebdb69da"
+                "085ac1e43e15996e458f3613d0f11d8c"
+                "387b2eaeb4302aeeb00d291612bb0c00",sig,64);
+        const uint8_t msg[1]={0x72};
+        int ok=ed25519_verify(pk,msg,1,sig);
+        if(ok){pass++;printf("  Ed25519 test 2 (1-byte):    PASS\n");}
+        else{fail++;printf("  Ed25519 test 2 (1-byte):    FAIL\n");}
+    }
+
+    /* ---- X448 RFC 7748 §6.2: Alice and Bob DH ---- */
+    {
+        uint8_t alice_priv[56],alice_pub[56],bob_priv[56],bob_pub[56],shared[56],expected_shared[56];
+        hex2bin("9a8f4925d1519f5775cf46971028b71b"
+                "44c869ef7f811f2e980069a5b4b6ff84"
+                "c06991f5ecc68a4f9c8c8e40c0b55607"
+                "3ebf96a2a94e5340",alice_priv,56);
+        hex2bin("07f32d8adc627f9789eaffb9dfd11fb6"
+                "b0297fc419bfd414e16127f1e1cfd847"
+                "bb6915ea4c0a20ed07dc3a1994685770"
+                "45867de21a4e4c18",alice_pub,56);
+        hex2bin("1c306a7ac2a0e2e0990b294470cba339"
+                "e6453772b075811d8fad0d1d6927c120"
+                "bb5ee8972b0d3e21374c9c921b09d1b0"
+                "366f10106a0f6a54",bob_priv,56);
+        hex2bin("1854a97a9c7f7cc2e5bb27297b8018b6"
+                "3655fae71e230c989331d79d4912f475"
+                "89c0d8ec320665c7f937fde0dcc9d7d4"
+                "3294cdf11f8855d5",bob_pub,56);
+        hex2bin("556634e295417314cc1fa25fcd60735a"
+                "4044bc7fbda74964eb5fd76d9ac0242e"
+                "0cf958b4841cfb7f1d2f6a6dafe4d26e"
+                "a16cbc0456048db3",expected_shared,56);
+
+        /* Verify Alice's public key = scalar_mult(alice_priv, basepoint) */
+        uint8_t computed_pub[56];
+        uint8_t basepoint[56]={5};
+        x448_scalar_mult(alice_priv,basepoint,computed_pub);
+        int pub_ok = memcmp(computed_pub,alice_pub,56)==0;
+
+        /* Verify shared secret = scalar_mult(alice_priv, bob_pub) */
+        x448_shared_secret(alice_priv,bob_pub,shared);
+        int shared_ok = memcmp(shared,expected_shared,56)==0;
+
+        if(pub_ok&&shared_ok){pass++;printf("  X448 DH test (RFC 7748):    PASS\n");}
+        else{fail++;printf("  X448 DH test (RFC 7748):    FAIL (pub=%d shared=%d)\n",pub_ok,shared_ok);}
+    }
+
+    /* ---- Ed448 RFC 8032 §7.4 Test Vector 1: empty message ---- */
+    {
+        uint8_t pk[57],sig[114];
+        hex2bin("5fd7449b59b461fd2ce787ec616ad46a"
+                "1da1342485a70e1f8a0ea75d80e96778"
+                "edf124769b46c7061bd6783df1e50f6c"
+                "d1fa1abeafe8256180",pk,57);
+        hex2bin("533a37f6bbe457251f023c0d88f976ae"
+                "2dfb504a843e34d2074fd823d41a591f"
+                "2b233f034f628281f2fd7a22ddd47d78"
+                "28c59bd0a21bfd39"
+                "80ff0d2028d4b18a9df63e006c5d1c2d"
+                "345b925d8dc00b4104852db99ac5c7cd"
+                "da8530a113a0f4dbb61149f05a736326"
+                "8c71d95808ff2e652600",sig,114);
+        int ok=ed448_verify(pk,(const uint8_t*)"",0,sig);
+        if(ok){pass++;printf("  Ed448 test 1 (empty msg):   PASS\n");}
+        else{fail++;printf("  Ed448 test 1 (empty msg):   FAIL\n");}
+    }
+
+    /* ---- SHAKE256 sanity check ---- */
+    {
+        /* SHAKE256("", 32) = 46b9dd2b0ba88d13233b3feb743eeb24
+                              3fcd52ea62b81b82b50c27646ed5762f */
+        uint8_t out[32],expected[32];
+        shake256_ctx c; shake256_init(&c); shake256_final(&c,out,32);
+        hex2bin("46b9dd2b0ba88d13233b3feb743eeb24"
+                "3fcd52ea62b81b82b50c27646ed5762f",expected,32);
+        if(memcmp(out,expected,32)==0){pass++;printf("  SHAKE256 sanity check:      PASS\n");}
+        else{fail++;printf("  SHAKE256 sanity check:      FAIL\n");}
+    }
+
+    printf("Self-tests: %d passed, %d failed\n",pass,fail);
+    return fail>0 ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     int arg = 1;
     if(arg < argc && strcmp(argv[arg], "-v") == 0) { verbose = 1; arg++; }
-    if(arg != argc - 1) { fprintf(stderr, "Usage: %s [-v] https://host[:port]/path\n", argv[0]); return 1; }
+    if(arg < argc && strcmp(argv[arg], "-t") == 0) { return run_self_tests(); }
+    if(arg != argc - 1) { fprintf(stderr, "Usage: %s [-v] [-t] https://host[:port]/path\n", argv[0]); return 1; }
     const char *url = argv[arg];
     if(strncmp(url, "https://", 8) != 0) die("URL must start with https://");
     const char *hoststart = url + 8;

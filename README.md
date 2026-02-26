@@ -23,7 +23,7 @@ difficult, but not at all for use in anything more serious...
 
 ## What's here
 
-~6,000 lines of C99 that implements:
+~7,600 lines of C99 that implements:
 
 **X.509 chain validation**: signature verification, hostname matching (CN +
 SAN), validity periods, basicConstraints / pathLen / keyUsage / EKU
@@ -31,7 +31,7 @@ enforcement, name constraints, critical-extension rejection, out-of-order chain
 handling.
 
 **Certificate Transparency**: embedded SCT verification (RFC 6962) against
-Chrome's CT log list, enforcing Chrome/Apple SCT policy — 2 SCTs for
+Chrome's CT log list, enforcing Chrome/Safari/Firefox SCT policy: 2 SCTs for
 certificates <=180 days, 3 for longer-lived certificates, from >=2 distinct log
 operators.
 
@@ -61,29 +61,31 @@ ChaCha20-Poly1305 record protection.
 ### Key exchange
 
 - **X25519** (preferred)
+- **X448**
 - **ECDHE P-256**, **P-384**
 - **Static RSA** key transport (TLS 1.2 only)
 
 ### Signatures
 
 - ECDSA with P-256/SHA-256 and P-384/SHA-384
+- Ed25519 (TLS 1.3 CertificateVerify + X.509 cert signatures)
+- Ed448 (TLS 1.3 CertificateVerify + X.509 cert signatures)
 - RSA PKCS#1 v1.5 with SHA-256/384/512
 - RSA-PSS with SHA-256/384
 
 ### Crypto primitives
 
-SHA-1, SHA-256, SHA-384, SHA-512, HMAC, HKDF, AES-128/256 (GCM & CBC),
-ChaCha20-Poly1305, P-256/P-384 field & point arithmetic, X25519 Montgomery
-ladder, RSA modular exponentiation (64-bit & 32-bit limb paths).
+SHA-1, SHA-256, SHA-384, SHA-512, SHAKE256, HMAC, HKDF, AES-128/256 (GCM &
+CBC), ChaCha20-Poly1305, P-256/P-384 field & point arithmetic, X25519/X448
+Montgomery ladder, Ed25519/Ed448 point arithmetic and signature verification,
+RSA modular exponentiation (64-bit & 32-bit limb paths).
 
 ## What's not implemented
 
 - OCSP stapling / OCSP responder checking
 - Session resumption (every connection is a full handshake)
 - Client certificates
-- TLS 1.0/1.1
-- RC4/3DES
-- DHE
+- Old crypto: TLS 1.0/1.1, RC4/3DES, DHE
 - 0-RTT
 - Renegotiation and compression
 
@@ -107,8 +109,9 @@ Delete `ct_log_table.inc` and re-run `make` to refresh.
 ## Testing
 
 ```
-make test      # compile, static analysis, 25 random domains + all xfail
-make fulltest  # compile, static analysis, all 276 domains + all xfail
+make test      # compile, static analysis, 25 random domains + all xfail + local crypto
+make fulltest  # compile, static analysis, all 276 domains + all xfail + local crypto
+./tls_client -t # RFC test vectors for Ed25519, X448, Ed448
 ```
 
 Runs the compiler, static analysis (cppcheck + clang --analyze), then
@@ -116,8 +119,15 @@ expected-pass and 31 expected-fail connection tests covering:
 
 - badssl.com certificate/cipher edge cases + AIA incomplete chain
 - ~250 top domains (Google, Amazon, Cloudflare, banks, CDNs, etc.)
+- Local `openssl s_server` integration tests for Ed25519, X448, and Ed448
+  (auto-skipped if OpenSSL lacks support)
 
 Bails early after 10 failures.
+
+The local crypto tests exercise code paths that no public server currently
+offers: Ed25519/Ed448 certificate signatures and X448 key exchange. Each test
+generates a self-signed cert, starts a local `openssl s_server`, connects with
+`tls_client`, and verifies the handshake succeeds.
 
 ## Building
 

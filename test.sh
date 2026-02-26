@@ -492,11 +492,133 @@ for entry in "${xfail_tests[@]}"; do
     fi
 done
 
+# ================================================================
+# Local crypto tests (openssl s_server)
+# ================================================================
+printf "\n${BLD}=== Local crypto tests ===${RST}\n"
+
+local_pass=0
+local_fail=0
+local_skip=0
+
+LOCAL_TMPDIR=$(mktemp -d)
+local_cleanup_pids=()
+
+cleanup_local() {
+    for pid in "${local_cleanup_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf "$LOCAL_TMPDIR"
+    rm -f trust_store/ed25519_test.crt trust_store/x448_test.crt trust_store/ed448_test.crt
+}
+trap cleanup_local EXIT
+
+wait_for_server() {
+    local port=$1 i=0
+    while [[ $i -lt 30 ]]; do
+        if nc -z localhost "$port" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Run a local TLS test: start s_server, connect with tls_client, check result.
+# Usage: run_local_test <name> <port> <key> <cert> <trust_file> [extra s_server args...]
+run_local_test() {
+    local name="$1" port="$2" key="$3" cert="$4" trust_file="$5"
+    shift 5
+
+    if nc -z localhost "$port" 2>/dev/null; then
+        printf "${YLW}SKIP${RST}  (port %s in use)\n" "$port"
+        local_skip=$((local_skip + 1))
+        return
+    fi
+
+    cp "$cert" "$trust_file"
+
+    openssl s_server -key "$key" -cert "$cert" -port "$port" -www \
+        "$@" </dev/null >/dev/null 2>&1 &
+    local srv_pid=$!
+    local_cleanup_pids+=("$srv_pid")
+
+    if wait_for_server "$port"; then
+        run_with_timeout "$TEST_TIMEOUT" ./tls_client "https://localhost:$port/"
+        if [[ $TIMEOUT_RC -eq 0 ]]; then
+            printf "${GRN}PASS${RST}\n"
+            local_pass=$((local_pass + 1))
+        else
+            local reason
+            reason=$(echo "$TIMEOUT_OUTPUT" | grep 'FATAL:' | head -1 || true)
+            printf "${RED}FAIL${RST}  %s\n" "$reason"
+            local_fail=$((local_fail + 1))
+            failures+=("local $name: $reason")
+        fi
+    else
+        printf "${RED}FAIL${RST}  server failed to start\n"
+        local_fail=$((local_fail + 1))
+        failures+=("local $name: server failed to start")
+    fi
+
+    kill "$srv_pid" 2>/dev/null || true
+    wait "$srv_pid" 2>/dev/null || true
+    rm -f "$trust_file"
+}
+
+# --- Test: Ed25519 CertificateVerify ---
+printf "  %-50s " "Ed25519 CertificateVerify"
+if openssl genpkey -algorithm Ed25519 -out "$LOCAL_TMPDIR/ed25519_key.pem" 2>/dev/null && \
+   openssl req -new -x509 -key "$LOCAL_TMPDIR/ed25519_key.pem" \
+       -out "$LOCAL_TMPDIR/ed25519_cert.pem" -days 1 \
+       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
+    run_local_test "Ed25519" 14433 \
+        "$LOCAL_TMPDIR/ed25519_key.pem" "$LOCAL_TMPDIR/ed25519_cert.pem" \
+        trust_store/ed25519_test.crt
+else
+    printf "${YLW}SKIP${RST}  (OpenSSL lacks Ed25519 support)\n"
+    local_skip=$((local_skip + 1))
+fi
+
+# --- Test: X448 key exchange ---
+printf "  %-50s " "X448 key exchange"
+if openssl genpkey -algorithm X448 -out /dev/null 2>/dev/null && \
+   openssl ecparam -name prime256v1 -genkey -noout \
+       -out "$LOCAL_TMPDIR/x448_key.pem" 2>/dev/null && \
+   openssl req -new -x509 -key "$LOCAL_TMPDIR/x448_key.pem" \
+       -out "$LOCAL_TMPDIR/x448_cert.pem" -days 1 \
+       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
+    run_local_test "X448" 14434 \
+        "$LOCAL_TMPDIR/x448_key.pem" "$LOCAL_TMPDIR/x448_cert.pem" \
+        trust_store/x448_test.crt -groups X448
+else
+    printf "${YLW}SKIP${RST}  (OpenSSL lacks X448 support)\n"
+    local_skip=$((local_skip + 1))
+fi
+
+# --- Test: Ed448 CertificateVerify ---
+printf "  %-50s " "Ed448 CertificateVerify"
+if openssl genpkey -algorithm Ed448 -out "$LOCAL_TMPDIR/ed448_key.pem" 2>/dev/null && \
+   openssl req -new -x509 -key "$LOCAL_TMPDIR/ed448_key.pem" \
+       -out "$LOCAL_TMPDIR/ed448_cert.pem" -days 1 \
+       -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null; then
+    run_local_test "Ed448" 14435 \
+        "$LOCAL_TMPDIR/ed448_key.pem" "$LOCAL_TMPDIR/ed448_cert.pem" \
+        trust_store/ed448_test.crt
+else
+    printf "${YLW}SKIP${RST}  (OpenSSL lacks Ed448 support)\n"
+    local_skip=$((local_skip + 1))
+fi
+
 # -- Summary --
 printf "\n${BLD}=== Summary ===${RST}\n"
 printf "  ${GRN}Pass: %d${RST}   ${RED}Fail: %d${RST}   " "$pass" "$fail"
 printf "Expected-fail: %d   " "$xfail"
 printf "${RED}Unexpected-pass: %d${RST}\n" "$xfail_unexpected_pass"
+printf "  Local crypto: ${GRN}%d pass${RST} / ${RED}%d fail${RST} / ${YLW}%d skip${RST}\n" \
+    "$local_pass" "$local_fail" "$local_skip"
 
 exit_code=0
 
