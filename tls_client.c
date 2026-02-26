@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <dirent.h>
+#include <limits.h>
 
 static int verbose = 0;
 
@@ -3234,8 +3235,8 @@ static void load_trust_store(const char *dir) {
     while((ent=readdir(d))!=NULL&&trust_store_count<MAX_TRUST_CERTS){
         size_t nl=strlen(ent->d_name);
         if(nl<4||strcmp(ent->d_name+nl-4,".crt")!=0) continue;
-        char path[512];
-        snprintf(path,sizeof(path),"%s/%s",dir,ent->d_name);
+        char path[PATH_MAX];
+        if(snprintf(path,sizeof(path),"%s/%s",dir,ent->d_name)>=(int)sizeof(path)) continue;
         FILE *f=fopen(path,"r");
         if(!f) continue;
         size_t pem_len=fread(pem_buf,1,sizeof(pem_buf)-1,f);
