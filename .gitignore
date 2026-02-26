@@ -1,6 +1,7 @@
 # Build artifacts
-tls_client
-tls_client_*
+https_get
+tls_test
+*.o
 *.plist
 *.dSYM/
 

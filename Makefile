@@ -1,8 +1,15 @@
 CC ?= cc
 CFLAGS ?= -std=c99 -Wall -Wextra -Werror -pedantic -O2
 
-tls_client: tls_client.c ct_log_table.inc
-	$(CC) $(CFLAGS) -o $@ $<
+https_get: https_get.o tls_client.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+tls_test: tls_test.o tls_client.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+tls_client.o: tls_client.c tls_client.h ct_log_table.inc
+https_get.o: https_get.c tls_client.h
+tls_test.o: tls_test.c tls_client.h
 
 getcerts:
 	@set -e; \
@@ -26,29 +33,29 @@ getcerts:
 ct_log_table.inc:
 	python3 gen_ct_logs.py > $@
 
-test: tls_client
+test: https_get tls_test
 	bash test.sh -n 25
 
-fulltest: tls_client
+fulltest: https_get tls_test
 	bash test.sh
 
-test-local: tls_client
+test-local: https_get tls_test
 	bash test.sh -s local
 
 test-static:
 	bash test.sh -s compile,static
 
-test-sites-all: tls_client
+test-sites-all: https_get
 	bash test.sh -s pass,xfail
 
-test-sites: tls_client
+test-sites: https_get
 	bash test.sh -s pass -n 25
 
-test-xfail: tls_client
+test-xfail: https_get
 	bash test.sh -s xfail
 
 clean:
-	rm -f tls_client ct_log_table.inc
+	rm -f https_get tls_test *.o ct_log_table.inc
 	rm -rf __pycache__
 
 .PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail clean

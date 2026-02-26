@@ -41,12 +41,24 @@ if run_section compile; then
 printf "${BLD}=== Compile ===${RST}\n"
 
 printf "  cc  ... "
-cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_client tls_client.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_client.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c https_get.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_test.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get https_get.o tls_client.o
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_test tls_test.o tls_client.o
 printf "${GRN}ok${RST}\n"
 
 printf "  gcc-15 ... "
-gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_client_gcc tls_client.c
-rm -f tls_client_gcc
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o tls_client_gcc.o tls_client.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o https_get_gcc.o https_get.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o tls_test_gcc.o tls_test.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get_gcc https_get_gcc.o tls_client_gcc.o
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_test_gcc tls_test_gcc.o tls_client_gcc.o
+rm -f https_get_gcc tls_test_gcc *_gcc.o
+printf "${GRN}ok${RST}\n"
+
+printf "  self-tests ... "
+./tls_test
 printf "${GRN}ok${RST}\n"
 fi
 
@@ -54,19 +66,19 @@ if run_section static; then
 printf "\n${BLD}=== Static analysis ===${RST}\n"
 
 printf "  cppcheck ... "
-if cppcheck --error-exitcode=1 --quiet --std=c99 tls_client.c 2>&1; then
+if cppcheck --error-exitcode=1 --quiet --std=c99 tls_client.c https_get.c tls_test.c 2>&1; then
     printf "${GRN}ok${RST}\n"
 else
     printf "${YLW}warnings (non-fatal)${RST}\n"
 fi
 
 printf "  clang --analyze ... "
-if clang --analyze -std=c99 -Weverything tls_client.c 2>&1 | head -20; then
+if clang --analyze -std=c99 -Weverything tls_client.c https_get.c tls_test.c 2>&1 | head -20; then
     printf "${GRN}ok${RST}\n"
 else
     printf "${YLW}warnings (non-fatal)${RST}\n"
 fi
-rm -f tls_client.plist
+rm -f tls_client.plist https_get.plist tls_test.plist
 fi
 
 # -- Timeout helper (macOS lacks GNU timeout) --
@@ -458,7 +470,7 @@ for entry in "${pass_tests[@]}"; do
         "$i" "$total_pass_tests" "$pct"
     printf "\033[K  %-50s " "$url"
 
-    run_with_timeout "$TEST_TIMEOUT" ./tls_client "$url"
+    run_with_timeout "$TEST_TIMEOUT" ./https_get "$url"
     rc=$TIMEOUT_RC
     output="$TIMEOUT_OUTPUT"
 
@@ -491,7 +503,7 @@ for entry in "${xfail_tests[@]}"; do
     expected_err="${rest##*|}"
     printf "  %-50s " "$url"
 
-    run_with_timeout "$TEST_TIMEOUT" ./tls_client "$url"
+    run_with_timeout "$TEST_TIMEOUT" ./https_get "$url"
     rc=$TIMEOUT_RC
     output="$TIMEOUT_OUTPUT"
 
@@ -674,7 +686,7 @@ run_server_test() {
     local_cleanup_pids+=("$srv_pid")
 
     if wait_for_server $LOCAL_PORT; then
-        run_with_timeout "$TEST_TIMEOUT" ./tls_client "https://localhost:$LOCAL_PORT/"
+        run_with_timeout "$TEST_TIMEOUT" ./https_get "https://localhost:$LOCAL_PORT/"
         if [[ $TIMEOUT_RC -eq 0 ]]; then
             printf "${GRN}PASS${RST}\n"
             local_pass=$((local_pass + 1))
@@ -711,7 +723,7 @@ run_server_xfail() {
     local_cleanup_pids+=("$srv_pid")
 
     if wait_for_server $LOCAL_PORT; then
-        run_with_timeout "$TEST_TIMEOUT" ./tls_client "https://localhost:$LOCAL_PORT/"
+        run_with_timeout "$TEST_TIMEOUT" ./https_get "https://localhost:$LOCAL_PORT/"
         if [[ $TIMEOUT_RC -eq 0 ]]; then
             printf "${RED}XPASS${RST}  (unexpected success!)\n"
             local_fail=$((local_fail + 1))

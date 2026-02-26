@@ -1,12 +1,9 @@
 /*
- * tls_client.c — TLS 1.2/1.3 HTTPS client from scratch in C.
+ * tls_client.c — TLS 1.2/1.3 HTTPS client library from scratch in C.
  * Implements: SHA-1, SHA-256, SHA-384, SHA-512, SHAKE256, HMAC, HKDF,
  *             AES-128/256-GCM, AES-128/256-CBC, ChaCha20-Poly1305,
  *             ECDHE-P256/P384, X25519, X448, Ed25519, Ed448, TLS 1.2/1.3
  * No external crypto libraries.
- *
- * Compile:  cc -O2 -o tls_client tls_client.c
- * Run:      ./tls_client
  *
  * Certificate verification: SHA-256/384/512, ECDSA-P256/P384,
  *   RSA PKCS#1 v1.5, RSA-PSS, Ed25519, Ed448, X.509 chain.
@@ -26,8 +23,9 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <limits.h>
+#include "tls_client.h"
 
-static int verbose = 0;
+int tls_verbose = 0;
 
 /* ---- Detect limb width: 64-bit on 64-bit platforms, 32-bit otherwise ---- */
 #if !defined(USE_64BIT_LIMBS)
@@ -577,17 +575,11 @@ static void keccak_f1600(uint64_t st[25]) {
 
 #define SHAKE256_RATE 136 /* 1600 - 2*256 = 1088 bits = 136 bytes */
 
-typedef struct {
-    uint64_t st[25];
-    uint8_t buf[SHAKE256_RATE];
-    size_t buf_len;
-} shake256_ctx;
-
-static void shake256_init(shake256_ctx *ctx) {
+void shake256_init(shake256_ctx *ctx) {
     memset(ctx,0,sizeof(*ctx));
 }
 
-static void shake256_update(shake256_ctx *ctx, const uint8_t *data, size_t len) {
+void shake256_update(shake256_ctx *ctx, const uint8_t *data, size_t len) {
     while(len>0){
         size_t space=SHAKE256_RATE-ctx->buf_len;
         size_t chunk=len<space?len:space;
@@ -605,7 +597,7 @@ static void shake256_update(shake256_ctx *ctx, const uint8_t *data, size_t len) 
     }
 }
 
-static void shake256_final(shake256_ctx *ctx, uint8_t *out, size_t out_len) {
+void shake256_final(shake256_ctx *ctx, uint8_t *out, size_t out_len) {
     /* Pad: SHAKE domain separation 0x1F, then pad10*1 */
     memset(ctx->buf+ctx->buf_len,0,SHAKE256_RATE-ctx->buf_len);
     ctx->buf[ctx->buf_len]|=0x1F;
@@ -1826,7 +1818,7 @@ static void ecdhe_p384_keygen(uint8_t priv[P384_SCALAR_LEN], uint8_t pub[P384_PO
         if(!ec384_on_curve(&P384_GX,&P384_GY)) fprintf(stderr,"  G is NOT on curve either!\n");
         else fprintf(stderr,"  G IS on curve (field math OK, EC ops buggy)\n");
     } else {
-        if(verbose) printf("  Point verified on curve\n");
+        if(tls_verbose) fprintf(stderr,"  Point verified on curve\n");
     }
 }
 
@@ -2210,7 +2202,7 @@ static void ecdhe_p256_keygen(uint8_t priv[P256_SCALAR_LEN], uint8_t pub[P256_PO
     fp256_to_bytes(pub+1,&ax);
     fp256_to_bytes(pub+33,&ay);
     if(!ec256_on_curve(&ax,&ay)) fprintf(stderr,"BUG: P-256 point NOT on curve!\n");
-    else if(verbose) printf("  P-256 point verified on curve\n");
+    else if(tls_verbose) fprintf(stderr,"  P-256 point verified on curve\n");
 }
 
 static void ecdhe_p256_shared_secret(const uint8_t priv[P256_SCALAR_LEN],
@@ -2758,8 +2750,8 @@ static void ed25519_reduce_l(uint8_t out[32], const uint8_t in[64]) {
 }
 
 /* Ed25519 verify (RFC 8032 §5.1.7, cofactorless) */
-static int ed25519_verify(const uint8_t pubkey[32], const uint8_t *msg, size_t msg_len,
-                           const uint8_t sig[64]) {
+int ed25519_verify(const uint8_t pubkey[32], const uint8_t *msg, size_t msg_len,
+                   const uint8_t sig[64]) {
     ed25519_pt A;
     if(ed25519_decompress(&A,pubkey)<0) return 0;
     ed25519_pt R;
@@ -3071,7 +3063,7 @@ static void fp448_to_le(uint8_t b[56], const fp448 *a) {
 }
 
 /* X448 Montgomery ladder (RFC 7748 §5) — u-coordinate only */
-static void x448_scalar_mult(const uint8_t scalar[56],
+void x448_scalar_mult(const uint8_t scalar[56],
     const uint8_t u_in[56], uint8_t u_out[56]) {
     fp448 u; fp448_from_le(&u,u_in);
     uint8_t s[56]; memcpy(s,scalar,56);
@@ -3125,7 +3117,7 @@ static void x448_keygen(uint8_t priv[X448_KEY_LEN], uint8_t pub[X448_KEY_LEN]) {
     x448_scalar_mult(priv,basepoint,pub);
 }
 
-static int x448_shared_secret(const uint8_t priv[X448_KEY_LEN],
+int x448_shared_secret(const uint8_t priv[X448_KEY_LEN],
     const uint8_t peer[X448_KEY_LEN], uint8_t out[X448_KEY_LEN]) {
     x448_scalar_mult(priv,peer,out);
     uint8_t z=0; for(int i=0;i<56;i++) z|=out[i];
@@ -3381,8 +3373,8 @@ static void ed448_reduce_l(uint8_t out[57], const uint8_t in[114]) {
 }
 
 /* Ed448 verify (RFC 8032 §5.2.7, cofactorless) */
-static int ed448_verify(const uint8_t pubkey[57], const uint8_t *msg, size_t msg_len,
-                         const uint8_t sig[114]) {
+int ed448_verify(const uint8_t pubkey[57], const uint8_t *msg, size_t msg_len,
+                 const uint8_t sig[114]) {
     ed448_pt A;
     if(ed448_decompress(&A,pubkey)<0) return 0;
     ed448_pt R;
@@ -4362,7 +4354,7 @@ static void load_trust_store(const char *dir) {
         trust_store_count++;
     }
     closedir(d);
-    if(verbose) printf("Loaded %d trust store certificates\n",trust_store_count);
+    if(tls_verbose) fprintf(stderr,"Loaded %d trust store certificates\n",trust_store_count);
 }
 
 /* Unified signature verification dispatch */
@@ -4430,7 +4422,7 @@ static int validate_leaf_cert(const x509_cert *leaf, const char *hostname) {
         fprintf(stderr,"Hostname verification failed for %s\n",hostname);
         return -1;
     }
-    if(verbose) printf("    Hostname verified: %s\n",hostname);
+    if(tls_verbose) fprintf(stderr,"    Hostname verified: %s\n",hostname);
     if(leaf->has_eku && !leaf->eku_server_auth){
         fprintf(stderr,"Leaf certificate EKU does not include serverAuth\n");
         return -1;
@@ -4945,7 +4937,7 @@ static int ct_verify_scts(const x509_cert *leaf, const uint8_t *issuer_key_hash)
     int lifetime_days = (int)((leaf->not_after - leaf->not_before) / 86400);
     int required = (lifetime_days <= 180) ? 2 : 3;
 
-    if(verbose) printf("    CT: %d valid SCT(s) from %d distinct operator(s) (%d SCTs required, 2 operators required)\n",
+    if(tls_verbose) fprintf(stderr,"    CT: %d valid SCT(s) from %d distinct operator(s) (%d SCTs required, 2 operators required)\n",
                        total_scts, distinct_ops, required);
 
     if(total_scts < required) {
@@ -4967,7 +4959,7 @@ static uint8_t crl_buf[16*1024*1024]; /* 16 MB for CRL */
 
 static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
     if(!cert->crl_dp_url){
-        if(verbose) printf("    CRL: no distribution point URL\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: no distribution point URL\n");
         return 0; /* soft-fail */
     }
 
@@ -5022,10 +5014,10 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
                     }
                 }
                 if(fresh){
-                    if(verbose) printf("    CRL: using cached %s\n",cache_path);
+                    if(tls_verbose) fprintf(stderr,"    CRL: using cached %s\n",cache_path);
                     from_cache=1;
                 } else {
-                    if(verbose) printf("    CRL: cached %s expired, re-fetching\n",cache_path);
+                    if(tls_verbose) fprintf(stderr,"    CRL: cached %s expired, re-fetching\n",cache_path);
                     crl_der=NULL;
                     crl_len=0;
                 }
@@ -5034,12 +5026,12 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
     }
 
     if(!from_cache){
-        if(verbose) printf("    CRL: fetching %.*s\n",
+        if(tls_verbose) fprintf(stderr,"    CRL: fetching %.*s\n",
                (int)cert->crl_dp_url_len,cert->crl_dp_url);
         if(http_fetch(cert->crl_dp_url,cert->crl_dp_url_len,
                       crl_buf,sizeof(crl_buf),CRL_READ_TIMEOUT_S,
                       &crl_der,&crl_len)<0){
-            if(verbose) printf("    CRL: fetch failed (soft-fail)\n");
+            if(tls_verbose) fprintf(stderr,"    CRL: fetch failed (soft-fail)\n");
             return 0;
         }
         /* Write to disk cache (best-effort) */
@@ -5051,7 +5043,7 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
                 if(wf){
                     fwrite(crl_der,1,crl_len,wf);
                     fclose(wf);
-                    if(verbose) printf("    CRL: cached to %s\n",cache_path);
+                    if(tls_verbose) fprintf(stderr,"    CRL: cached to %s\n",cache_path);
                 }
             }
         }
@@ -5064,7 +5056,7 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
     uint8_t tag; size_t len;
     const uint8_t *p=der_expect(crl_der,crl_der+crl_len,0x30,&len);
     if(!p){
-        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: parse error (soft-fail)\n");
         return 0;
     }
     const uint8_t *crl_end=p+len;
@@ -5073,7 +5065,7 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
     const uint8_t *tbs_start=p;
     const uint8_t *tbs=der_expect(p,crl_end,0x30,&len);
     if(!tbs){
-        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: parse error (soft-fail)\n");
         return 0;
     }
     const uint8_t *tbs_end_ptr=tbs+len;
@@ -5084,7 +5076,7 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
     const uint8_t *crl_sig_alg_start=p;
     const uint8_t *sa=der_read_tl(p,crl_end,&tag,&len);
     if(!sa||tag!=0x30){
-        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: parse error (soft-fail)\n");
         return 0;
     }
     /* Extract the OID from the AlgorithmIdentifier SEQUENCE */
@@ -5094,14 +5086,14 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
     if(sa_oid){ crl_sig_alg=sa_oid; crl_sig_alg_len=len; }
     p=der_skip(crl_sig_alg_start,crl_end);
     if(!p){
-        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: parse error (soft-fail)\n");
         return 0;
     }
 
     /* signatureValue BIT STRING */
     const uint8_t *sig_bits=der_expect(p,crl_end,0x03,&len);
     if(!sig_bits||len<2||sig_bits[0]!=0){
-        if(verbose) printf("    CRL: parse error (soft-fail)\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: parse error (soft-fail)\n");
         return 0;
     }
     const uint8_t *crl_sig=sig_bits+1;
@@ -5116,10 +5108,10 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
                               issuer->pubkey,issuer->pubkey_len,
                               issuer->rsa_n,issuer->rsa_n_len,
                               issuer->rsa_e,issuer->rsa_e_len)){
-            if(verbose) printf("    CRL: signature verification failed (soft-fail)\n");
+            if(tls_verbose) fprintf(stderr,"    CRL: signature verification failed (soft-fail)\n");
             return 0;
         }
-        if(verbose) printf("    CRL: signature verified\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: signature verified\n");
     }
 
     /* Parse TBSCertList fields */
@@ -5151,23 +5143,23 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
     /* Check validity */
     time_t now=time(NULL);
     if(this_update>0&&now<this_update){
-        if(verbose) printf("    CRL: not yet valid (soft-fail)\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: not yet valid (soft-fail)\n");
         return 0;
     }
     if(next_update>0&&now>next_update){
-        if(verbose) printf("    CRL: expired (soft-fail)\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: expired (soft-fail)\n");
         return 0;
     }
 
     /* revokedCertificates is OPTIONAL per RFC 5280 §5.1.2.6; a conforming
      * CA may omit it when there are no revoked certificates. */
     if(tp>=tbs_end_ptr||*tp!=0x30){
-        if(verbose) printf("    CRL: no revoked certificates — not revoked\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: no revoked certificates — not revoked\n");
         return 0;
     }
     const uint8_t *revoked=der_expect(tp,tbs_end_ptr,0x30,&len);
     if(!revoked){
-        if(verbose) printf("    CRL: not revoked\n");
+        if(tls_verbose) fprintf(stderr,"    CRL: not revoked\n");
         return 0;
     }
     const uint8_t *revoked_end=revoked+len;
@@ -5194,7 +5186,7 @@ static int crl_check(const x509_cert *cert, const x509_cert *issuer) {
         }
     }
 
-    if(verbose) printf("    CRL: certificate not revoked\n");
+    if(tls_verbose) fprintf(stderr,"    CRL: certificate not revoked\n");
     return 0;
 }
 
@@ -5269,7 +5261,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             return -1;
         }
     }
-    if(verbose) printf("    Validity periods OK\n");
+    if(tls_verbose) fprintf(stderr,"    Validity periods OK\n");
 
     /* Walk chain from leaf upward: at each cert, try trust store first,
      * then find issuer among remaining chain certs. Handles out-of-order
@@ -5281,7 +5273,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         for(int j=0;j<trust_store_count;j++){
             if(certs[i].issuer_len!=trust_store[j].subject_len) continue;
             if(memcmp(certs[i].issuer,trust_store[j].subject,certs[i].issuer_len)!=0) continue;
-            if(verbose) printf("    Verifying cert %d against trust store...\n",i);
+            if(tls_verbose) fprintf(stderr,"    Verifying cert %d against trust store...\n",i);
             if(verify_signature(certs[i].tbs,certs[i].tbs_len,
                                  certs[i].sig_alg,certs[i].sig_alg_len,
                                  certs[i].sig,certs[i].sig_len,
@@ -5289,8 +5281,8 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                                  trust_store[j].pubkey,trust_store[j].pubkey_len,
                                  trust_store[j].rsa_n,trust_store[j].rsa_n_len,
                                  trust_store[j].rsa_e,trust_store[j].rsa_e_len)){
-                if(verbose) printf("    Certificate %d root signature verified\n",i);
-                if(verbose) printf("    Certificate chain verified successfully!\n");
+                if(tls_verbose) fprintf(stderr,"    Certificate %d root signature verified\n",i);
+                if(tls_verbose) fprintf(stderr,"    Certificate chain verified successfully!\n");
                 /* CT verification — skip for directly-trusted certs (e.g. self-signed
                    in trust store); CT is a public WebPKI mechanism only */
                 if(i > 0) {
@@ -5333,7 +5325,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             }
         }
         if(found<0&&certs[i].aia_url&&chain_count<MAX_CHAIN&&aia_fetches<MAX_AIA_FETCHES){
-            if(verbose) printf("    AIA: fetching issuer for cert %d from %.*s\n",
+            if(tls_verbose) fprintf(stderr,"    AIA: fetching issuer for cert %d from %.*s\n",
                    i,(int)certs[i].aia_url_len,certs[i].aia_url);
             const uint8_t *fetched=NULL; size_t fetched_len=0;
             if(http_fetch_der(certs[i].aia_url,certs[i].aia_url_len,
@@ -5348,7 +5340,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                         certs[chain_count]=fc;
                         chain_count++;
                         aia_fetches++;
-                        if(verbose) printf("    AIA: fetched intermediate certificate\n");
+                        if(tls_verbose) fprintf(stderr,"    AIA: fetched intermediate certificate\n");
                         /* Retry issuer search with the new cert */
                         for(int j=i+1;j<chain_count;j++){
                             if(certs[i].issuer_len==certs[j].subject_len&&
@@ -5375,7 +5367,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
         if(found!=i+1){
             x509_cert tmp=certs[i+1]; certs[i+1]=certs[found]; certs[found]=tmp;
         }
-        if(verbose) printf("    Verifying cert %d signature...\n",i);
+        if(tls_verbose) fprintf(stderr,"    Verifying cert %d signature...\n",i);
         if(!verify_signature(certs[i].tbs,certs[i].tbs_len,
                               certs[i].sig_alg,certs[i].sig_alg_len,
                               certs[i].sig,certs[i].sig_len,
@@ -5386,7 +5378,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
             fprintf(stderr,"Signature verification failed for cert %d\n",i);
             return -1;
         }
-        if(verbose) printf("    Certificate %d signature verified\n",i);
+        if(tls_verbose) fprintf(stderr,"    Certificate %d signature verified\n",i);
         /* Intermediate must be v3 (only v3 has extensions) */
         if(certs[i+1].version!=2){
             fprintf(stderr,"Certificate %d is not v3, cannot be CA\n",i+1);
@@ -6296,7 +6288,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
 
             switch(mtype) {
                 case 11: /* Certificate */
-                    if(verbose) printf("  Certificate (%u bytes)\n",(unsigned)mlen);
+                    if(tls_verbose) fprintf(stderr,"  Certificate (%u bytes)\n",(unsigned)mlen);
                     free(out->cert_msg);
                     out->cert_msg=malloc(mlen);
                     if(!out->cert_msg) die("malloc failed");
@@ -6306,7 +6298,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                 case 12: { /* ServerKeyExchange */
                     if(is_rsa_kex)
                         die("unexpected ServerKeyExchange for RSA key transport");
-                    if(verbose) printf("  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
+                    if(tls_verbose) fprintf(stderr,"  ServerKeyExchange (%u bytes)\n",(unsigned)mlen);
                     if(mlen<8) die("ServerKeyExchange too short");
                     const uint8_t *ske=hs12_buf+pos+4;
                     if(ske[0]!=0x03) die("expected named_curve type in SKE");
@@ -6373,16 +6365,16 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                         signed_len,sig_ptr,sig_len_val,&leaf);
                     if(!sig_ok)
                         die("ServerKeyExchange signature verification failed");
-                    if(verbose) printf("    SKE signature verified (algo=0x%04x)\n",
+                    if(tls_verbose) fprintf(stderr,"    SKE signature verified (algo=0x%04x)\n",
                            sig_algo);
                     break;
                 }
                 case 14: /* ServerHelloDone */
-                    if(verbose) printf("  ServerHelloDone\n");
+                    if(tls_verbose) fprintf(stderr,"  ServerHelloDone\n");
                     got_server_done=1;
                     break;
                 default:
-                    if(verbose) printf("  TLS 1.2 handshake msg type %d (%u bytes)\n",
+                    if(tls_verbose) fprintf(stderr,"  TLS 1.2 handshake msg type %d (%u bytes)\n",
                            mtype,(unsigned)mlen);
                     break;
             }
@@ -6397,7 +6389,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
     }
 
     if(out->cert_msg) {
-        if(verbose) printf("  Validating certificate chain...\n");
+        if(tls_verbose) fprintf(stderr,"  Validating certificate chain...\n");
         if(verify_cert_chain(out->cert_msg,out->cert_msg_len,host,0)<0)
             die("Certificate verification failed");
     }
@@ -6461,7 +6453,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         memcpy(ss12,pms,48);
         ss12_len=48;
         secure_zero(pms,sizeof(pms));
-        if(verbose) printf("Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",
+        if(tls_verbose) fprintf(stderr,"Sent ClientKeyExchange (RSA encrypted PMS, %zu bytes)\n",
                enc_len);
     } else if(srv->ske_curve==TLS_GROUP_X25519) {
         uint8_t cke[5+X25519_KEY_LEN];
@@ -6474,7 +6466,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         if(x25519_shared_secret(x25519_priv, srv->ske_pubkey, ss12)<0)
             die("X25519 shared secret is zero");
         ss12_len=X25519_KEY_LEN;
-        if(verbose) printf("Sent ClientKeyExchange\n"
+        if(tls_verbose) fprintf(stderr,"Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (X25519)\n");
     } else if(srv->ske_curve==TLS_GROUP_X448) {
         uint8_t cke[5+X448_KEY_LEN];
@@ -6487,7 +6479,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         if(x448_shared_secret(x448_priv, srv->ske_pubkey, ss12)<0)
             die("X448 shared secret is zero");
         ss12_len=X448_KEY_LEN;
-        if(verbose) printf("Sent ClientKeyExchange\n"
+        if(tls_verbose) fprintf(stderr,"Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (X448)\n");
     } else if(srv->ske_curve==TLS_GROUP_SECP256R1) {
         uint8_t cke[5+P256_POINT_LEN];
@@ -6499,7 +6491,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         sha384_update(transcript384, cke, sizeof(cke));
         ecdhe_p256_shared_secret(p256_priv, srv->ske_pubkey, ss12);
         ss12_len=P256_SCALAR_LEN;
-        if(verbose) printf("Sent ClientKeyExchange\n"
+        if(tls_verbose) fprintf(stderr,"Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (P-256)\n");
     } else {
         uint8_t cke[5+P384_POINT_LEN];
@@ -6511,7 +6503,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         sha384_update(transcript384, cke, sizeof(cke));
         ecdhe_p384_shared_secret(p384_priv, srv->ske_pubkey, ss12);
         ss12_len=P384_SCALAR_LEN;
-        if(verbose) printf("Sent ClientKeyExchange\n"
+        if(tls_verbose) fprintf(stderr,"Sent ClientKeyExchange\n"
                "Computed ECDHE shared secret (P-384)\n");
     }
     secure_zero(p256_priv,P256_SCALAR_LEN);
@@ -6522,7 +6514,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
     tls12_derive_keys(tk, cipher_suite, mode, ss12, ss12_len,
                       client_random, server_random);
     secure_zero(ss12,sizeof(ss12));
-    if(verbose) printf("Derived TLS 1.2 traffic keys\n");
+    if(tls_verbose) fprintf(stderr,"Derived TLS 1.2 traffic keys\n");
 }
 
 /* Phase 3: Exchange CCS and Finished messages */
@@ -6532,7 +6524,7 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
                                      sha384_ctx *transcript384) {
     /* Send ChangeCipherSpec */
     { uint8_t ccs=1; tls_send_record(fd,TLS_RT_CCS,&ccs,1); }
-    if(verbose) printf("Sent ChangeCipherSpec\n");
+    if(tls_verbose) fprintf(stderr,"Sent ChangeCipherSpec\n");
 
     /* Send Finished (encrypted) */
     {
@@ -6560,14 +6552,14 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
             tk->mac_alg,tk->c_wiv,0);
         sha256_update(transcript, fin_msg, 16);
         sha384_update(transcript384, fin_msg, 16);
-        if(verbose) printf("Sent Finished (encrypted)\n");
+        if(tls_verbose) fprintf(stderr,"Sent Finished (encrypted)\n");
     }
 
     /* Receive ChangeCipherSpec */
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype=tls_read_record(fd,rec,&rec_len);
     if(rtype!=TLS_RT_CCS) die("expected ChangeCipherSpec from server");
-    if(verbose) printf("Received ChangeCipherSpec\n");
+    if(tls_verbose) fprintf(stderr,"Received ChangeCipherSpec\n");
 
     /* Receive server Finished (encrypted) */
     rtype=tls_read_record(fd,rec,&rec_len);
@@ -6596,7 +6588,7 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
                     th12_sf, th12_sf_len, expected, 12);
         if(!ct_memeq(expected, pt12+4, 12))
             die("Server Finished verify failed!");
-        if(verbose) printf("Server Finished VERIFIED\n");
+        if(tls_verbose) fprintf(stderr,"Server Finished VERIFIED\n");
     }
 }
 
@@ -6608,9 +6600,24 @@ static struct {
     size_t chunk_rem;
     uint8_t hdr[16384];
     size_t hdr_len;
+    uint8_t *body;      /* accumulated body */
+    size_t body_len;    /* current length */
+    size_t body_cap;    /* allocated capacity */
 } ho;
 
 static void http_output_init(void) { memset(&ho,0,sizeof(ho)); }
+
+static void ho_append(const uint8_t *data, size_t len) {
+    if(ho.body_len + len > ho.body_cap) {
+        size_t new_cap = ho.body_cap ? ho.body_cap * 2 : 4096;
+        while(new_cap < ho.body_len + len) new_cap *= 2;
+        ho.body = realloc(ho.body, new_cap);
+        if(!ho.body) die("realloc");
+        ho.body_cap = new_cap;
+    }
+    memcpy(ho.body + ho.body_len, data, len);
+    ho.body_len += len;
+}
 
 static void http_output(const uint8_t *d, size_t len) {
     size_t i=0;
@@ -6624,7 +6631,7 @@ static void http_output(const uint8_t *d, size_t len) {
                 if(ho.hdr_len>=4 &&
                    ho.hdr[ho.hdr_len-4]=='\r' && ho.hdr[ho.hdr_len-3]=='\n' &&
                    ho.hdr[ho.hdr_len-2]=='\r' && ho.hdr[ho.hdr_len-1]=='\n') {
-                    if(verbose) fwrite(ho.hdr,1,ho.hdr_len,stdout);
+                    if(tls_verbose) fwrite(ho.hdr,1,ho.hdr_len,stderr);
                     ho.hdr[ho.hdr_len]='\0';
                     /* scan for Transfer-Encoding: chunked */
                     for(const char *p=(char*)ho.hdr; *p; ) {
@@ -6657,7 +6664,7 @@ static void http_output(const uint8_t *d, size_t len) {
             }
             break;
         case 1: /* non-chunked body */
-            fwrite(d+i,1,len-i,stdout);
+            ho_append(d+i, len-i);
             i=len;
             break;
         case 2: /* chunk size line */
@@ -6680,7 +6687,7 @@ static void http_output(const uint8_t *d, size_t len) {
         case 3: { /* chunk data */
             size_t avail=len-i;
             size_t n=avail<ho.chunk_rem?avail:ho.chunk_rem;
-            fwrite(d+i,1,n,stdout);
+            ho_append(d+i, n);
             i+=n;
             ho.chunk_rem-=n;
             if(ho.chunk_rem==0) ho.state=4;
@@ -6708,13 +6715,13 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
         tls12_send_encrypted(fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
             tk->mac_alg,tk->c_wiv,c12_seq++);
-        if(verbose) printf("Sent HTTP GET %s\n\n",path);
+        if(tls_verbose) fprintf(stderr,"Sent HTTP GET %s\n\n",path);
     }
 
     uint64_t s12_seq=1;
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype;
-    if(verbose) printf("=== HTTP Response ===\n");
+    if(tls_verbose) fprintf(stderr,"=== HTTP Response ===\n");
     http_output_init();
     for(;;) {
         rtype=tls_read_record(fd,rec,&rec_len);
@@ -6741,7 +6748,7 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
       tls12_send_encrypted(fd,TLS_RT_ALERT,alert,2,
           mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
           tk->mac_alg,tk->c_wiv,c12_seq++); }
-    if(verbose) printf("\n=== Done ===\n");
+    if(tls_verbose) fprintf(stderr,"\n=== Done ===\n");
 }
 
 /* ================================================================
@@ -6774,7 +6781,7 @@ static void tls12_handshake(const tls_conn *conn) {
                    || cipher_suite==TLS_RSA_AES256_CBC
                    || cipher_suite==TLS_RSA_AES128_CBC);
     cipher_mode_t mode = cipher_mode_of(cipher_suite);
-    if(verbose) printf("Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
+    if(tls_verbose) fprintf(stderr,"Negotiated TLS 1.2 (cipher suite 0x%04x%s%s%s)\n",cipher_suite,
            is_rsa_kex?" RSA-kex":"", mode==CIPHER_CBC?" CBC":"",
            mode==CIPHER_CHACHA?" ChaCha20":"");
 
@@ -6873,7 +6880,7 @@ static void tls13_derive_hs_keys(tls13_hs_state *st,
     hkdf_expand_label_u(alg,st->c_hs_traffic,"key",NULL,0,st->c_hs_key,st->kl);
     hkdf_expand_label_u(alg,st->c_hs_traffic,"iv",
                         NULL,0,st->c_hs_iv,AES_GCM_NONCE_LEN);
-    if(verbose) printf("Derived handshake traffic keys\n");
+    if(tls_verbose) fprintf(stderr,"Derived handshake traffic keys\n");
 
     secure_zero(early_secret,sizeof(early_secret));
     secure_zero(derived1,sizeof(derived1));
@@ -6914,14 +6921,14 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
 
             switch(mtype) {
                 case 8: /* EncryptedExtensions */
-                    if(verbose) printf("  EncryptedExtensions (%u bytes)\n",
+                    if(tls_verbose) fprintf(stderr,"  EncryptedExtensions (%u bytes)\n",
                            (unsigned)mlen);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
                     break;
                 case 11: /* Certificate */
-                    if(verbose) printf("  Certificate (%u bytes)\n",(unsigned)mlen);
+                    if(tls_verbose) fprintf(stderr,"  Certificate (%u bytes)\n",(unsigned)mlen);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
@@ -6932,7 +6939,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     st->cert_msg_len=mlen;
                     break;
                 case 13: /* CertificateRequest */
-                    if(verbose) printf("  CertificateRequest (%u bytes)\n",
+                    if(tls_verbose) fprintf(stderr,"  CertificateRequest (%u bytes)\n",
                            (unsigned)mlen);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
@@ -6940,10 +6947,10 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     st->got_cert_request=1;
                     break;
                 case 15: { /* CertificateVerify */
-                    if(verbose) printf("  CertificateVerify (%u bytes)\n",
+                    if(tls_verbose) fprintf(stderr,"  CertificateVerify (%u bytes)\n",
                            (unsigned)mlen);
                     if(st->cert_msg){
-                        if(verbose) printf("  Validating certificate chain...\n");
+                        if(tls_verbose) fprintf(stderr,"  Validating certificate chain...\n");
                         if(verify_cert_chain(st->cert_msg,st->cert_msg_len,
                                              st->host,1)<0)
                             die("Certificate verification failed");
@@ -6990,7 +6997,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                         cv_content_len,cv_sig,cv_sig_len,&leaf);
                     if(!cv_ok)
                         die("CertificateVerify signature verification failed");
-                    if(verbose) printf("  CertificateVerify VERIFIED (algo=0x%04x)\n",
+                    if(tls_verbose) fprintf(stderr,"  CertificateVerify VERIFIED (algo=0x%04x)\n",
                            cv_algo);
                     got_cert_verify=1;
 
@@ -7004,7 +7011,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                         die("Server Finished without CertificateVerify");
                     if(mlen!=st->hash_len)
                         die("Server Finished length mismatch");
-                    if(verbose) printf("  Server Finished\n");
+                    if(tls_verbose) fprintf(stderr,"  Server Finished\n");
                     uint8_t fin_key[SHA384_DIGEST_LEN];
                     hkdf_expand_label_u(st->alg,st->s_hs_traffic,"finished",
                         NULL,0,fin_key,st->alg->digest_len);
@@ -7016,7 +7023,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                          th_before_fin,st->alg->digest_len,expected);
                     if(!ct_memeq(expected,hs_buf+pos+4,st->hash_len))
                         die("Server Finished verify failed!");
-                    if(verbose) printf("  Server Finished VERIFIED\n");
+                    if(tls_verbose) fprintf(stderr,"  Server Finished VERIFIED\n");
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
@@ -7024,7 +7031,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     break;
                 }
                 default:
-                    if(verbose) printf("  Unknown handshake msg type %d\n",mtype);
+                    if(tls_verbose) fprintf(stderr,"  Unknown handshake msg type %d\n",mtype);
                     if(st->is_aes256)
                         sha384_update(&st->transcript384,hs_buf+pos,msg_total);
                     else sha256_update(&st->transcript,hs_buf+pos,msg_total);
@@ -7073,7 +7080,7 @@ static void tls13_derive_app_keys(tls13_hs_state *st) {
                         NULL,0,st->c_ap_key,st->kl);
     hkdf_expand_label_u(alg,st->c_ap_traffic,"iv",
                         NULL,0,st->c_ap_iv,AES_GCM_NONCE_LEN);
-    if(verbose) printf("Derived application traffic keys\n");
+    if(tls_verbose) fprintf(stderr,"Derived application traffic keys\n");
 
     secure_zero(derived2,sizeof(derived2));
     secure_zero(master_secret,sizeof(master_secret));
@@ -7097,7 +7104,7 @@ static void tls13_send_client_finished(tls13_hs_state *st) {
             st->c_hs_key,st->c_hs_iv,c_hs_seq++,st->mode,st->kl);
         if(st->is_aes256) sha384_update(&st->transcript384,cert_msg,8);
         else sha256_update(&st->transcript,cert_msg,8);
-        if(verbose) printf("Sent empty client Certificate\n");
+        if(tls_verbose) fprintf(stderr,"Sent empty client Certificate\n");
     }
 
     /* Send client Finished */
@@ -7117,7 +7124,7 @@ static void tls13_send_client_finished(tls13_hs_state *st) {
         encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,fin_msg,4+st->hash_len,
             st->c_hs_key,st->c_hs_iv,c_hs_seq++,st->mode,st->kl);
     }
-    if(verbose) printf("Sent client Finished\n");
+    if(tls_verbose) fprintf(stderr,"Sent client Finished\n");
 }
 
 /* Phase 5: Send HTTP GET, receive response with KeyUpdate support */
@@ -7131,13 +7138,13 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
             st->path,st->host);
         encrypt_and_send(st->fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             st->c_ap_key,st->c_ap_iv,c_ap_seq++,st->mode,st->kl);
-        if(verbose) printf("Sent HTTP GET %s\n\n",st->path);
+        if(tls_verbose) fprintf(stderr,"Sent HTTP GET %s\n\n",st->path);
     }
 
     uint64_t s_ap_seq=0;
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
     int rtype;
-    if(verbose) printf("=== HTTP Response ===\n");
+    if(tls_verbose) fprintf(stderr,"=== HTTP Response ===\n");
     http_output_init();
     for(;;) {
         rtype=tls_read_record(st->fd,rec,&rec_len);
@@ -7194,7 +7201,7 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
     { const uint8_t alert[2]={1,0};
       encrypt_and_send(st->fd,TLS_RT_ALERT,alert,2,st->c_ap_key,st->c_ap_iv,
           c_ap_seq,st->mode,st->kl); }
-    if(verbose) printf("\n=== Done ===\n");
+    if(tls_verbose) fprintf(stderr,"\n=== Done ===\n");
 }
 
 /* ================================================================
@@ -7232,7 +7239,7 @@ static void tls13_handshake(const tls_conn *conn) {
     else if(server_pub_len==X448_KEY_LEN) selected_group=TLS_GROUP_X448;
     else if(server_pub_len==P256_POINT_LEN) selected_group=TLS_GROUP_SECP256R1;
     else selected_group=TLS_GROUP_SECP384R1;
-    if(verbose) printf("Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",
+    if(tls_verbose) fprintf(stderr,"Received ServerHello (TLS 1.3, cipher=0x%04x, group=0x%04x)\n",
         cipher_suite,selected_group);
 
     /* Compute shared secret */
@@ -7259,7 +7266,7 @@ static void tls13_handshake(const tls_conn *conn) {
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(x25519_priv,sizeof(x25519_priv));
     secure_zero(x448_priv,sizeof(x448_priv));
-    if(verbose) printf("Computed ECDHE shared secret (%zu bytes)\n",shared_len);
+    if(tls_verbose) fprintf(stderr,"Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Phase 1: Derive handshake keys */
     tls13_derive_hs_keys(&st, shared, shared_len);
@@ -7302,7 +7309,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
                                sha384_ctx *transcript384,
                                size_t *sh_leftover) {
     uint32_t sh_msg_len=4+GET24(rec+1);
-    if(verbose) printf("Received HelloRetryRequest (cipher=0x%04x)\n",*cipher_suite);
+    if(tls_verbose) fprintf(stderr,"Received HelloRetryRequest (cipher=0x%04x)\n",*cipher_suite);
 
     /* Parse HRR extensions to find selected group */
     uint16_t hrr_group=0;
@@ -7328,7 +7335,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_X448
        && hrr_group!=TLS_GROUP_SECP256R1 && hrr_group!=TLS_GROUP_SECP384R1)
         die("HRR selected unsupported group");
-    if(verbose) printf("  HRR selected group 0x%04x\n",hrr_group);
+    if(tls_verbose) fprintf(stderr,"  HRR selected group 0x%04x\n",hrr_group);
 
     int hrr_aes256 = (*cipher_suite == TLS_AES_256_GCM_SHA384);
 
@@ -7363,7 +7370,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
         sha256_update(transcript,ch,ch_len);
 
     tls_send_record(fd,TLS_RT_HANDSHAKE,ch,ch_len);
-    if(verbose) printf("Sent new ClientHello with group 0x%04x (%zu bytes)\n",hrr_group,ch_len);
+    if(tls_verbose) fprintf(stderr,"Sent new ClientHello with group 0x%04x (%zu bytes)\n",hrr_group,ch_len);
 
     /* Read real ServerHello (skip CCS if present) */
     int rtype=tls_read_record(fd,rec,rec_len);
@@ -7385,15 +7392,15 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     else
         sha256_update(transcript,rec,sh_msg_len);
     *sh_leftover=*rec_len>sh_msg_len ? *rec_len-sh_msg_len : 0;
-    if(verbose) printf("Received real ServerHello after HRR (cipher=0x%04x)\n",*cipher_suite);
+    if(tls_verbose) fprintf(stderr,"Received real ServerHello after HRR (cipher=0x%04x)\n",*cipher_suite);
 }
 
 /* Main TLS handshake + HTTP GET */
-static void do_https_get(const char *host, int port, const char *path) {
+uint8_t *do_https_get(const char *host, int port, const char *path, size_t *out_len) {
     load_trust_store("trust_store");
 
     int fd=tcp_connect(host,port);
-    if(verbose) printf("Connected to %s:%d\n",host,port);
+    if(tls_verbose) fprintf(stderr,"Connected to %s:%d\n",host,port);
 
     /* Generate ECDHE keypairs for all groups */
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
@@ -7404,7 +7411,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     x25519_keygen(x25519_priv,x25519_pub_key);
     uint8_t x448_priv[X448_KEY_LEN], x448_pub_key[X448_KEY_LEN];
     x448_keygen(x448_priv,x448_pub_key);
-    if(verbose) printf("Generated ECDHE keypairs (X25519 + X448 + P-256 + P-384)\n");
+    if(tls_verbose) fprintf(stderr,"Generated ECDHE keypairs (X25519 + X448 + P-256 + P-384)\n");
 
     /* Build & send ClientHello */
     uint8_t ch[CH_BUF_SIZE];
@@ -7429,7 +7436,7 @@ static void do_https_get(const char *host, int port, const char *path) {
     sha384_init(&transcript384);
     sha256_update(&transcript,ch,ch_len);
     sha384_update(&transcript384,ch,ch_len);
-    if(verbose) printf("Sent ClientHello (%zu bytes)\n",ch_len);
+    if(tls_verbose) fprintf(stderr,"Sent ClientHello (%zu bytes)\n",ch_len);
 
     /* Read ServerHello */
     uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
@@ -7508,147 +7515,7 @@ static void do_https_get(const char *host, int port, const char *path) {
 
     /* Clear connection context secrets */
     secure_zero(&conn, sizeof(conn));
-}
 
-
-/* ================================================================
- * Self-tests: RFC test vectors for Ed25519, X448, Ed448
- * ================================================================ */
-static int hex2bin(const char *hex, uint8_t *bin, size_t bin_len) {
-    for(size_t i=0;i<bin_len;i++){
-        unsigned hi,lo;
-        if(sscanf(hex+2*i,"%1x%1x",&hi,&lo)!=2) return -1;
-        bin[i]=(uint8_t)((hi<<4)|lo);
-    }
-    return 0;
-}
-
-static int run_self_tests(void) {
-    int pass=0,fail=0;
-
-    /* ---- Ed25519 RFC 8032 §7.1 Test Vector 1: empty message ---- */
-    {
-        uint8_t sk[32],pk[32],sig[64];
-        hex2bin("9d61b19deffd5a60ba844af492ec2cc4"
-                "4449c5697b326919703bac031cae7f60",sk,32);
-        hex2bin("d75a980182b10ab7d54bfed3c964073a"
-                "0ee172f3daa62325af021a68f707511a",pk,32);
-        hex2bin("e5564300c360ac729086e2cc806e828a"
-                "84877f1eb8e5d974d873e06522490155"
-                "5fb8821590a33bacc61e39701cf9b46b"
-                "d25bf5f0595bbe24655141438e7a100b",sig,64);
-        int ok=ed25519_verify(pk,(const uint8_t*)"",0,sig);
-        if(ok){pass++;printf("  Ed25519 test 1 (empty msg): PASS\n");}
-        else{fail++;printf("  Ed25519 test 1 (empty msg): FAIL\n");}
-    }
-    /* ---- Ed25519 RFC 8032 §7.1 Test Vector 2: 1-byte message (0x72) ---- */
-    {
-        uint8_t pk[32],sig[64];
-        hex2bin("3d4017c3e843895a92b70aa74d1b7ebc"
-                "9c982ccf2ec4968cc0cd55f12af4660c",pk,32);
-        hex2bin("92a009a9f0d4cab8720e820b5f642540"
-                "a2b27b5416503f8fb3762223ebdb69da"
-                "085ac1e43e15996e458f3613d0f11d8c"
-                "387b2eaeb4302aeeb00d291612bb0c00",sig,64);
-        const uint8_t msg[1]={0x72};
-        int ok=ed25519_verify(pk,msg,1,sig);
-        if(ok){pass++;printf("  Ed25519 test 2 (1-byte):    PASS\n");}
-        else{fail++;printf("  Ed25519 test 2 (1-byte):    FAIL\n");}
-    }
-
-    /* ---- X448 RFC 7748 §6.2: Alice and Bob DH ---- */
-    {
-        uint8_t alice_priv[56],alice_pub[56],bob_priv[56],bob_pub[56],shared[56],expected_shared[56];
-        hex2bin("9a8f4925d1519f5775cf46971028b71b"
-                "44c869ef7f811f2e980069a5b4b6ff84"
-                "c06991f5ecc68a4f9c8c8e40c0b55607"
-                "3ebf96a2a94e5340",alice_priv,56);
-        hex2bin("07f32d8adc627f9789eaffb9dfd11fb6"
-                "b0297fc419bfd414e16127f1e1cfd847"
-                "bb6915ea4c0a20ed07dc3a1994685770"
-                "45867de21a4e4c18",alice_pub,56);
-        hex2bin("1c306a7ac2a0e2e0990b294470cba339"
-                "e6453772b075811d8fad0d1d6927c120"
-                "bb5ee8972b0d3e21374c9c921b09d1b0"
-                "366f10106a0f6a54",bob_priv,56);
-        hex2bin("1854a97a9c7f7cc2e5bb27297b8018b6"
-                "3655fae71e230c989331d79d4912f475"
-                "89c0d8ec320665c7f937fde0dcc9d7d4"
-                "3294cdf11f8855d5",bob_pub,56);
-        hex2bin("556634e295417314cc1fa25fcd60735a"
-                "4044bc7fbda74964eb5fd76d9ac0242e"
-                "0cf958b4841cfb7f1d2f6a6dafe4d26e"
-                "a16cbc0456048db3",expected_shared,56);
-
-        /* Verify Alice's public key = scalar_mult(alice_priv, basepoint) */
-        uint8_t computed_pub[56];
-        uint8_t basepoint[56]={5};
-        x448_scalar_mult(alice_priv,basepoint,computed_pub);
-        int pub_ok = memcmp(computed_pub,alice_pub,56)==0;
-
-        /* Verify shared secret = scalar_mult(alice_priv, bob_pub) */
-        x448_shared_secret(alice_priv,bob_pub,shared);
-        int shared_ok = memcmp(shared,expected_shared,56)==0;
-
-        if(pub_ok&&shared_ok){pass++;printf("  X448 DH test (RFC 7748):    PASS\n");}
-        else{fail++;printf("  X448 DH test (RFC 7748):    FAIL (pub=%d shared=%d)\n",pub_ok,shared_ok);}
-    }
-
-    /* ---- Ed448 RFC 8032 §7.4 Test Vector 1: empty message ---- */
-    {
-        uint8_t pk[57],sig[114];
-        hex2bin("5fd7449b59b461fd2ce787ec616ad46a"
-                "1da1342485a70e1f8a0ea75d80e96778"
-                "edf124769b46c7061bd6783df1e50f6c"
-                "d1fa1abeafe8256180",pk,57);
-        hex2bin("533a37f6bbe457251f023c0d88f976ae"
-                "2dfb504a843e34d2074fd823d41a591f"
-                "2b233f034f628281f2fd7a22ddd47d78"
-                "28c59bd0a21bfd39"
-                "80ff0d2028d4b18a9df63e006c5d1c2d"
-                "345b925d8dc00b4104852db99ac5c7cd"
-                "da8530a113a0f4dbb61149f05a736326"
-                "8c71d95808ff2e652600",sig,114);
-        int ok=ed448_verify(pk,(const uint8_t*)"",0,sig);
-        if(ok){pass++;printf("  Ed448 test 1 (empty msg):   PASS\n");}
-        else{fail++;printf("  Ed448 test 1 (empty msg):   FAIL\n");}
-    }
-
-    /* ---- SHAKE256 sanity check ---- */
-    {
-        /* SHAKE256("", 32) = 46b9dd2b0ba88d13233b3feb743eeb24
-                              3fcd52ea62b81b82b50c27646ed5762f */
-        uint8_t out[32],expected[32];
-        shake256_ctx c; shake256_init(&c); shake256_final(&c,out,32);
-        hex2bin("46b9dd2b0ba88d13233b3feb743eeb24"
-                "3fcd52ea62b81b82b50c27646ed5762f",expected,32);
-        if(memcmp(out,expected,32)==0){pass++;printf("  SHAKE256 sanity check:      PASS\n");}
-        else{fail++;printf("  SHAKE256 sanity check:      FAIL\n");}
-    }
-
-    printf("Self-tests: %d passed, %d failed\n",pass,fail);
-    return fail>0 ? 1 : 0;
-}
-
-int main(int argc, char **argv) {
-    int arg = 1;
-    if(arg < argc && strcmp(argv[arg], "-v") == 0) { verbose = 1; arg++; }
-    if(arg < argc && strcmp(argv[arg], "-t") == 0) { return run_self_tests(); }
-    if(arg != argc - 1) { fprintf(stderr, "Usage: %s [-v] [-t] https://host[:port]/path\n", argv[0]); return 1; }
-    const char *url = argv[arg];
-    if(strncmp(url, "https://", 8) != 0) die("URL must start with https://");
-    const char *hoststart = url + 8;
-    const char *slash = strchr(hoststart, '/');
-    const char *path = slash ? slash : "/";
-    char host[256];
-    int port = 443;
-    size_t hostlen = slash ? (size_t)(slash - hoststart) : strlen(hoststart);
-    if(hostlen >= sizeof(host)) die("hostname too long");
-    memcpy(host, hoststart, hostlen);
-    host[hostlen] = '\0';
-    /* check for :port */
-    char *colon = strchr(host, ':');
-    if(colon) { port = (int)strtol(colon + 1, NULL, 10); *colon = '\0'; }
-    do_https_get(host, port, path);
-    return 0;
+    *out_len = ho.body_len;
+    return ho.body;
 }

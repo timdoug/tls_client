@@ -7,8 +7,10 @@ dependencies besides POSIX / C stdlib.
 $ make
 python3 gen_ct_logs.py > ct_log_table.inc
 // Extracted 54 logs from 8 operators
-cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_client tls_client.c
-$ ./tls_client https://www.example.com
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_client.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c https_get.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get https_get.o tls_client.o
+$ ./https_get https://www.example.com
 <!doctype html><html lang="en"><head><title>Example Domain</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href="https://iana.org/domains/example">Learn more</a></p></div></body></html>
 $
 ```
@@ -16,14 +18,14 @@ $
 ## Really, don't use this
 
 It's all vibe-coded! A machine has written every line of code though a human
-has manually approved every commit (and I'm no cryptographer). An impressive
-display of current capability but please don't consider this secure in any
-manner. Maybe fun to slot into an old toy where compiling real libraries is
-difficult, but not at all for use in anything more serious...
+has manually directed and approved every commit (and I'm no cryptographer). An
+impressive display of current capability but please don't consider this secure
+in any manner. Maybe fun to slot into an old toy where compiling real libraries
+is difficult, but not at all for use in anything more serious...
 
 ## What's here
 
-~7,600 lines of C99 that implements:
+~7,500 lines of C99 (library) that implements:
 
 **X.509 chain validation**: signature verification, hostname matching (CN +
 SAN), validity periods, basicConstraints / pathLen / keyUsage / EKU
@@ -116,7 +118,7 @@ make test-static    # compile + static analysis only
 make test-sites     # 25 random site connection tests only
 make test-sites-all # all site connection tests (pass + xfail)
 make test-xfail     # expected-failure tests only
-./tls_client -t     # RFC test vectors for Ed25519, X448, Ed448
+./tls_test          # RFC test vectors for Ed25519, X448, Ed448, SHAKE256
 ```
 
 The full suite covers:
