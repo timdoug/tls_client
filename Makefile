@@ -26,7 +26,13 @@ getcerts:
 getlogs:
 	python3 gen_ct_logs.py > ct_log_table.inc
 
+test: tls_client
+	bash test.sh -n 25
+
+fulltest: tls_client
+	bash test.sh
+
 clean:
 	rm -f tls_client
 
-.PHONY: getcerts getlogs clean
+.PHONY: getcerts getlogs test fulltest clean

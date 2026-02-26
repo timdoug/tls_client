@@ -3,6 +3,15 @@ set -euo pipefail
 
 # -- Settings --
 TEST_TIMEOUT=30   # seconds per test (must exceed TLS_READ_TIMEOUT_S in tls_client.c)
+MAX_FAILURES=10   # bail early after this many failures in pass tests
+SAMPLE_SIZE=0     # 0 = run all; >0 = random sample of N pass tests
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n) SAMPLE_SIZE="$2"; shift 2 ;;
+        *)  echo "Usage: $0 [-n sample_size]" >&2; exit 1 ;;
+    esac
+done
 
 # -- Colors --
 RED='\033[0;31m'
@@ -396,11 +405,41 @@ xfail_tests=(
 # ================================================================
 # Run tests expected to PASS
 # ================================================================
-printf "\n${BLD}=== Connection tests (expected pass) ===${RST}\n"
 
+# Random sampling: shuffle indices and take first N
+if [[ $SAMPLE_SIZE -gt 0 && $SAMPLE_SIZE -lt ${#pass_tests[@]} ]]; then
+    indices=($(seq 0 $(( ${#pass_tests[@]} - 1 ))))
+    for (( i=${#indices[@]}-1; i>0; i-- )); do
+        j=$(( RANDOM % (i+1) ))
+        tmp=${indices[$i]}; indices[$i]=${indices[$j]}; indices[$j]=$tmp
+    done
+    indices=("${indices[@]:0:$SAMPLE_SIZE}")
+    # Sort so output order is stable
+    IFS=$'\n' indices=($(sort -n <<<"${indices[*]}")); unset IFS
+    sampled=()
+    for idx in "${indices[@]}"; do
+        sampled+=("${pass_tests[$idx]}")
+    done
+    pass_tests=("${sampled[@]}")
+fi
+
+total_pass_tests=${#pass_tests[@]}
+printf "\n${BLD}=== Connection tests (expected pass) [0/%d] ===${RST}\n" "$total_pass_tests"
+
+i=0
 for entry in "${pass_tests[@]}"; do
+    i=$((i + 1))
     url="${entry%%|*}"
     desc="${entry##*|}"
+
+    # Progress bar
+    pct=$((i * 100 / total_pass_tests))
+    filled=$((pct / 2))
+    empty=$((50 - filled))
+    bar=$(printf "%${filled}s" | tr ' ' '█')$(printf "%${empty}s" | tr ' ' '░')
+    printf "\r\033[1A\033[K${BLD}=== Connection tests (expected pass) [%d/%d] %3d%% ${bar} ===${RST}\n" \
+        "$i" "$total_pass_tests" "$pct"
+
     printf "  %-50s " "$url"
 
     run_with_timeout "$TEST_TIMEOUT" ./tls_client "$url"
@@ -415,6 +454,10 @@ for entry in "${pass_tests[@]}"; do
         printf "${RED}FAIL${RST}  %s  %s\n" "$desc" "$reason"
         fail=$((fail + 1))
         failures+=("$url ($desc): $reason")
+        if [[ $fail -ge $MAX_FAILURES ]]; then
+            printf "\n  ${RED}Bailing early: %d failures reached (max %d)${RST}\n" "$fail" "$MAX_FAILURES"
+            break
+        fi
     fi
 done
 
