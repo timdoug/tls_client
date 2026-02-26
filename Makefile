@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -std=c17 -Wall -Wextra -Werror -pedantic -O2
 
-tls_client: tls_client.c
+tls_client: tls_client.c ct_log_table.inc
 	$(CC) $(CFLAGS) -o $@ $<
 
 getcerts:
@@ -23,7 +23,10 @@ getcerts:
 		'./usr/share/ca-certificates/mozilla/*.crt'; \
 	echo "Installed $$(ls trust_store/*.crt | wc -l | tr -d ' ') certs into trust_store/"
 
+getlogs:
+	python3 gen_ct_logs.py > ct_log_table.inc
+
 clean:
 	rm -f tls_client
 
-.PHONY: getcerts clean
+.PHONY: getcerts getlogs clean

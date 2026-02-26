@@ -21,21 +21,26 @@ difficult, but not at all for use in anything more serious...
 
 ## What's here
 
-~5,700 lines of C17 that implements:
-
-**TLS 1.3** (RFC 8446): full handshake with HelloRetryRequest and downgrade
-detection.
-
-**TLS 1.2** (RFC 5246): ECDHE and static-RSA key exchange, GCM / CBC /
-ChaCha20-Poly1305 record protection.
+~6,000 lines of C17 that implements:
 
 **X.509 chain validation**: signature verification, hostname matching (CN +
 SAN), validity periods, basicConstraints / pathLen / keyUsage / EKU
 enforcement, name constraints, critical-extension rejection, out-of-order chain
 handling.
 
+**Certificate Transparency**: embedded SCT verification (RFC 6962) against
+Chrome's CT log list, enforcing Chrome/Apple SCT policy — 2 SCTs for
+certificates <=180 days, 3 for longer-lived certificates, from >=2 distinct log
+operators.
+
 **AIA chasing**: fetches missing intermediate certificates over HTTP when the
 server sends an incomplete chain.
+
+**TLS 1.3** (RFC 8446): full handshake with HelloRetryRequest and downgrade
+detection.
+
+**TLS 1.2** (RFC 5246): ECDHE and static-RSA key exchange, GCM / CBC /
+ChaCha20-Poly1305 record protection.
 
 ### Cipher suites
 
@@ -65,14 +70,14 @@ ladder, RSA modular exponentiation (64-bit & 32-bit limb paths).
 
 ## What's not implemented
 
-- **Revocation checking**: OCSP, CRL, and CT/SCT are not implemented
-- **Session resumption**: every connection is a full handshake
-- **Client certificates**
-- **TLS 1.0/1.1**
-- **RC4/3DES**
-- **DHE** (ECDHE and static RSA are supported)
-- **0-RTT**
-- **Renegotiation and compression**
+- Revocation checking: OCSP, CRL
+- Session resumption (every connection is a full handshake)
+- Client certificates
+- TLS 1.0/1.1
+- RC4/3DES
+- DHE
+- 0-RTT
+- Renegotiation and compression
 
 ## Trust store
 
@@ -81,6 +86,17 @@ directory. To fetch the latest Mozilla CA bundle from Debian stable:
 
 ```
 make getcerts
+```
+
+## CT log table
+
+The CT log public keys and operator IDs are compiled in from
+`ct_log_table.inc`, generated from Chrome's
+[log_list.json](https://www.gstatic.com/ct/log_list/v3/log_list.json).
+To regenerate:
+
+```
+make getlogs
 ```
 
 ## Testing

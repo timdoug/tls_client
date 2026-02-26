@@ -4,5 +4,9 @@ tls_client_*
 *.plist
 *.dSYM/
 
+# Generated files
+ct_log_table.inc
+__pycache__/
+
 # Trust store (local runtime data)
 trust_store/

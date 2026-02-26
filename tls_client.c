@@ -2838,6 +2838,10 @@ static const uint8_t OID_AIA[]         = {0x2B,0x06,0x01,0x05,0x05,0x07,0x01,0x0
 static const uint8_t OID_CA_ISSUERS[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x30,0x02};
 static const uint8_t OID_NAME_CONSTRAINTS[]   = {0x55,0x1D,0x1E};
 static const uint8_t OID_POLICY_CONSTRAINTS[] = {0x55,0x1D,0x24};
+static const uint8_t OID_SCT_LIST[] = {0x2B,0x06,0x01,0x04,0x01,0xD6,0x79,0x02,0x04,0x02};
+
+#include "ct_log_table.inc"
+
 /* ================================================================
  * X.509 Certificate Parser
  * ================================================================ */
@@ -2862,6 +2866,8 @@ typedef struct {
     int eku_server_auth;                            /* EKU contains serverAuth */
     int version;                                    /* 0=v1, 1=v2, 2=v3 */
     uint16_t key_usage;                             /* keyUsage bit flags (0 = not present) */
+    const uint8_t *sct_list; size_t sct_list_len;   /* SCT list extension value */
+    const uint8_t *spki; size_t spki_len;            /* raw DER SubjectPublicKeyInfo */
 } x509_cert;
 
 static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8_t *tbs_end) {
@@ -2990,6 +2996,11 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
         } else if(oid_eq(eoid,len,OID_POLICY_CONSTRAINTS,sizeof(OID_POLICY_CONSTRAINTS))){
             /* Recognized to avoid critical-extension rejection; not enforced */
             (void)0;
+        } else if(oid_eq(eoid,len,OID_SCT_LIST,sizeof(OID_SCT_LIST))){
+            const uint8_t *rest=eoid+len;
+            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(oct&&tag==0x04){cert->sct_list=oct;cert->sct_list_len=len;}
         } else {
             /* RFC 5280 §4.2: reject unrecognized critical extensions */
             const uint8_t *rest=eoid+len;
@@ -3061,10 +3072,13 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     cert->subject_len=(size_t)(tp-subj_start);
 
     /* SubjectPublicKeyInfo */
+    const uint8_t *spki_start=tp;
     const uint8_t *spki_val=der_expect(tp,tbs_end,0x30,&len);
     if(!spki_val) return -1;
     const uint8_t *spki_end=spki_val+len;
     tp=spki_end;
+    cert->spki=spki_start;
+    cert->spki_len=(size_t)(spki_end-spki_start);
 
     /* AlgorithmIdentifier inside SPKI */
     const uint8_t *alg_val=der_expect(spki_val,spki_end,0x30,&len);
@@ -3205,6 +3219,7 @@ typedef struct {
     uint8_t pubkey[128]; size_t pubkey_len;   /* EC point */
     uint8_t rsa_n[520]; size_t rsa_n_len;     /* RSA modulus */
     uint8_t rsa_e[16]; size_t rsa_e_len;      /* RSA exponent */
+    uint8_t spki_hash[32];                    /* SHA-256 of DER SPKI, for CT issuer_key_hash */
 } trust_cert;
 
 static trust_cert trust_store[MAX_TRUST_CERTS];
@@ -3249,6 +3264,8 @@ static void load_trust_store(const char *dir) {
                 tc->rsa_e_len=cert.rsa_e_len;
             }
         }
+        if(cert.spki && cert.spki_len > 0)
+            sha256_hash(cert.spki, cert.spki_len, tc->spki_hash);
         trust_store_count++;
     }
     closedir(d);
@@ -3535,6 +3552,305 @@ static int check_name_constraints(const x509_cert *ca, const x509_cert *leaf,
 }
 
 /* ================================================================
+ * Certificate Transparency (RFC 6962) — SCT Verification
+ * ================================================================ */
+
+static const ct_log_entry *ct_find_log(const uint8_t log_id[32]) {
+    for(int i=0;i<CT_LOG_COUNT;i++)
+        if(memcmp(ct_logs[i].log_id,log_id,32)==0) return &ct_logs[i];
+    return NULL;
+}
+
+/* DER length encoding helpers */
+static size_t der_length_size(size_t len) {
+    if(len<0x80) return 1;
+    if(len<0x100) return 2;
+    if(len<0x10000) return 3;
+    return 4;
+}
+
+static size_t der_write_length(uint8_t *out, size_t len) {
+    if(len<0x80){ out[0]=(uint8_t)len; return 1; }
+    if(len<0x100){ out[0]=0x81; out[1]=(uint8_t)len; return 2; }
+    if(len<0x10000){ out[0]=0x82; out[1]=(uint8_t)(len>>8); out[2]=(uint8_t)len; return 3; }
+    out[0]=0x83; out[1]=(uint8_t)(len>>16); out[2]=(uint8_t)(len>>8); out[3]=(uint8_t)len; return 4;
+}
+
+/* Reconstruct the precertificate TBSCertificate by removing the SCT list extension.
+   CT logs sign a version of TBS *without* the SCT extension (entry_type=1 precert). */
+static int ct_reconstruct_precert_tbs(const uint8_t *tbs, size_t tbs_len,
+                                       uint8_t *out, size_t out_size, size_t *out_len) {
+    uint8_t tag; size_t len;
+
+    /* tbs points to the TBS SEQUENCE value start (after outer tag+len) —
+       but we actually receive the full TBS with its SEQUENCE wrapper.
+       Parse the outer SEQUENCE. */
+    const uint8_t *tbs_end = tbs + tbs_len;
+    const uint8_t *val = der_read_tl(tbs, tbs_end, &tag, &len);
+    if(!val || tag != 0x30) return -1;
+    const uint8_t *seq_end = val + len;
+
+    /* Walk through TBS fields to find the [3] extensions wrapper */
+    const uint8_t *tp = val;
+
+    /* version [0] EXPLICIT */
+    if(tp < seq_end && *tp == 0xA0) { tp = der_skip(tp, seq_end); if(!tp) return -1; }
+    /* serialNumber */
+    tp = der_skip(tp, seq_end); if(!tp) return -1;
+    /* signature AlgorithmIdentifier */
+    tp = der_skip(tp, seq_end); if(!tp) return -1;
+    /* issuer Name */
+    tp = der_skip(tp, seq_end); if(!tp) return -1;
+    /* validity */
+    tp = der_skip(tp, seq_end); if(!tp) return -1;
+    /* subject Name */
+    tp = der_skip(tp, seq_end); if(!tp) return -1;
+    /* subjectPublicKeyInfo */
+    tp = der_skip(tp, seq_end); if(!tp) return -1;
+    /* optional issuerUniqueID [1], subjectUniqueID [2] */
+    while(tp < seq_end && (*tp == 0x81 || *tp == 0x82))
+        { tp = der_skip(tp, seq_end); if(!tp) return -1; }
+
+    /* Now tp should point to [3] EXPLICIT extensions */
+    if(tp >= seq_end || *tp != 0xA3) return -1;
+
+    const uint8_t *a3_start = tp;
+    const uint8_t *a3_val = der_read_tl(tp, seq_end, &tag, &len);
+    if(!a3_val || tag != 0xA3) return -1;
+
+    /* extensions SEQUENCE */
+    const uint8_t *exts_val = der_expect(a3_val, a3_val + len, 0x30, &len);
+    if(!exts_val) return -1;
+    const uint8_t *exts_end = exts_val + len;
+
+    /* Find the SCT extension and record its byte range */
+    const uint8_t *sct_ext_start = NULL;
+    const uint8_t *sct_ext_end_ptr = NULL;
+    const uint8_t *ep = exts_val;
+    while(ep < exts_end) {
+        const uint8_t *ext_start = ep;
+        const uint8_t *ext_val = der_expect(ep, exts_end, 0x30, &len);
+        if(!ext_val) return -1;
+        const uint8_t *ext_end2 = ext_val + len;
+        /* Read OID */
+        size_t oid_len;
+        const uint8_t *eoid = der_expect(ext_val, ext_end2, 0x06, &oid_len);
+        if(eoid && oid_eq(eoid, oid_len, OID_SCT_LIST, sizeof(OID_SCT_LIST))) {
+            sct_ext_start = ext_start;
+            sct_ext_end_ptr = ext_end2;
+        }
+        ep = ext_end2;
+    }
+
+    if(!sct_ext_start) return -1; /* no SCT extension found */
+
+    size_t sct_ext_len = (size_t)(sct_ext_end_ptr - sct_ext_start);
+
+    /* Compute new lengths */
+    size_t old_exts_content_len = (size_t)(exts_end - exts_val);
+    size_t new_exts_content_len = old_exts_content_len - sct_ext_len;
+    size_t new_exts_seq_len = 1 + der_length_size(new_exts_content_len) + new_exts_content_len;
+    size_t new_a3_content_len = new_exts_seq_len;
+
+    /* Content before [3] wrapper */
+    size_t prefix_len = (size_t)(a3_start - val);
+    size_t new_tbs_content_len = prefix_len + 1 + der_length_size(new_a3_content_len) + new_a3_content_len;
+
+    size_t total = 1 + der_length_size(new_tbs_content_len) + new_tbs_content_len;
+    if(total > out_size) return -1;
+
+    uint8_t *wp = out;
+
+    /* TBS SEQUENCE tag + new length */
+    *wp++ = 0x30;
+    wp += der_write_length(wp, new_tbs_content_len);
+
+    /* Copy everything before [3] */
+    memcpy(wp, val, prefix_len);
+    wp += prefix_len;
+
+    /* [3] EXPLICIT tag + new length */
+    *wp++ = 0xA3;
+    wp += der_write_length(wp, new_a3_content_len);
+
+    /* Extensions SEQUENCE tag + new length */
+    *wp++ = 0x30;
+    wp += der_write_length(wp, new_exts_content_len);
+
+    /* Copy extensions content, skipping the SCT extension */
+    size_t before_sct = (size_t)(sct_ext_start - exts_val);
+    if(before_sct > 0) { memcpy(wp, exts_val, before_sct); wp += before_sct; }
+    size_t after_sct = (size_t)(exts_end - sct_ext_end_ptr);
+    if(after_sct > 0) { memcpy(wp, sct_ext_end_ptr, after_sct); wp += after_sct; }
+
+    *out_len = (size_t)(wp - out);
+    return 0;
+}
+
+/* Verify a single SCT against a precertificate TBS */
+static int ct_verify_sct(const uint8_t *precert_tbs, size_t precert_tbs_len,
+                          const uint8_t *issuer_key_hash,
+                          const uint8_t *sct, size_t sct_len) {
+    if(sct_len < 47) return 0; /* minimum: 1+32+8+2+1+1+2 = 47 */
+    const uint8_t *sp = sct;
+    const uint8_t *sct_end = sct + sct_len;
+
+    uint8_t version = *sp++;
+    if(version != 0) return 0; /* only v1 */
+
+    const uint8_t *log_id = sp; sp += 32;
+    const uint8_t *timestamp = sp; sp += 8;
+
+    /* extensions */
+    if(sp + 2 > sct_end) return 0;
+    uint16_t ext_len = (uint16_t)((sp[0]<<8)|sp[1]); sp += 2;
+    const uint8_t *ext_data = sp;
+    if(sp + ext_len > sct_end) return 0;
+    sp += ext_len;
+
+    /* hash_alg + sig_alg */
+    if(sp + 2 > sct_end) return 0;
+    uint8_t hash_alg = *sp++;
+    uint8_t sig_alg = *sp++;
+    if(hash_alg != 4 || sig_alg != 3) return 0; /* SHA-256 + ECDSA only */
+
+    /* signature */
+    if(sp + 2 > sct_end) return 0;
+    uint16_t sig_len2 = (uint16_t)((sp[0]<<8)|sp[1]); sp += 2;
+    if(sp + sig_len2 > sct_end) return 0;
+    const uint8_t *sig = sp;
+
+    /* Look up log */
+    const ct_log_entry *log = ct_find_log(log_id);
+    if(!log) return 0;
+
+    /* Build signed data: version(1) + sig_type(1) + timestamp(8) +
+       entry_type(2) + issuer_key_hash(32) + tbs_len(3) + tbs + ext_len(2) + ext */
+    size_t signed_data_len = 1 + 1 + 8 + 2 + 32 + 3 + precert_tbs_len + 2 + ext_len;
+    uint8_t *signed_data = malloc(signed_data_len);
+    if(!signed_data) return 0;
+
+    uint8_t *wp = signed_data;
+    *wp++ = 0x00; /* version v1 */
+    *wp++ = 0x00; /* signature_type = certificate_timestamp */
+    memcpy(wp, timestamp, 8); wp += 8;
+    *wp++ = 0x00; *wp++ = 0x01; /* entry_type = precert_entry */
+    memcpy(wp, issuer_key_hash, 32); wp += 32;
+    /* tbs_length is 3 bytes (uint24) */
+    *wp++ = (uint8_t)(precert_tbs_len >> 16);
+    *wp++ = (uint8_t)(precert_tbs_len >> 8);
+    *wp++ = (uint8_t)(precert_tbs_len);
+    memcpy(wp, precert_tbs, precert_tbs_len); wp += precert_tbs_len;
+    *wp++ = (uint8_t)(ext_len >> 8);
+    *wp++ = (uint8_t)(ext_len);
+    if(ext_len > 0) { memcpy(wp, ext_data, ext_len); wp += ext_len; }
+
+    uint8_t hash[32];
+    sha256_hash(signed_data, signed_data_len, hash);
+    free(signed_data);
+
+    return ecdsa_p256_verify(hash, 32, sig, sig_len2, log->pubkey, 65);
+}
+
+/* Verify all embedded SCTs in a leaf certificate.
+   Chrome/Apple policy: <=180 day cert needs 2 SCTs from >=2 distinct operators,
+   >180 day cert needs 3 SCTs from >=2 distinct operators. */
+static int ct_verify_scts(const x509_cert *leaf, const uint8_t *issuer_key_hash) {
+    if(!leaf->sct_list || leaf->sct_list_len < 2) {
+        fprintf(stderr, "No embedded SCTs in leaf certificate\n");
+        return -1;
+    }
+
+    /* The extension value is an OCTET STRING wrapping a TLS-encoded SCT list.
+       sct_list/sct_list_len point to the OCTET STRING contents (the outer
+       OCTET STRING was already stripped by the extension parser). Inside is
+       another opaque<1..2^16-1> (the TLS SCT list encoding). */
+    const uint8_t *p = leaf->sct_list;
+    const uint8_t *end = p + leaf->sct_list_len;
+
+    /* Inner OCTET STRING wrapping (some certs have double OCTET STRING) */
+    uint8_t tag; size_t ilen;
+    const uint8_t *inner = der_read_tl(p, end, &tag, &ilen);
+    if(inner && tag == 0x04 && inner + ilen <= end) {
+        p = inner;
+        end = inner + ilen;
+    }
+
+    /* TLS-encoded SignedCertificateTimestampList: 2-byte total length */
+    if(end - p < 2) {
+        fprintf(stderr, "SCT list too short\n");
+        return -1;
+    }
+    uint16_t list_len = (uint16_t)((p[0]<<8)|p[1]); p += 2;
+    if(p + list_len > end) list_len = (uint16_t)(end - p);
+
+    const uint8_t *list_end = p + list_len;
+
+    /* Reconstruct precert TBS (remove SCT extension) */
+    uint8_t *precert_tbs = malloc(leaf->tbs_len + 16);
+    if(!precert_tbs) return -1;
+    size_t precert_tbs_len = 0;
+
+    /* tbs/tbs_len in x509_cert includes the full TBS SEQUENCE tag+length+value,
+       so we can pass it directly to the reconstruction function. */
+    if(ct_reconstruct_precert_tbs(leaf->tbs, leaf->tbs_len,
+                                   precert_tbs, leaf->tbs_len + 16, &precert_tbs_len) < 0) {
+        free(precert_tbs);
+        fprintf(stderr, "Failed to reconstruct precert TBS\n");
+        return -1;
+    }
+
+    /* Parse individual SCTs and verify — track total count + distinct operators */
+    uint8_t verified_ops[10]; /* distinct operator IDs seen, up to 10 */
+    int distinct_ops = 0;
+    int total_scts = 0;
+
+    while(p + 2 <= list_end) {
+        uint16_t sct_len = (uint16_t)((p[0]<<8)|p[1]); p += 2;
+        if(p + sct_len > list_end) break;
+
+        if(ct_verify_sct(precert_tbs, precert_tbs_len, issuer_key_hash, p, sct_len)) {
+            total_scts++;
+            /* Look up the log to get operator_id */
+            const uint8_t *this_id = p + 1; /* skip version byte to get log_id */
+            const ct_log_entry *log = ct_find_log(this_id);
+            if(log) {
+                int dup = 0;
+                for(int k = 0; k < distinct_ops; k++) {
+                    if(verified_ops[k] == log->operator_id) { dup = 1; break; }
+                }
+                if(!dup && distinct_ops < 10) {
+                    verified_ops[distinct_ops] = log->operator_id;
+                    distinct_ops++;
+                }
+            }
+        }
+        p += sct_len;
+    }
+
+    free(precert_tbs);
+
+    /* Chrome/Apple policy: require more SCTs for longer-lived certs,
+       and always require SCTs from at least 2 distinct operators */
+    int lifetime_days = (int)((leaf->not_after - leaf->not_before) / 86400);
+    int required = (lifetime_days <= 180) ? 2 : 3;
+
+    if(verbose) printf("    CT: %d valid SCT(s) from %d distinct operator(s) (%d SCTs required, 2 operators required)\n",
+                       total_scts, distinct_ops, required);
+
+    if(total_scts < required) {
+        fprintf(stderr, "CT: only %d valid SCT(s), need at least %d\n", total_scts, required);
+        return -1;
+    }
+    if(distinct_ops < 2) {
+        fprintf(stderr, "CT: SCTs from only %d operator(s), need at least 2 distinct\n", distinct_ops);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ================================================================
  * Certificate Chain Validation
  * ================================================================ */
 static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
@@ -3627,6 +3943,19 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
                                  trust_store[j].rsa_e,trust_store[j].rsa_e_len)){
                 if(verbose) printf("    Certificate %d root signature verified\n",i);
                 if(verbose) printf("    Certificate chain verified successfully!\n");
+                {
+                    uint8_t ikh[32];
+                    if(i==0)
+                        memcpy(ikh, trust_store[j].spki_hash, 32);
+                    else
+                        sha256_hash(certs[1].spki, certs[1].spki_len, ikh);
+                    if(certs[0].sct_list) {
+                        if(ct_verify_scts(&certs[0], ikh) < 0) return -1;
+                    } else {
+                        fprintf(stderr, "No embedded SCTs in leaf certificate\n");
+                        return -1;
+                    }
+                }
                 return 0;
             }
         }
