@@ -425,6 +425,7 @@ fi
 
 total_pass_tests=${#pass_tests[@]}
 printf "\n${BLD}=== Connection tests (expected pass) [0/%d] ===${RST}\n" "$total_pass_tests"
+printf "\n"  # placeholder line for domain result (overwritten on first iteration)
 
 i=0
 for entry in "${pass_tests[@]}"; do
@@ -432,15 +433,14 @@ for entry in "${pass_tests[@]}"; do
     url="${entry%%|*}"
     desc="${entry##*|}"
 
-    # Progress bar
+    # Progress bar — go up 2 lines to overwrite bar + previous result
     pct=$((i * 100 / total_pass_tests))
     filled=$((pct / 2))
     empty=$((50 - filled))
     bar=$(printf "%${filled}s" | tr ' ' '█')$(printf "%${empty}s" | tr ' ' '░')
-    printf "\r\033[1A\033[K${BLD}=== Connection tests (expected pass) [%d/%d] %3d%% ${bar} ===${RST}\n" \
+    printf "\033[2A\r\033[K${BLD}=== Connection tests (expected pass) [%d/%d] %3d%% ${bar} ===${RST}\n" \
         "$i" "$total_pass_tests" "$pct"
-
-    printf "  %-50s " "$url"
+    printf "\033[K  %-50s " "$url"
 
     run_with_timeout "$TEST_TIMEOUT" ./tls_client "$url"
     rc=$TIMEOUT_RC
