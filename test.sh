@@ -30,25 +30,25 @@ xfail_pass_list=()
 printf "${BLD}=== Compile ===${RST}\n"
 
 printf "  cc  ... "
-cc -std=c17 -Wall -Wextra -Werror -pedantic -O2 -o tls_client tls_client.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_client tls_client.c
 printf "${GRN}ok${RST}\n"
 
 printf "  gcc-15 ... "
-gcc-15 -std=c17 -Wall -Wextra -Werror -pedantic -O2 -o tls_client_gcc tls_client.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_client_gcc tls_client.c
 rm -f tls_client_gcc
 printf "${GRN}ok${RST}\n"
 
 printf "\n${BLD}=== Static analysis ===${RST}\n"
 
 printf "  cppcheck ... "
-if cppcheck --error-exitcode=1 --quiet --std=c11 tls_client.c 2>&1; then
+if cppcheck --error-exitcode=1 --quiet --std=c99 tls_client.c 2>&1; then
     printf "${GRN}ok${RST}\n"
 else
     printf "${YLW}warnings (non-fatal)${RST}\n"
 fi
 
 printf "  clang --analyze ... "
-if clang --analyze -std=c17 -Weverything tls_client.c 2>&1 | head -20; then
+if clang --analyze -std=c99 -Weverything tls_client.c 2>&1 | head -20; then
     printf "${GRN}ok${RST}\n"
 else
     printf "${YLW}warnings (non-fatal)${RST}\n"

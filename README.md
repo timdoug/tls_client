@@ -7,7 +7,7 @@ dependencies besides POSIX / C stdlib.
 $ make
 python3 gen_ct_logs.py > ct_log_table.inc
 // Extracted 54 logs from 8 operators
-cc -std=c17 -Wall -Wextra -Werror -pedantic -O2 -o tls_client tls_client.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_client tls_client.c
 $ ./tls_client https://www.example.com
 <!doctype html><html lang="en"><head><title>Example Domain</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href="https://iana.org/domains/example">Learn more</a></p></div></body></html>
 $
@@ -23,7 +23,7 @@ difficult, but not at all for use in anything more serious...
 
 ## What's here
 
-~6,000 lines of C17 that implements:
+~6,000 lines of C99 that implements:
 
 **X.509 chain validation**: signature verification, hostname matching (CN +
 SAN), validity periods, basicConstraints / pathLen / keyUsage / EKU
@@ -101,18 +101,21 @@ Delete `ct_log_table.inc` and re-run `make` to refresh.
 ## Testing
 
 ```
-bash test.sh
+make test      # compile, static analysis, 25 random domains + all xfail
+make fulltest  # compile, static analysis, all 276 domains + all xfail
 ```
 
-Runs the compiler, static analysis (cppcheck + clang --analyze), then 276
+Runs the compiler, static analysis (cppcheck + clang --analyze), then
 expected-pass and 31 expected-fail connection tests covering:
 
 - badssl.com certificate/cipher edge cases + AIA incomplete chain
 - ~250 top domains (Google, Amazon, Cloudflare, banks, CDNs, etc.)
 
+Bails early after 10 failures.
+
 ## Building
 
-Requires a C17 compiler. No dependencies beyond libc and POSIX sockets.
+Requires a C99 compiler. No dependencies beyond libc and POSIX sockets.
 
 ```
 make

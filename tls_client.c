@@ -227,7 +227,7 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define TLS_READ_TIMEOUT_S   10
 #define AIA_READ_TIMEOUT_S   5
 
-_Noreturn static void die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
+static void __attribute__((noreturn)) die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
 
 static void random_bytes(uint8_t *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);

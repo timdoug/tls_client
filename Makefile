@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -std=c17 -Wall -Wextra -Werror -pedantic -O2
+CFLAGS ?= -std=c99 -Wall -Wextra -Werror -pedantic -O2
 
 tls_client: tls_client.c ct_log_table.inc
 	$(CC) $(CFLAGS) -o $@ $<
