@@ -232,6 +232,8 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define REC_BUF_SIZE  32768
 #define HS_BUF_SIZE   65536
 #define REQ_BUF_SIZE  512
+#define RSA_MAX_MOD_BYTES  512       /* 4096-bit RSA */
+#define TLS_MAX_CIPHERTEXT (TLS_MAX_PLAINTEXT + 256)  /* RFC 8446 §5.2 */
 
 /* Socket read timeouts (seconds) */
 #define TLS_READ_TIMEOUT_S   10
@@ -3726,12 +3728,12 @@ static int rsa_pkcs1_verify(const uint8_t *hash, size_t hash_len,
 
     bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
 
-    uint8_t m[512];
+    uint8_t m[RSA_MAX_MOD_BYTES];
     if(mod_len>sizeof(m)) return 0;
     bn_to_bytes(&m_bn,m,mod_len);
 
     if(mod_len < 2+8+1+di_len+hash_len) return 0;
-    uint8_t expected[512];
+    uint8_t expected[RSA_MAX_MOD_BYTES];
     expected[0]=0x00; expected[1]=0x01;
     size_t pad_len=mod_len-3-di_len-hash_len;
     memset(expected+2,0xFF,pad_len);
@@ -3760,7 +3762,7 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
 
     bn_modexp(&m_bn,&s_bn,&e_bn,&n_bn);
 
-    uint8_t em[512];
+    uint8_t em[RSA_MAX_MOD_BYTES];
     if(mod_len>sizeof(em)) return 0;
     bn_to_bytes(&m_bn,em,mod_len);
 
@@ -3775,7 +3777,7 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
     const uint8_t *h=em+db_len;
 
     /* MGF1: dbMask = MGF1(H, db_len) */
-    uint8_t db_mask[512];
+    uint8_t db_mask[RSA_MAX_MOD_BYTES];
     size_t done=0;
     uint32_t counter=0;
     while(done<db_len){
@@ -3792,7 +3794,7 @@ static int rsa_pss_verify(const uint8_t *hash, size_t hash_len,
         done+=use; counter++;
     }
 
-    uint8_t db[512] = {0}; /* zero-init silences false-positive uninitialized-read warning */
+    uint8_t db[RSA_MAX_MOD_BYTES] = {0}; /* zero-init silences false-positive uninitialized-read warning */
     for(size_t i=0;i<db_len;i++) db[i]=masked_db[i]^db_mask[i];
     db[0]&=0x7F;
 
@@ -3821,7 +3823,7 @@ static int rsa_encrypt(const uint8_t *pt, size_t pt_len,
                         const uint8_t *exponent, size_t exp_len,
                         uint8_t *ct) {
     if(mod_len < pt_len+11) return -1; /* need at least 8 bytes padding + 3 overhead */
-    uint8_t em[512];
+    uint8_t em[RSA_MAX_MOD_BYTES];
     if(mod_len>sizeof(em)) return -1;
     em[0]=0x00; em[1]=0x02;
     size_t pad_len=mod_len-pt_len-3;
@@ -4303,7 +4305,7 @@ typedef struct {
     uint8_t subject[512]; size_t subject_len;
     int key_type;
     uint8_t pubkey[128]; size_t pubkey_len;   /* EC point */
-    uint8_t rsa_n[520]; size_t rsa_n_len;     /* RSA modulus */
+    uint8_t rsa_n[RSA_MAX_MOD_BYTES + 8]; size_t rsa_n_len;  /* RSA modulus (+8 for DER overhead) */
     uint8_t rsa_e[16]; size_t rsa_e_len;      /* RSA exponent */
     uint8_t spki_hash[32];                    /* SHA-256 of DER SPKI, for CT issuer_key_hash */
 } trust_cert;
@@ -4456,8 +4458,8 @@ static int http_fetch(const uint8_t *url, size_t url_len, int timeout_s,
             break;
         }
     }
-    if(host_len==0||host_len>=256) return -1;
-    char host[256];
+    if(host_len==0||host_len>=MAX_HOSTNAME) return -1;
+    char host[MAX_HOSTNAME];
     memcpy(host,hp,host_len);
     host[host_len]='\0';
 
@@ -4644,7 +4646,7 @@ static int check_name_constraints(const x509_cert *ca, const x509_cert *leaf,
                 const uint8_t *val=der_read_tl(lp,lend,&tag,&len);
                 if(!val) break;
                 if(tag==0x82&&len>0){ /* dNSName */
-                    char nbuf[256];
+                    char nbuf[MAX_HOSTNAME];
                     size_t nlen=len<sizeof(nbuf)?len:sizeof(nbuf)-1;
                     memcpy(nbuf,val,nlen); nbuf[nlen]='\0';
                     CHECK_NAME(nbuf,nlen);
@@ -5476,7 +5478,7 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
     /* RFC 5246 §6.2.3: max 2^14+2048 for TLS 1.2; RFC 8446 §5.2: max 2^14+256 for TLS 1.3.
        Enforce the stricter TLS 1.3 limit (16640). TLS 1.2 CBC records with compression
        could exceed this but compression is not supported, so 16640 is safe for both. */
-    if(len>16384+256) die("record too large");
+    if(len>TLS_MAX_CIPHERTEXT) die("record too large");
     if(read_exact(fd,out,len)<0) return -1;
     *out_len=len;
     return hdr[0];
@@ -6311,7 +6313,7 @@ typedef struct {
     sha256_ctx transcript;
     sha384_ctx transcript384;
     size_t sh_leftover;
-    uint8_t sh_leftover_data[REC_BUF_SIZE];
+    uint8_t *sh_leftover_data;
 } tls_conn;
 
 /* ================================================================
@@ -6397,12 +6399,14 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                                     const uint8_t server_random[32],
                                     const char *host,
                                     tls12_server_params *out) {
-    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    uint8_t *rec = malloc(REC_BUF_SIZE); if(!rec) die("malloc failed");
+    size_t rec_len;
     int rtype;
-    uint8_t hs12_buf[HS_BUF_SIZE]; size_t hs12_len=0;
+    uint8_t *hs12_buf = malloc(HS_BUF_SIZE); if(!hs12_buf) die("malloc failed");
+    size_t hs12_len=0;
     int got_server_done=0;
 
-    if(leftover_len>0 && leftover_len<=sizeof(hs12_buf)) {
+    if(leftover_len>0 && leftover_len<=HS_BUF_SIZE) {
         memcpy(hs12_buf, leftover, leftover_len);
         hs12_len=leftover_len;
     }
@@ -6411,7 +6415,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
         rtype=tls_read_record(fd,rec,&rec_len);
         if(rtype!=TLS_RT_HANDSHAKE) die("expected handshake record in TLS 1.2");
 
-        if(hs12_len+rec_len>sizeof(hs12_buf)) die("TLS 1.2 handshake buffer overflow");
+        if(hs12_len+rec_len>HS_BUF_SIZE) die("TLS 1.2 handshake buffer overflow");
         memcpy(hs12_buf+hs12_len, rec, rec_len);
         hs12_len+=rec_len;
 
@@ -6532,6 +6536,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
         if(verify_cert_chain(out->cert_msg,out->cert_msg_len,host,0)<0)
             die("Certificate verification failed");
     }
+    free(rec); free(hs12_buf);
 }
 
 /* Phase 2: Send ClientKeyExchange, compute shared secret, derive keys */
@@ -6570,7 +6575,7 @@ static void tls12_do_key_exchange(int fd, sha256_ctx *transcript,
         pms[0]=0x03; pms[1]=0x03;
         random_bytes(pms+2,46);
 
-        uint8_t encrypted_pms[512];
+        uint8_t encrypted_pms[RSA_MAX_MOD_BYTES];
         if(rsa_encrypt(pms,48,leaf.rsa_n,leaf.rsa_n_len,
                        leaf.rsa_e,leaf.rsa_e_len,encrypted_pms)<0)
             die("RSA encrypt failed");
@@ -6695,7 +6700,8 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
     }
 
     /* Receive ChangeCipherSpec */
-    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    uint8_t *rec = malloc(REC_BUF_SIZE); if(!rec) die("malloc failed");
+    size_t rec_len;
     int rtype=tls_read_record(fd,rec,&rec_len);
     if(rtype!=TLS_RT_CCS) die("expected ChangeCipherSpec from server");
     if(tls_verbose) fprintf(stderr,"Received ChangeCipherSpec\n");
@@ -6729,6 +6735,7 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
             die("Server Finished verify failed!");
         if(tls_verbose) fprintf(stderr,"Server Finished VERIFIED\n");
     }
+    free(rec);
 }
 
 /* ---- HTTP response output: strips headers and decodes chunked TE ---- */
@@ -6737,7 +6744,7 @@ static struct {
     int chunked;
     int hex_done;
     size_t chunk_rem;
-    uint8_t hdr[16384];
+    uint8_t hdr[TLS_MAX_PLAINTEXT];
     size_t hdr_len;
     uint8_t *body;      /* accumulated body */
     size_t body_len;    /* current length */
@@ -6858,7 +6865,9 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
     }
 
     uint64_t s12_seq=1;
-    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    uint8_t *rec = malloc(REC_BUF_SIZE); if(!rec) die("malloc failed");
+    uint8_t *pt12 = malloc(REC_BUF_SIZE); if(!pt12) die("malloc failed");
+    size_t rec_len;
     int rtype;
     if(tls_verbose) fprintf(stderr,"=== HTTP Response ===\n");
     http_output_init();
@@ -6866,7 +6875,7 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
         rtype=tls_read_record(fd,rec,&rec_len);
         if(rtype<0) break;
         if(rtype==TLS_RT_APPDATA) {
-            uint8_t pt12[REC_BUF_SIZE]; size_t pt12_len;
+            size_t pt12_len;
             int dec_ok2=tls12_recv_decrypt(rec,rec_len,TLS_RT_APPDATA,
                 mode,tk->s_wk,tk->key_len,tk->s_mk,tk->mac_key_len,
                 tk->mac_alg,tk->s_wiv,s12_seq++,pt12,&pt12_len);
@@ -6887,6 +6896,7 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
       tls12_send_encrypted(fd,TLS_RT_ALERT,alert,2,
           mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
           tk->mac_alg,tk->c_wiv,c12_seq++); }
+    free(rec); free(pt12);
     if(tls_verbose) fprintf(stderr,"\n=== Done ===\n");
 }
 
@@ -7038,10 +7048,13 @@ static void tls13_derive_hs_keys(tls13_hs_state *st,
 
 /* Phase 2: Process encrypted handshake messages until server Finished */
 static void tls13_process_encrypted_hs(tls13_hs_state *st) {
-    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    uint8_t *rec = malloc(REC_BUF_SIZE); if(!rec) die("malloc failed");
+    uint8_t *hs_buf = malloc(HS_BUF_SIZE); if(!hs_buf) die("malloc failed");
+    uint8_t *pt = malloc(REC_BUF_SIZE); if(!pt) die("malloc failed");
+    size_t rec_len;
     int rtype;
     uint64_t s_hs_seq=0;
-    uint8_t hs_buf[HS_BUF_SIZE]; size_t hs_buf_len=0;
+    size_t hs_buf_len=0;
 
     /* May get a ChangeCipherSpec first (compat) */
     rtype=tls_read_record(st->fd,rec,&rec_len);
@@ -7051,13 +7064,13 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
     int got_finished=0, got_cert_verify=st->psk_mode; /* PSK mode: no cert verify needed */
     while(!got_finished) {
         if(rtype!=TLS_RT_APPDATA) die("expected encrypted record");
-        uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
+        size_t pt_len;
         int inner=decrypt_record(rec,rec_len,st->s_hs_key,st->s_hs_iv,
             s_hs_seq++,pt,&pt_len,st->mode,st->kl);
         if(inner!=TLS_RT_HANDSHAKE)
             die("expected handshake inside encrypted record");
 
-        if(hs_buf_len+pt_len>sizeof(hs_buf))
+        if(hs_buf_len+pt_len>HS_BUF_SIZE)
             die("TLS 1.3 handshake buffer overflow");
         memcpy(hs_buf+hs_buf_len,pt,pt_len);
         hs_buf_len+=pt_len;
@@ -7199,6 +7212,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
         if(!got_finished)
             rtype=tls_read_record(st->fd,rec,&rec_len);
     }
+    free(rec); free(hs_buf); free(pt);
 }
 
 /* Phase 3: Derive application traffic keys from master secret */
@@ -7307,7 +7321,9 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
     }
 
     uint64_t s_ap_seq=0;
-    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    uint8_t *rec = malloc(REC_BUF_SIZE); if(!rec) die("malloc failed");
+    uint8_t *pt = malloc(REC_BUF_SIZE); if(!pt) die("malloc failed");
+    size_t rec_len;
     int rtype;
     if(tls_verbose) fprintf(stderr,"=== HTTP Response ===\n");
     http_output_init();
@@ -7315,7 +7331,7 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
         rtype=tls_read_record(st->fd,rec,&rec_len);
         if(rtype<0) break;
         if(rtype==TLS_RT_APPDATA) {
-            uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
+            size_t pt_len;
             int inner=decrypt_record(rec,rec_len,st->s_ap_key,st->s_ap_iv,
                 s_ap_seq++,pt,&pt_len,st->mode,st->kl);
             if(inner==TLS_RT_APPDATA) {
@@ -7411,6 +7427,7 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
     { const uint8_t alert[2]={1,0};
       encrypt_and_send(st->fd,TLS_RT_ALERT,alert,2,st->c_ap_key,st->c_ap_iv,
           c_ap_seq,st->mode,st->kl); }
+    free(rec); free(pt);
     if(tls_verbose) fprintf(stderr,"\n=== Done ===\n");
 }
 
@@ -7574,7 +7591,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
 
     /* Build and send new ClientHello with only the requested group.
        Reuse client_random and session_id per RFC 8446 §4.1.2. */
-    uint8_t ch[CH_BUF_SIZE];
+    uint8_t *ch = malloc(CH_BUF_SIZE); if(!ch) die("malloc failed");
     uint8_t cr_copy[32]; memcpy(cr_copy, client_random, 32);
     size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,x448_pub,host,
         cr_copy,session_id,hrr_group,NULL);
@@ -7607,6 +7624,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
         sha256_update(transcript,rec,sh_msg_len);
     *sh_leftover=*rec_len>sh_msg_len ? *rec_len-sh_msg_len : 0;
     if(tls_verbose) fprintf(stderr,"Received real ServerHello after HRR (cipher=0x%04x)\n",*cipher_suite);
+    free(ch);
 }
 
 /* Main TLS handshake + HTTP GET with optional session resumption */
@@ -7644,7 +7662,7 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     if(tls_verbose) fprintf(stderr,"Generated ECDHE keypairs (X25519 + X448 + P-256 + P-384)\n");
 
     /* Build & send ClientHello */
-    uint8_t ch[CH_BUF_SIZE];
+    uint8_t *ch = malloc(CH_BUF_SIZE); if(!ch) die("malloc failed");
     uint8_t client_random[32];
     size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,host,client_random,NULL,0,sess);
     /* Save session_id from ClientHello for HRR reuse (RFC 8446 §4.1.2) */
@@ -7652,11 +7670,12 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     /* For the record layer, first ClientHello uses version 0x0301.
        Send header+body in one write to avoid middlebox issues with TCP fragmentation. */
     {
-        uint8_t ch_rec[5+CH_BUF_SIZE];
+        uint8_t *ch_rec = malloc(5+CH_BUF_SIZE); if(!ch_rec) die("malloc failed");
         ch_rec[0]=TLS_RT_HANDSHAKE; ch_rec[1]=(TLS_VERSION_10>>8); ch_rec[2]=(TLS_VERSION_10&0xFF);
         PUT16(ch_rec+3,(uint16_t)ch_len);
         memcpy(ch_rec+5,ch,ch_len);
         write_all(fd,ch_rec,5+ch_len);
+        free(ch_rec);
     }
 
     /* Start transcript */
@@ -7669,7 +7688,8 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     if(tls_verbose) fprintf(stderr,"Sent ClientHello (%zu bytes)\n",ch_len);
 
     /* Read ServerHello */
-    uint8_t rec[REC_BUF_SIZE]; size_t rec_len;
+    uint8_t *rec = malloc(REC_BUF_SIZE); if(!rec) die("malloc failed");
+    size_t rec_len;
     int rtype=tls_read_record(fd,rec,&rec_len);
     if(rtype==TLS_RT_ALERT && rec_len>=2) {
         fprintf(stderr,"Alert: level=%d desc=%d\n",rec[0],rec[1]);
@@ -7738,9 +7758,11 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     conn.transcript = transcript;
     conn.transcript384 = transcript384;
     conn.sh_leftover = sh_leftover;
+    conn.sh_leftover_data = malloc(REC_BUF_SIZE); if(!conn.sh_leftover_data) die("malloc failed");
     if(sh_leftover > 0) {
         memcpy(conn.sh_leftover_data, rec + sh_msg_len, sh_leftover);
     }
+    free(ch); free(rec);
 
     /* Clear local secret material */
     secure_zero(p256_priv, sizeof(p256_priv));
@@ -7770,6 +7792,9 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     secure_zero(psk_copy,sizeof(psk_copy));
 
     /* Clear connection context secrets */
+    secure_zero(conn.sh_leftover_data, REC_BUF_SIZE);
+    free(conn.sh_leftover_data);
+    conn.sh_leftover_data = NULL;
     secure_zero(&conn, sizeof(conn));
 
     *out_len = ho.body_len;

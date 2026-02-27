@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
     const char *hoststart = url + 8;
     const char *slash = strchr(hoststart, '/');
     const char *path = slash ? slash : "/";
-    char host[256];
+    char host[MAX_HOSTNAME];
     int port = 443;
     size_t hostlen = slash ? (size_t)(slash - hoststart) : strlen(hoststart);
     if(hostlen >= sizeof(host)) die("hostname too long");
