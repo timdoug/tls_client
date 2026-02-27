@@ -118,7 +118,7 @@ make test-static    # compile + static analysis only
 make test-sites     # 25 random site connection tests only
 make test-sites-all # all site connection tests (pass + xfail)
 make test-xfail     # expected-failure tests only
-./tls_test          # RFC test vectors for Ed25519, X448, Ed448, SHAKE256
+./tls_test          # RFC/NIST test vectors for all crypto primitives (21 tests)
 ```
 
 The full suite covers:

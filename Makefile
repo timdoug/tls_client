@@ -4,12 +4,11 @@ CFLAGS ?= -std=c99 -Wall -Wextra -Werror -pedantic -O2
 https_get: https_get.o tls_client.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-tls_test: tls_test.o tls_client.o
-	$(CC) $(CFLAGS) -o $@ $^
+tls_test: tls_client.c tls_client.h ct_log_table.inc
+	$(CC) $(CFLAGS) -DTLS_TEST -o $@ tls_client.c
 
 tls_client.o: tls_client.c tls_client.h ct_log_table.inc
 https_get.o: https_get.c tls_client.h
-tls_test.o: tls_test.c tls_client.h
 
 getcerts:
 	@set -e; \
