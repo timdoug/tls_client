@@ -53,8 +53,11 @@ test-sites: https_get
 test-xfail: https_get
 	bash test.sh -s xfail
 
+test-resume: https_get
+	bash test.sh -s resume -n 25
+
 clean:
 	rm -f https_get tls_test *.o ct_log_table.inc
 	rm -rf __pycache__
 
-.PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail clean
+.PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail test-resume clean

@@ -5,14 +5,14 @@ set -euo pipefail
 TEST_TIMEOUT=30   # seconds per test (must exceed TLS_READ_TIMEOUT_S in tls_client.c)
 MAX_FAILURES=10   # bail early after this many failures in pass tests
 SAMPLE_SIZE=0     # 0 = run all; >0 = random sample of N pass tests
-SECTIONS=""       # comma-separated: compile,static,pass,xfail,local (empty = all)
+SECTIONS=""       # comma-separated: compile,static,pass,resume,xfail,local (empty = all)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n) SAMPLE_SIZE="$2"; shift 2 ;;
         -s) SECTIONS="$2"; shift 2 ;;
         *)  echo "Usage: $0 [-n sample_size] [-s sections]" >&2
-            echo "  sections: compile,static,pass,xfail,local (default: all)" >&2
+            echo "  sections: compile,static,pass,resume,xfail,local (default: all)" >&2
             exit 1 ;;
     esac
 done
@@ -43,17 +43,15 @@ printf "${BLD}=== Compile ===${RST}\n"
 printf "  cc  ... "
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_client.c
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c https_get.c
-cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_test.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -DTLS_TEST -o tls_test tls_client.c
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get https_get.o tls_client.o
-cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_test tls_test.o tls_client.o
 printf "${GRN}ok${RST}\n"
 
 printf "  gcc-15 ... "
 gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o tls_client_gcc.o tls_client.c
 gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o https_get_gcc.o https_get.c
-gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o tls_test_gcc.o tls_test.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -DTLS_TEST -o tls_test_gcc tls_client.c
 gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get_gcc https_get_gcc.o tls_client_gcc.o
-gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_test_gcc tls_test_gcc.o tls_client_gcc.o
 rm -f https_get_gcc tls_test_gcc *_gcc.o
 printf "${GRN}ok${RST}\n"
 
@@ -66,19 +64,19 @@ if run_section static; then
 printf "\n${BLD}=== Static analysis ===${RST}\n"
 
 printf "  cppcheck ... "
-if cppcheck --error-exitcode=1 --quiet --std=c99 tls_client.c https_get.c tls_test.c 2>&1; then
+if cppcheck --error-exitcode=1 --quiet --std=c99 tls_client.c https_get.c 2>&1; then
     printf "${GRN}ok${RST}\n"
 else
     printf "${YLW}warnings (non-fatal)${RST}\n"
 fi
 
 printf "  clang --analyze ... "
-if clang --analyze -std=c99 -Weverything tls_client.c https_get.c tls_test.c 2>&1 | head -20; then
+if clang --analyze -std=c99 -Weverything tls_client.c https_get.c 2>&1 | head -20; then
     printf "${GRN}ok${RST}\n"
 else
     printf "${YLW}warnings (non-fatal)${RST}\n"
 fi
-rm -f tls_client.plist https_get.plist tls_test.plist
+rm -f tls_client.plist https_get.plist
 fi
 
 # -- Timeout helper (macOS lacks GNU timeout) --
@@ -429,6 +427,9 @@ xfail_tests=(
     "https://client-cert-missing.badssl.com/|client cert required|expected ChangeCipherSpec"
 )
 
+# Save original list before pass section mutates it via sampling
+all_pass_tests=("${pass_tests[@]}")
+
 # ================================================================
 # Run tests expected to PASS
 # ================================================================
@@ -489,6 +490,80 @@ for entry in "${pass_tests[@]}"; do
     fi
 done
 fi # run_section pass
+
+# ================================================================
+# Session resumption tests (PSK-DHE against real servers)
+# ================================================================
+resume_pass=0
+resume_fail=0
+resume_skip=0
+
+if run_section resume; then
+
+# Use the saved original list (pass section may have sampled it down)
+resume_tests=("${all_pass_tests[@]}")
+
+# Random sampling (same logic as pass tests)
+if [[ $SAMPLE_SIZE -gt 0 && $SAMPLE_SIZE -lt ${#resume_tests[@]} ]]; then
+    indices=($(seq 0 $(( ${#resume_tests[@]} - 1 ))))
+    for (( i=${#indices[@]}-1; i>0; i-- )); do
+        j=$(( RANDOM % (i+1) ))
+        tmp=${indices[$i]}; indices[$i]=${indices[$j]}; indices[$j]=$tmp
+    done
+    indices=("${indices[@]:0:$SAMPLE_SIZE}")
+    IFS=$'\n' indices=($(sort -n <<<"${indices[*]}")); unset IFS
+    sampled=()
+    for idx in "${indices[@]}"; do
+        sampled+=("${resume_tests[$idx]}")
+    done
+    resume_tests=("${sampled[@]}")
+fi
+
+total_resume_tests=${#resume_tests[@]}
+printf "\n${BLD}=== Session resumption tests [0/%d] ===${RST}\n" "$total_resume_tests"
+printf "\n"
+
+ri=0
+for entry in "${resume_tests[@]}"; do
+    ri=$((ri + 1))
+    url="${entry%%|*}"
+    desc="${entry##*|}"
+
+    pct=$((ri * 100 / total_resume_tests))
+    filled=$((pct / 2))
+    empty=$((50 - filled))
+    bar=$(printf "%${filled}s" | tr ' ' '█')$(printf "%${empty}s" | tr ' ' '░')
+    printf "\033[2A\r\033[K${BLD}=== Session resumption tests [%d/%d] %3d%% ${bar} ===${RST}\n" \
+        "$ri" "$total_resume_tests" "$pct"
+    printf "\033[K  %-50s " "$url"
+
+    # Double timeout since resumption makes two full connections
+    run_with_timeout $((TEST_TIMEOUT * 2)) ./https_get -v -r "$url"
+    rc=$TIMEOUT_RC
+    output="$TIMEOUT_OUTPUT"
+
+    if [[ $rc -eq 0 ]] && echo "$output" | grep -q "Server accepted PSK resumption"; then
+        printf "${GRN}PASS${RST}  %s\n" "$desc"
+        resume_pass=$((resume_pass + 1))
+    elif [[ $rc -ne 0 ]] && echo "$output" | grep -q "No session ticket received"; then
+        printf "${YLW}SKIP${RST}  %s  (no ticket)\n" "$desc"
+        resume_skip=$((resume_skip + 1))
+    elif [[ $rc -eq 0 ]]; then
+        # Completed OK but server didn't accept PSK (fallback worked)
+        if echo "$output" | grep -q "did not accept PSK"; then
+            printf "${YLW}SKIP${RST}  %s  (PSK rejected)\n" "$desc"
+        else
+            printf "${YLW}SKIP${RST}  %s  (no ticket)\n" "$desc"
+        fi
+        resume_skip=$((resume_skip + 1))
+    else
+        reason=$(echo "$output" | grep 'FATAL:' | head -1 || true)
+        printf "${RED}FAIL${RST}  %s  %s\n" "$desc" "$reason"
+        resume_fail=$((resume_fail + 1))
+        failures+=("resume $url ($desc): $reason")
+    fi
+done
+fi # run_section resume
 
 # ================================================================
 # Run tests expected to FAIL (xfail)
@@ -759,6 +834,76 @@ run_server_test "TLS13 ChaCha20-Poly1305 P-384" \
     "$EC384_KEY" "$EC384_CERT" \
     -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -groups P-384
 
+# --- TLS 1.3 Session Resumption (PSK-DHE) ---
+# Usage: run_server_resume_test <name> <key> <cert> [extra s_server args...]
+run_server_resume_test() {
+    local name="$1" key="$2" cert="$3"
+    shift 3
+
+    printf "  %-50s " "$name"
+
+    wait_for_port_free $LOCAL_PORT
+
+    openssl s_server -key "$key" -cert "$cert" -port $LOCAL_PORT -www \
+        "$@" </dev/null >/dev/null 2>&1 &
+    local srv_pid=$!
+    local_cleanup_pids+=("$srv_pid")
+
+    if wait_for_server $LOCAL_PORT; then
+        local tmpf
+        tmpf=$(mktemp)
+        # -r flag: first request captures ticket, second resumes
+        ./https_get -v -r "https://localhost:$LOCAL_PORT/" >"$tmpf" 2>&1 &
+        local pid=$!
+        ( sleep "$TEST_TIMEOUT"; kill "$pid" 2>/dev/null; true ) &
+        local watcher=$!
+        local rc=0
+        wait "$pid" 2>/dev/null || rc=$?
+        kill "$watcher" 2>/dev/null || true
+        wait "$watcher" 2>/dev/null || true
+        local output
+        output=$(cat "$tmpf")
+        rm -f "$tmpf"
+
+        if [[ $rc -eq 0 ]] && echo "$output" | grep -q "Server accepted PSK resumption" && \
+           echo "$output" | grep -q "Received NewSessionTicket"; then
+            printf "${GRN}PASS${RST}\n"
+            local_pass=$((local_pass + 1))
+        else
+            local reason=""
+            if [[ $rc -ne 0 ]]; then
+                reason=$(echo "$output" | grep 'FATAL:' | head -1 || true)
+            elif ! echo "$output" | grep -q "Received NewSessionTicket"; then
+                reason="no ticket received"
+            elif ! echo "$output" | grep -q "Server accepted PSK resumption"; then
+                reason="PSK not accepted"
+            fi
+            printf "${RED}FAIL${RST}  %s\n" "$reason"
+            local_fail=$((local_fail + 1))
+            failures+=("local $name: $reason")
+        fi
+    else
+        printf "${RED}FAIL${RST}  server failed to start\n"
+        local_fail=$((local_fail + 1))
+        failures+=("local $name: server failed to start")
+    fi
+
+    kill "$srv_pid" 2>/dev/null || true
+    wait "$srv_pid" 2>/dev/null || true
+}
+
+run_server_resume_test "TLS13 Resume AES-128-GCM X25519" \
+    "$RSA_KEY" "$RSA_CERT" \
+    -tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256 -groups X25519
+
+run_server_resume_test "TLS13 Resume AES-256-GCM P-256" \
+    "$EC256_KEY" "$EC256_CERT" \
+    -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -groups P-256
+
+run_server_resume_test "TLS13 Resume ChaCha20-Poly1305 P-384" \
+    "$EC384_KEY" "$EC384_CERT" \
+    -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -groups P-384
+
 # --- TLS 1.2 ECDHE-RSA ---
 run_server_test "TLS12 ECDHE-RSA-AES128-GCM" \
     "$RSA_KEY" "$RSA_CERT" \
@@ -892,6 +1037,10 @@ if run_section pass || run_section xfail; then
     printf "  ${GRN}Pass: %d${RST}   ${RED}Fail: %d${RST}   " "$pass" "$fail"
     printf "Expected-fail: %d   " "$xfail"
     printf "${RED}Unexpected-pass: %d${RST}\n" "$xfail_unexpected_pass"
+fi
+if run_section resume; then
+    printf "  Resumption: ${GRN}%d pass${RST} / ${RED}%d fail${RST} / ${YLW}%d skip${RST}\n" \
+        "$resume_pass" "$resume_fail" "$resume_skip"
 fi
 if run_section local; then
     printf "  Local crypto: ${GRN}%d pass${RST} / ${RED}%d fail${RST} / %d xfail / ${YLW}%d skip${RST}\n" \

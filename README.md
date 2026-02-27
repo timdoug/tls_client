@@ -10,7 +10,7 @@ python3 gen_ct_logs.py > ct_log_table.inc
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_client.c
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c https_get.c
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get https_get.o tls_client.o
-$ ./https_get https://www.example.com
+$ ./https_get https://www.example.com/
 <!doctype html><html lang="en"><head><title>Example Domain</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href="https://iana.org/domains/example">Learn more</a></p></div></body></html>
 $
 ```
@@ -25,7 +25,7 @@ is difficult, but not at all for use in anything more serious...
 
 ## What's here
 
-~7,500 lines of C99 (library) that implements:
+~8,000 lines of C99 (library) that implements:
 
 **X.509 chain validation**: signature verification, hostname matching (CN +
 SAN), validity periods, basicConstraints / pathLen / keyUsage / EKU
@@ -46,8 +46,9 @@ cached to the `crls/` directory and reused until `nextUpdate` expires. Soft-fail
 **AIA chasing**: fetches missing intermediate certificates over HTTP when the
 server sends an incomplete chain.
 
-**TLS 1.3** (RFC 8446): full handshake with HelloRetryRequest and downgrade
-detection.
+**TLS 1.3** (RFC 8446): full handshake with HelloRetryRequest, downgrade
+detection, and session resumption via PSK-DHE (NewSessionTicket + pre_shared_key
+binder computation).
 
 **TLS 1.2** (RFC 5246): ECDHE and static-RSA key exchange, GCM / CBC /
 ChaCha20-Poly1305 record protection.
@@ -85,7 +86,6 @@ RSA modular exponentiation (64-bit & 32-bit limb paths).
 ## What's not implemented
 
 - OCSP stapling / OCSP responder checking
-- Session resumption (every connection is a full handshake)
 - Client certificates
 - Old crypto: TLS 1.0/1.1, RC4/3DES, DHE
 - 0-RTT
@@ -118,6 +118,7 @@ make test-static    # compile + static analysis only
 make test-sites     # 25 random site connection tests only
 make test-sites-all # all site connection tests (pass + xfail)
 make test-xfail     # expected-failure tests only
+make test-resume    # session resumption tests (local + 25 random sites)
 ./tls_test          # RFC/NIST test vectors for all crypto primitives (21 tests)
 ```
 
@@ -130,6 +131,9 @@ The full suite covers:
   every supported cipher suite, key exchange group, and cert type, plus 5
   negative tests (expired cert, wrong hostname, untrusted cert, TLS 1.0/1.1
   rejection)
+- **Session resumption tests**: 3 local `openssl s_server` PSK-DHE resumption
+  tests (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305) plus 25 random
+  real-host resumption tests
 
 Bails early after 10 failures.
 
@@ -138,6 +142,11 @@ and connect with `tls_client`. This exercises all 3 TLS 1.3 ciphers (with
 X25519, P-256, P-384 groups), all 10 TLS 1.2 ECDHE cipher suites (RSA and
 ECDSA auth), all 4 static RSA cipher suites, plus Ed25519/X448/Ed448
 (auto-skipped if OpenSSL lacks support).
+
+The resumption tests verify TLS 1.3 PSK-DHE session resumption by making two
+connections — the first captures a NewSessionTicket, the second resumes with
+it. Servers that don't issue tickets or reject PSK are counted as skips (not
+failures), since both cases are handled gracefully.
 
 ## Building
 

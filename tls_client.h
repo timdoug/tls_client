@@ -5,6 +5,12 @@
 
 extern int tls_verbose;
 
+/* Opaque session type for TLS 1.3 resumption */
+typedef struct tls_session tls_session;
+
 uint8_t *do_https_get(const char *host, int port, const char *path, size_t *out_len);
+uint8_t *do_https_get_session(const char *host, int port, const char *path,
+                               size_t *out_len, tls_session **session);
+void tls_session_free(tls_session *s);
 
 #endif

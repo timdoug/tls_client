@@ -228,7 +228,7 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define TLS_SIG_ED448                  0x0808
 
 /* Buffer sizes */
-#define CH_BUF_SIZE   1024
+#define CH_BUF_SIZE   2048
 #define REC_BUF_SIZE  32768
 #define HS_BUF_SIZE   65536
 #define REQ_BUF_SIZE  512
@@ -5482,6 +5482,24 @@ static int tls_read_record(int fd, uint8_t *out, size_t *out_len) {
     return hdr[0];
 }
 
+/* ================================================================
+ * TLS 1.3 Session Resumption (PSK-DHE)
+ * ================================================================ */
+struct tls_session {
+    uint8_t *ticket;            /* opaque ticket blob */
+    size_t ticket_len;
+    uint32_t ticket_lifetime;   /* seconds */
+    uint32_t ticket_age_add;    /* obfuscation value */
+    uint8_t psk[48];            /* HKDF-Expand-Label(res_master, "resumption", nonce) */
+    size_t psk_len;             /* 32 (SHA-256) or 48 (SHA-384) */
+    uint16_t cipher_suite;      /* must match on resumption */
+    uint64_t timestamp;         /* time() when ticket was received */
+};
+
+void tls_session_free(tls_session *s) {
+    if(s) { secure_zero(s->psk, sizeof(s->psk)); free(s->ticket); free(s); }
+}
+
 /* Build ClientHello for TLS 1.2/1.3.
    only_group: 0 = emit all key shares (initial CH),
                specific group = emit only that group's key share (after HRR)
@@ -5493,7 +5511,8 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
                                   const char *host,
                                   uint8_t client_random[32],
                                   const uint8_t *session_id,
-                                  uint16_t only_group) {
+                                  uint16_t only_group,
+                                  const tls_session *sess) {
     size_t p=0;
     /* Handshake header - fill length later */
     buf[p++]=0x01; /* ClientHello */
@@ -5645,6 +5664,95 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     buf[p++]=0x08;               /* protocol name len = 8 */
     memcpy(buf+p,"http/1.1",8);p+=8;
 
+    /* psk_key_exchange_modes extension (0x002d): always advertise psk_dhe_ke (0x01)
+       so servers know we support resumption and will send NewSessionTicket */
+    buf[p++]=0x00;buf[p++]=0x2d;
+    buf[p++]=0x00;buf[p++]=0x02;
+    buf[p++]=0x01;buf[p++]=0x01;
+
+    /* pre_shared_key extension — MUST be final extension */
+    if(sess && sess->ticket && sess->ticket_len>0) {
+        /* Determine hash length for binder */
+        size_t hash_len=sess->psk_len; /* 32 or 48 */
+        const hash_alg *psk_alg=(hash_len==48)?&SHA384_ALG:&SHA256_ALG;
+
+        /* pre_shared_key extension (0x0029) — MUST be last */
+        /* Compute obfuscated_ticket_age */
+        uint64_t now=(uint64_t)time(NULL);
+        uint32_t age_ms=(uint32_t)((now-sess->timestamp)*1000);
+        uint32_t obf_age=(age_ms+sess->ticket_age_add);
+
+        /* Extension layout:
+           type(2) + ext_len(2) +
+           identities_len(2) + [ identity_len(2) + identity(ticket_len) + obf_age(4) ] +
+           binders_len(2) + [ binder_len(1) + binder(hash_len) ]
+        */
+        size_t identities_inner=2+sess->ticket_len+4;
+        size_t binders_inner=1+hash_len;
+        size_t ext_data_len=2+identities_inner+2+binders_inner;
+
+        buf[p++]=0x00;buf[p++]=0x29; /* extension type */
+        PUT16(buf+p,(uint16_t)ext_data_len);p+=2;
+        /* identities */
+        PUT16(buf+p,(uint16_t)identities_inner);p+=2;
+        PUT16(buf+p,(uint16_t)sess->ticket_len);p+=2;
+        memcpy(buf+p,sess->ticket,sess->ticket_len);p+=sess->ticket_len;
+        buf[p++]=(obf_age>>24)&0xFF;buf[p++]=(obf_age>>16)&0xFF;
+        buf[p++]=(obf_age>>8)&0xFF;buf[p++]=obf_age&0xFF;
+        /* Save position: partial ClientHello for binder ends here (after identities) */
+        size_t truncated_ch_len=p;
+        /* binders — placeholder first */
+        PUT16(buf+p,(uint16_t)binders_inner);p+=2;
+        buf[p++]=(uint8_t)hash_len;
+        memset(buf+p,0,hash_len); /* placeholder binder */
+        size_t binder_val_pos=p;
+        p+=hash_len;
+
+        /* Fill in extension and handshake lengths before computing binder */
+        PUT16(buf+ext_len_pos,(uint16_t)(p-ext_len_pos-2));
+        uint32_t body_len=(uint32_t)(p-4);
+        buf[1]=(body_len>>16)&0xFF;buf[2]=(body_len>>8)&0xFF;buf[3]=body_len&0xFF;
+
+        /* Compute binder (RFC 8446 §4.2.11.2):
+           1. early_secret = HKDF-Extract(zero, PSK)
+           2. binder_key = HKDF-Expand-Label(early_secret, "res binder", hash(""))
+           3. finished_key = HKDF-Expand-Label(binder_key, "finished", "")
+           4. partial_hash = Hash(ClientHello up to and including identities, not binders)
+           5. binder = HMAC(finished_key, partial_hash)
+        */
+        uint8_t early_secret[SHA384_DIGEST_LEN];
+        { const uint8_t z[SHA384_DIGEST_LEN]={0};
+          hkdf_extract_u(psk_alg,z,psk_alg->digest_len,sess->psk,sess->psk_len,early_secret); }
+
+        uint8_t binder_key[SHA384_DIGEST_LEN];
+        { uint8_t empty_hash[SHA384_DIGEST_LEN];
+          psk_alg->hash(NULL,0,empty_hash);
+          hkdf_expand_label_u(psk_alg,early_secret,"res binder",
+              empty_hash,psk_alg->digest_len,binder_key,psk_alg->digest_len); }
+
+        uint8_t finished_key[SHA384_DIGEST_LEN];
+        hkdf_expand_label_u(psk_alg,binder_key,"finished",NULL,0,
+            finished_key,psk_alg->digest_len);
+
+        /* Hash the partial ClientHello: everything up to and including identities,
+           but not the binders list (RFC 8446 §4.2.11.2). Length fields are already
+           set as if the full binders were present. */
+        uint8_t partial_hash[SHA384_DIGEST_LEN];
+        psk_alg->hash(buf,truncated_ch_len,partial_hash);
+
+        /* binder = HMAC(finished_key, partial_hash) */
+        uint8_t binder[SHA384_DIGEST_LEN];
+        hmac(psk_alg,finished_key,psk_alg->digest_len,
+             partial_hash,psk_alg->digest_len,binder);
+        memcpy(buf+binder_val_pos,binder,hash_len);
+
+        secure_zero(early_secret,sizeof(early_secret));
+        secure_zero(binder_key,sizeof(binder_key));
+        secure_zero(finished_key,sizeof(finished_key));
+
+        return p;
+    }
+
     /* Fill in lengths */
     PUT16(buf+ext_len_pos,(uint16_t)(p-ext_len_pos-2));
     uint32_t body_len=(uint32_t)(p-4);
@@ -5659,7 +5767,8 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
                                     uint8_t *server_pub, size_t *pub_len,
                                     uint8_t server_random[32],
-                                    uint16_t *cipher_suite_out) {
+                                    uint16_t *cipher_suite_out,
+                                    int *psk_accepted) {
     const uint8_t *end=msg+len;
     if(len<4) die("ServerHello too short");
     if(msg[0]!=0x02) die("not ServerHello");
@@ -5701,6 +5810,7 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     /* extensions (may not be present for TLS 1.2 minimal hello) */
     uint16_t version=TLS_VERSION_12; /* default TLS 1.2 */
     *pub_len=0;
+    if(psk_accepted) *psk_accepted=0;
     if(b+2<=sh_end) {
         uint16_t ext_total=GET16(b); b+=2;
         const uint8_t *ext_end=b+ext_total;
@@ -5730,6 +5840,9 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
             } else if(etype==0x002b && elen>=2) { /* supported_versions */
                 uint16_t ver=GET16(b);
                 if(ver==TLS_VERSION_13) version=TLS_VERSION_13;
+            } else if(etype==0x0029 && elen>=2 && psk_accepted) { /* pre_shared_key */
+                uint16_t selected=GET16(b);
+                if(selected==0) *psk_accepted=1;
             }
             b+=elen;
         }
@@ -6876,15 +6989,26 @@ typedef struct {
     uint8_t s_ap_key[AES256_KEY_LEN], s_ap_iv[AES_GCM_NONCE_LEN];
     uint8_t c_ap_key[AES256_KEY_LEN], c_ap_iv[AES_GCM_NONCE_LEN];
     uint8_t s_ap_traffic[SHA384_DIGEST_LEN], c_ap_traffic[SHA384_DIGEST_LEN];
+    /* PSK resumption state */
+    int psk_mode;
+    uint8_t master_secret[SHA384_DIGEST_LEN];
+    uint8_t res_master[SHA384_DIGEST_LEN];
+    tls_session **out_session;
 } tls13_hs_state;
 
 /* Phase 1: Derive handshake traffic keys from shared secret */
 static void tls13_derive_hs_keys(tls13_hs_state *st,
-                                  const uint8_t *shared, size_t shared_len) {
+                                  const uint8_t *shared, size_t shared_len,
+                                  const uint8_t *psk, size_t psk_len) {
     const hash_alg *alg=st->alg;
     uint8_t early_secret[SHA384_DIGEST_LEN];
-    { const uint8_t z[SHA384_DIGEST_LEN]={0};
-      hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret); }
+    if(psk && psk_len>0) {
+        const uint8_t z[SHA384_DIGEST_LEN]={0};
+        hkdf_extract_u(alg,z,alg->digest_len,psk,psk_len,early_secret);
+    } else {
+        const uint8_t z[SHA384_DIGEST_LEN]={0};
+        hkdf_extract_u(alg,z,alg->digest_len,z,alg->digest_len,early_secret);
+    }
     uint8_t derived1[SHA384_DIGEST_LEN];
     { uint8_t empty_hash[SHA384_DIGEST_LEN]; alg->hash(NULL,0,empty_hash);
       hkdf_expand_label_u(alg,early_secret,"derived",empty_hash,
@@ -6924,7 +7048,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
     if(rtype==TLS_RT_CCS)
         rtype=tls_read_record(st->fd,rec,&rec_len);
 
-    int got_finished=0, got_cert_verify=0;
+    int got_finished=0, got_cert_verify=st->psk_mode; /* PSK mode: no cert verify needed */
     while(!got_finished) {
         if(rtype!=TLS_RT_APPDATA) die("expected encrypted record");
         uint8_t pt[REC_BUF_SIZE]; size_t pt_len;
@@ -7108,6 +7232,9 @@ static void tls13_derive_app_keys(tls13_hs_state *st) {
                         NULL,0,st->c_ap_iv,AES_GCM_NONCE_LEN);
     if(tls_verbose) fprintf(stderr,"Derived application traffic keys\n");
 
+    /* Keep master_secret for resumption_master_secret derivation after client Finished */
+    memcpy(st->master_secret, master_secret, alg->digest_len);
+
     secure_zero(derived2,sizeof(derived2));
     secure_zero(master_secret,sizeof(master_secret));
 }
@@ -7149,8 +7276,20 @@ static void tls13_send_client_finished(tls13_hs_state *st) {
         memcpy(fin_msg+4,verify,st->hash_len);
         encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,fin_msg,4+st->hash_len,
             st->c_hs_key,st->c_hs_iv,c_hs_seq++,st->mode,st->kl);
+        /* Update transcript with client Finished for res_master derivation */
+        if(st->is_aes256) sha384_update(&st->transcript384,fin_msg,4+st->hash_len);
+        else sha256_update(&st->transcript,fin_msg,4+st->hash_len);
     }
     if(tls_verbose) fprintf(stderr,"Sent client Finished\n");
+
+    /* Derive resumption_master_secret from master_secret + transcript after client Finished */
+    {
+        uint8_t th_after_cf[SHA384_DIGEST_LEN];
+        tls13_transcript_hash(st->is_aes256,&st->transcript,&st->transcript384,th_after_cf);
+        hkdf_expand_label_u(st->alg,st->master_secret,"res master",th_after_cf,
+            st->alg->digest_len,st->res_master,st->alg->digest_len);
+        secure_zero(st->master_secret,sizeof(st->master_secret));
+    }
 }
 
 /* Phase 5: Send HTTP GET, receive response with KeyUpdate support */
@@ -7186,38 +7325,83 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
                 printf("\n[TLS Alert: %d %d]\n",pt[0],pt_len>1?pt[1]:-1);
                 break;
             } else if(inner==TLS_RT_HANDSHAKE) {
-                if(pt_len>=5 && pt[0]==24 && GET24(pt+1)==1) {
-                    uint8_t request_update=pt[4];
-                    {
-                        uint8_t new_s[SHA384_DIGEST_LEN];
-                        hkdf_expand_label_u(st->alg,st->s_ap_traffic,
-                            "traffic upd",NULL,0,new_s,st->alg->digest_len);
-                        memcpy(st->s_ap_traffic,new_s,st->alg->digest_len);
-                        hkdf_expand_label_u(st->alg,st->s_ap_traffic,"key",
-                            NULL,0,st->s_ap_key,st->kl);
-                        hkdf_expand_label_u(st->alg,st->s_ap_traffic,"iv",
-                            NULL,0,st->s_ap_iv,AES_GCM_NONCE_LEN);
-                    }
-                    s_ap_seq=0;
-                    if(request_update==1) {
-                        const uint8_t ku_msg[5]={24,0,0,1,0};
-                        encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,ku_msg,5,
-                            st->c_ap_key,st->c_ap_iv,c_ap_seq++,
-                            st->mode,st->kl);
+                /* Parse handshake messages inside app data records */
+                size_t hpos=0;
+                while(hpos+4<=pt_len) {
+                    uint8_t hmtype=pt[hpos];
+                    uint32_t hmlen=GET24(pt+hpos+1);
+                    if(hpos+4+hmlen>pt_len) break;
+                    if(hmtype==4 && st->out_session) {
+                        /* NewSessionTicket (type 4) */
+                        const uint8_t *tp=pt+hpos+4;
+                        if(hmlen<13) { hpos+=4+hmlen; continue; }
+                        uint32_t lifetime=(uint32_t)tp[0]<<24|(uint32_t)tp[1]<<16|
+                                          (uint32_t)tp[2]<<8|tp[3];
+                        uint32_t age_add=(uint32_t)tp[4]<<24|(uint32_t)tp[5]<<16|
+                                         (uint32_t)tp[6]<<8|tp[7];
+                        uint8_t nonce_len=tp[8];
+                        if(9u+nonce_len+2>hmlen) { hpos+=4+hmlen; continue; }
+                        const uint8_t *nonce=tp+9;
+                        uint16_t tkt_len=GET16(tp+9+nonce_len);
+                        if(9u+nonce_len+2+tkt_len>hmlen) { hpos+=4+hmlen; continue; }
+                        const uint8_t *tkt_data=tp+9+nonce_len+2;
+                        /* Derive PSK from res_master + ticket_nonce */
+                        tls_session *sess=calloc(1,sizeof(tls_session));
+                        if(!sess) die("malloc failed");
+                        sess->ticket=malloc(tkt_len);
+                        if(!sess->ticket) die("malloc failed");
+                        memcpy(sess->ticket,tkt_data,tkt_len);
+                        sess->ticket_len=tkt_len;
+                        sess->ticket_lifetime=lifetime;
+                        sess->ticket_age_add=age_add;
+                        sess->cipher_suite=st->is_aes256 ?
+                            TLS_AES_256_GCM_SHA384 : TLS_AES_128_GCM_SHA256;
+                        if(st->mode==CIPHER_CHACHA)
+                            sess->cipher_suite=TLS_CHACHA20_POLY1305_SHA256;
+                        sess->psk_len=st->alg->digest_len;
+                        hkdf_expand_label_u(st->alg,st->res_master,"resumption",
+                            nonce,nonce_len,sess->psk,sess->psk_len);
+                        sess->timestamp=(uint64_t)time(NULL);
+                        /* Free previous session if any, store new one */
+                        if(*st->out_session) tls_session_free(*st->out_session);
+                        *st->out_session=sess;
+                        if(tls_verbose) fprintf(stderr,"Received NewSessionTicket (lifetime=%u, ticket_len=%u)\n",
+                            lifetime,(unsigned)tkt_len);
+                    } else if(hmtype==24 && hmlen==1) {
+                        /* KeyUpdate — handle inline */
+                        uint8_t request_update=pt[hpos+4];
                         {
-                            uint8_t new_c[SHA384_DIGEST_LEN];
-                            hkdf_expand_label_u(st->alg,st->c_ap_traffic,
-                                "traffic upd",NULL,0,new_c,
-                                st->alg->digest_len);
-                            memcpy(st->c_ap_traffic,new_c,
-                                   st->alg->digest_len);
-                            hkdf_expand_label_u(st->alg,st->c_ap_traffic,
-                                "key",NULL,0,st->c_ap_key,st->kl);
-                            hkdf_expand_label_u(st->alg,st->c_ap_traffic,
-                                "iv",NULL,0,st->c_ap_iv,AES_GCM_NONCE_LEN);
+                            uint8_t new_s[SHA384_DIGEST_LEN];
+                            hkdf_expand_label_u(st->alg,st->s_ap_traffic,
+                                "traffic upd",NULL,0,new_s,st->alg->digest_len);
+                            memcpy(st->s_ap_traffic,new_s,st->alg->digest_len);
+                            hkdf_expand_label_u(st->alg,st->s_ap_traffic,"key",
+                                NULL,0,st->s_ap_key,st->kl);
+                            hkdf_expand_label_u(st->alg,st->s_ap_traffic,"iv",
+                                NULL,0,st->s_ap_iv,AES_GCM_NONCE_LEN);
                         }
-                        c_ap_seq=0;
+                        s_ap_seq=0;
+                        if(request_update==1) {
+                            const uint8_t ku_msg[5]={24,0,0,1,0};
+                            encrypt_and_send(st->fd,TLS_RT_HANDSHAKE,ku_msg,5,
+                                st->c_ap_key,st->c_ap_iv,c_ap_seq++,
+                                st->mode,st->kl);
+                            {
+                                uint8_t new_c[SHA384_DIGEST_LEN];
+                                hkdf_expand_label_u(st->alg,st->c_ap_traffic,
+                                    "traffic upd",NULL,0,new_c,
+                                    st->alg->digest_len);
+                                memcpy(st->c_ap_traffic,new_c,
+                                       st->alg->digest_len);
+                                hkdf_expand_label_u(st->alg,st->c_ap_traffic,
+                                    "key",NULL,0,st->c_ap_key,st->kl);
+                                hkdf_expand_label_u(st->alg,st->c_ap_traffic,
+                                    "iv",NULL,0,st->c_ap_iv,AES_GCM_NONCE_LEN);
+                            }
+                            c_ap_seq=0;
+                        }
                     }
+                    hpos+=4+hmlen;
                 }
             }
         } else {
@@ -7233,12 +7417,16 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
 /* ================================================================
  * TLS 1.3 Handshake
  * ================================================================ */
-static void tls13_handshake(const tls_conn *conn) {
+static void tls13_handshake(const tls_conn *conn, int psk_accepted,
+                            const uint8_t *psk, size_t psk_len,
+                            tls_session **out_session) {
     tls13_hs_state st;
     memset(&st,0,sizeof(st));
     st.fd = conn->fd;
     st.host = conn->host;
     st.path = conn->path;
+    st.psk_mode = psk_accepted;
+    st.out_session = out_session;
     uint16_t cipher_suite = conn->cipher_suite;
     st.is_aes256 = (cipher_suite == TLS_AES_256_GCM_SHA384);
     st.mode = cipher_mode_of(cipher_suite);
@@ -7295,7 +7483,7 @@ static void tls13_handshake(const tls_conn *conn) {
     if(tls_verbose) fprintf(stderr,"Computed ECDHE shared secret (%zu bytes)\n",shared_len);
 
     /* Phase 1: Derive handshake keys */
-    tls13_derive_hs_keys(&st, shared, shared_len);
+    tls13_derive_hs_keys(&st, shared, shared_len, psk, psk_len);
     secure_zero(shared,sizeof(shared));
 
     /* Phase 2: Process encrypted handshake messages */
@@ -7389,7 +7577,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     uint8_t ch[CH_BUF_SIZE];
     uint8_t cr_copy[32]; memcpy(cr_copy, client_random, 32);
     size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,x448_pub,host,
-        cr_copy,session_id,hrr_group);
+        cr_copy,session_id,hrr_group,NULL);
     if(hrr_aes256)
         sha384_update(transcript384,ch,ch_len);
     else
@@ -7409,7 +7597,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     if(rtype!=TLS_RT_HANDSHAKE) die("expected handshake record after HRR");
     if(rec[0]!=0x02) die("expected ServerHello after HRR");
     *version=parse_server_hello(rec,*rec_len,server_pub,
-        server_pub_len,server_random,cipher_suite);
+        server_pub_len,server_random,cipher_suite,NULL);
     if(*version!=TLS_VERSION_13) die("expected TLS 1.3 after HRR");
     if(*server_pub_len==0) die("no key_share in real ServerHello after HRR");
     sh_msg_len=4+GET24(rec+1);
@@ -7421,9 +7609,25 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     if(tls_verbose) fprintf(stderr,"Received real ServerHello after HRR (cipher=0x%04x)\n",*cipher_suite);
 }
 
-/* Main TLS handshake + HTTP GET */
-uint8_t *do_https_get(const char *host, int port, const char *path, size_t *out_len) {
+/* Main TLS handshake + HTTP GET with optional session resumption */
+uint8_t *do_https_get_session(const char *host, int port, const char *path,
+                               size_t *out_len, tls_session **session) {
     load_trust_store("trust_store");
+
+    /* Check if we have a valid session for PSK resumption */
+    tls_session *sess = (session && *session) ? *session : NULL;
+    if(sess) {
+        /* Check ticket lifetime */
+        uint64_t now=(uint64_t)time(NULL);
+        if(now - sess->timestamp > sess->ticket_lifetime) {
+            if(tls_verbose) fprintf(stderr,"Session ticket expired, doing full handshake\n");
+            tls_session_free(sess);
+            if(session) *session=NULL;
+            sess=NULL;
+        }
+    }
+    if(sess && tls_verbose)
+        fprintf(stderr,"Attempting PSK resumption (ticket_len=%zu)\n",sess->ticket_len);
 
     int fd=tcp_connect(host,port);
     if(tls_verbose) fprintf(stderr,"Connected to %s:%d\n",host,port);
@@ -7442,7 +7646,7 @@ uint8_t *do_https_get(const char *host, int port, const char *path, size_t *out_
     /* Build & send ClientHello */
     uint8_t ch[CH_BUF_SIZE];
     uint8_t client_random[32];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,host,client_random,NULL,0);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,host,client_random,NULL,0,sess);
     /* Save session_id from ClientHello for HRR reuse (RFC 8446 §4.1.2) */
     const uint8_t *saved_session_id=ch+6+32+1; /* past: type(1)+len(3)+version(2)+random(32)+sid_len(1) */
     /* For the record layer, first ClientHello uses version 0x0301.
@@ -7476,12 +7680,23 @@ uint8_t *do_https_get(const char *host, int port, const char *path, size_t *out_
     uint8_t server_pub[P384_POINT_LEN]; size_t server_pub_len=0;
     uint8_t server_random[32];
     uint16_t cipher_suite;
+    int psk_accepted=0;
     uint16_t version=parse_server_hello(rec,rec_len,server_pub,
-        &server_pub_len,server_random,&cipher_suite);
+        &server_pub_len,server_random,&cipher_suite,&psk_accepted);
     uint32_t sh_msg_len=4+GET24(rec+1);
     sha256_update(&transcript,rec,sh_msg_len);
     sha384_update(&transcript384,rec,sh_msg_len);
     size_t sh_leftover=rec_len>sh_msg_len ? rec_len-sh_msg_len : 0;
+
+    /* If we offered PSK but server didn't accept, fall back to full handshake */
+    if(sess && !psk_accepted) {
+        if(tls_verbose) fprintf(stderr,"Server did not accept PSK, falling back to full handshake\n");
+        tls_session_free(sess);
+        if(session) *session=NULL;
+        sess=NULL;
+    }
+    if(psk_accepted && tls_verbose)
+        fprintf(stderr,"Server accepted PSK resumption\n");
 
     /* HelloRetryRequest handling */
     if(memcmp(server_random,HRR_RANDOM,32)==0) {
@@ -7533,17 +7748,36 @@ uint8_t *do_https_get(const char *host, int port, const char *path, size_t *out_
     secure_zero(x25519_priv, sizeof(x25519_priv));
     secure_zero(x448_priv, sizeof(x448_priv));
 
+    /* Copy PSK data and free old session before handshake, since
+       tls13_transfer_appdata may replace *session with a new ticket */
+    uint8_t psk_copy[48]; size_t psk_copy_len=0;
+    if(sess) {
+        psk_copy_len=sess->psk_len;
+        memcpy(psk_copy,sess->psk,psk_copy_len);
+        tls_session_free(sess);
+        if(session) *session=NULL;
+        sess=NULL;
+    }
+
     if(version == TLS_VERSION_12) {
         tls12_handshake(&conn);
     } else {
-        tls13_handshake(&conn);
+        tls13_handshake(&conn, psk_accepted,
+                        psk_copy_len ? psk_copy : NULL,
+                        psk_copy_len,
+                        session);
     }
+    secure_zero(psk_copy,sizeof(psk_copy));
 
     /* Clear connection context secrets */
     secure_zero(&conn, sizeof(conn));
 
     *out_len = ho.body_len;
     return ho.body;
+}
+
+uint8_t *do_https_get(const char *host, int port, const char *path, size_t *out_len) {
+    return do_https_get_session(host, port, path, out_len, NULL);
 }
 
 /* ================================================================
