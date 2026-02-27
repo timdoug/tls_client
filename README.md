@@ -25,7 +25,7 @@ is difficult, but not at all for use in anything more serious...
 
 ## What's here
 
-~8,000 lines of C99 (library) that implements:
+~9,000 lines of C99 (library) that implements:
 
 **X.509 chain validation**: signature verification, hostname matching (CN +
 SAN), validity periods, basicConstraints / pathLen / keyUsage / EKU
@@ -47,8 +47,8 @@ cached to the `crls/` directory and reused until `nextUpdate` expires. Soft-fail
 server sends an incomplete chain.
 
 **TLS 1.3** (RFC 8446): full handshake with HelloRetryRequest, downgrade
-detection, and session resumption via PSK-DHE (NewSessionTicket + pre_shared_key
-binder computation).
+detection, session resumption via PSK-DHE (NewSessionTicket + pre_shared_key
+binder computation), and post-quantum hybrid key exchange (X25519MLKEM768).
 
 **TLS 1.2** (RFC 5246): ECDHE and static-RSA key exchange, GCM / CBC /
 ChaCha20-Poly1305 record protection.
@@ -63,7 +63,8 @@ ChaCha20-Poly1305 record protection.
 
 ### Key exchange
 
-- **X25519** (preferred)
+- **X25519MLKEM768** post-quantum hybrid (preferred, TLS 1.3 only)
+- **X25519**
 - **X448**
 - **ECDHE P-256**, **P-384**
 - **Static RSA** key transport (TLS 1.2 only)
@@ -78,10 +79,11 @@ ChaCha20-Poly1305 record protection.
 
 ### Crypto primitives
 
-SHA-1, SHA-256, SHA-384, SHA-512, SHAKE256, HMAC, HKDF, AES-128/256 (GCM &
-CBC), ChaCha20-Poly1305, P-256/P-384 field & point arithmetic, X25519/X448
-Montgomery ladder, Ed25519/Ed448 point arithmetic and signature verification,
-RSA modular exponentiation (64-bit & 32-bit limb paths).
+SHA-1, SHA-256, SHA-384, SHA-512, SHA3-256, SHA3-512, SHAKE128, SHAKE256,
+HMAC, HKDF, AES-128/256 (GCM & CBC), ChaCha20-Poly1305, ML-KEM768 (FIPS 203,
+NTT-based), P-256/P-384 field & point arithmetic, X25519/X448 Montgomery
+ladder, Ed25519/Ed448 point arithmetic and signature verification, RSA modular
+exponentiation (64-bit & 32-bit limb paths).
 
 ## What's not implemented
 
@@ -119,7 +121,7 @@ make test-sites     # 25 random site connection tests only
 make test-sites-all # all site connection tests (pass + xfail)
 make test-xfail     # expected-failure tests only
 make test-resume    # session resumption tests (local + 25 random sites)
-./tls_test          # RFC/NIST test vectors for all crypto primitives (21 tests)
+./tls_test          # RFC/NIST test vectors for all crypto primitives (32 tests)
 ```
 
 The full suite covers:

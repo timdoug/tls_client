@@ -834,6 +834,17 @@ run_server_test "TLS13 ChaCha20-Poly1305 P-384" \
     "$EC384_KEY" "$EC384_CERT" \
     -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -groups P-384
 
+# X25519MLKEM768 post-quantum hybrid (requires OpenSSL 3.5+)
+if openssl list -1 -tls-groups 2>/dev/null | grep -q X25519MLKEM768; then
+    run_server_test "TLS13 AES-256-GCM X25519MLKEM768" \
+        "$RSA_KEY" "$RSA_CERT" \
+        -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -groups X25519MLKEM768
+else
+    printf "  %-50s ${YLW}SKIP${RST}  OpenSSL lacks X25519MLKEM768\n" \
+        "TLS13 AES-256-GCM X25519MLKEM768"
+    local_skip=$((local_skip + 1))
+fi
+
 # --- TLS 1.3 Session Resumption (PSK-DHE) ---
 # Usage: run_server_resume_test <name> <key> <cert> [extra s_server args...]
 run_server_resume_test() {

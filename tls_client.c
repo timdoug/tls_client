@@ -1,8 +1,10 @@
 /*
  * tls_client.c — TLS 1.2/1.3 HTTPS client library from scratch in C.
- * Implements: SHA-1, SHA-256, SHA-384, SHA-512, SHAKE256, HMAC, HKDF,
+ * Implements: SHA-1, SHA-256, SHA-384, SHA-512, SHA3-256, SHA3-512,
+ *             SHAKE128, SHAKE256, HMAC, HKDF, ML-KEM768,
  *             AES-128/256-GCM, AES-128/256-CBC, ChaCha20-Poly1305,
- *             ECDHE-P256/P384, X25519, X448, Ed25519, Ed448, TLS 1.2/1.3
+ *             X25519MLKEM768, ECDHE-P256/P384, X25519, X448,
+ *             Ed25519, Ed448, TLS 1.2/1.3
  * No external crypto libraries.
  *
  * Certificate verification: SHA-256/384/512, ECDSA-P256/P384,
@@ -182,6 +184,17 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define TLS_GROUP_X448      0x001E
 #define TLS_GROUP_SECP256R1 0x0017
 #define TLS_GROUP_SECP384R1 0x0018
+#define TLS_GROUP_X25519MLKEM768 0x11EC
+
+/* ML-KEM768 sizes */
+#define MLKEM768_EK_LEN  1184
+#define MLKEM768_DK_LEN  2400
+#define MLKEM768_CT_LEN  1088
+#define MLKEM768_SS_LEN  32
+
+/* X25519MLKEM768 hybrid key share/response sizes */
+#define HYBRID_SHARE_LEN  (X25519_KEY_LEN + MLKEM768_EK_LEN)  /* 1216 */
+#define HYBRID_RESP_LEN   (X25519_KEY_LEN + MLKEM768_CT_LEN)  /* 1120 */
 
 /* X25519 / X448 / ChaCha20-Poly1305 sizes */
 #define X25519_KEY_LEN            32
@@ -228,7 +241,7 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define TLS_SIG_ED448                  0x0808
 
 /* Buffer sizes */
-#define CH_BUF_SIZE   2048
+#define CH_BUF_SIZE   4096
 #define REC_BUF_SIZE  32768
 #define HS_BUF_SIZE   65536
 #define REQ_BUF_SIZE  512
@@ -621,6 +634,631 @@ static void shake256_final(shake256_ctx *ctx, uint8_t *out, size_t out_len) {
         squeezed+=avail;
         if(squeezed<out_len) keccak_f1600(ctx->st);
     }
+}
+
+/* ================================================================
+ * SHA3-256 / SHA3-512 (FIPS 202) — used as H() and G() in ML-KEM
+ * ================================================================ */
+static void sha3_hash(const uint8_t *data, size_t len, uint8_t *out,
+                       size_t rate, size_t out_len) {
+    uint64_t st[25]; memset(st,0,sizeof(st));
+    /* Absorb */
+    while(len>=rate) {
+        for(size_t i=0;i<rate/8;i++){
+            uint64_t w=0;
+            for(int j=0;j<8;j++) w|=(uint64_t)data[8*i+j]<<(8*j);
+            st[i]^=w;
+        }
+        keccak_f1600(st);
+        data+=rate; len-=rate;
+    }
+    /* Final block: absorb remaining + pad */
+    uint8_t buf[200]; memset(buf,0,rate);
+    memcpy(buf,data,len);
+    buf[len]=0x06; /* SHA-3 domain separator */
+    buf[rate-1]|=0x80;
+    for(size_t i=0;i<rate/8;i++){
+        uint64_t w=0;
+        for(int j=0;j<8;j++) w|=(uint64_t)buf[8*i+j]<<(8*j);
+        st[i]^=w;
+    }
+    keccak_f1600(st);
+    /* Squeeze (single block suffices for SHA3-256/512) */
+    for(size_t i=0;i<out_len;i++)
+        out[i]=(uint8_t)(st[i/8]>>(8*(i%8)));
+}
+
+static void sha3_256(const uint8_t *data, size_t len, uint8_t out[32]) {
+    sha3_hash(data,len,out,136,32); /* rate=1600-2*256=1088 bits=136 bytes */
+}
+
+static void sha3_512(const uint8_t *data, size_t len, uint8_t out[64]) {
+    sha3_hash(data,len,out,72,64); /* rate=1600-2*512=576 bits=72 bytes */
+}
+
+/* ================================================================
+ * SHAKE128 (incremental XOF, FIPS 202)
+ * Used by ML-KEM for matrix sampling (rejection sampling needs
+ * incremental squeeze).
+ * ================================================================ */
+#define SHAKE128_RATE 168 /* 1600 - 2*128 = 1344 bits = 168 bytes */
+typedef struct {
+    uint64_t st[25];
+    uint8_t buf[168];
+    size_t buf_len;
+    int finalized;
+    size_t squeeze_pos; /* byte offset within current Keccak block */
+} shake128_ctx;
+
+static void shake128_init(shake128_ctx *ctx) { memset(ctx,0,sizeof(*ctx)); }
+
+static void shake128_update(shake128_ctx *ctx, const uint8_t *data, size_t len) {
+    while(len>0){
+        size_t space=SHAKE128_RATE-ctx->buf_len;
+        size_t chunk=len<space?len:space;
+        memcpy(ctx->buf+ctx->buf_len,data,chunk);
+        ctx->buf_len+=chunk; data+=chunk; len-=chunk;
+        if(ctx->buf_len==SHAKE128_RATE){
+            for(int i=0;i<SHAKE128_RATE/8;i++){
+                uint64_t w=0;
+                for(int j=0;j<8;j++) w|=(uint64_t)ctx->buf[8*i+j]<<(8*j);
+                ctx->st[i]^=w;
+            }
+            keccak_f1600(ctx->st);
+            ctx->buf_len=0;
+        }
+    }
+}
+
+static void shake128_finalize(shake128_ctx *ctx) {
+    memset(ctx->buf+ctx->buf_len,0,SHAKE128_RATE-ctx->buf_len);
+    ctx->buf[ctx->buf_len]|=0x1F; /* SHAKE domain separation */
+    ctx->buf[SHAKE128_RATE-1]|=0x80;
+    for(int i=0;i<SHAKE128_RATE/8;i++){
+        uint64_t w=0;
+        for(int j=0;j<8;j++) w|=(uint64_t)ctx->buf[8*i+j]<<(8*j);
+        ctx->st[i]^=w;
+    }
+    keccak_f1600(ctx->st);
+    ctx->finalized=1;
+    ctx->squeeze_pos=0;
+}
+
+static void shake128_squeeze(shake128_ctx *ctx, uint8_t *out, size_t out_len) {
+    size_t pos=ctx->squeeze_pos;
+    while(out_len>0){
+        if(pos==SHAKE128_RATE){
+            keccak_f1600(ctx->st);
+            pos=0;
+        }
+        size_t avail=SHAKE128_RATE-pos;
+        if(avail>out_len) avail=out_len;
+        for(size_t i=0;i<avail;i++)
+            out[i]=(uint8_t)(ctx->st[(pos+i)/8]>>(8*((pos+i)%8)));
+        out+=avail; out_len-=avail; pos+=avail;
+    }
+    ctx->squeeze_pos=pos;
+}
+
+/* ================================================================
+ * ML-KEM768 (FIPS 203) — Module-Lattice Key Encapsulation Mechanism
+ * Post-quantum KEM used in X25519MLKEM768 hybrid key exchange.
+ * ================================================================ */
+#define MLKEM_N  256
+#define MLKEM_Q  3329
+#define MLKEM_K  3
+
+/* Montgomery form: R = 2^16, QINV = q^{-1} mod R = 62209 */
+static int16_t mlkem_montgomery_reduce(int32_t a) {
+    int16_t t = (int16_t)((uint16_t)a * 62209u);
+    return (int16_t)((a - (int32_t)t * MLKEM_Q) >> 16);
+}
+
+/* Barrett reduction: reduce to [0, q) */
+static int16_t mlkem_barrett_reduce(int16_t a) {
+    int16_t t = (int16_t)(((int32_t)a * 20159 + (1 << 25)) >> 26);
+    t = a - t * MLKEM_Q;
+    return t;
+}
+
+/* Precomputed NTT zetas in Montgomery form: zetas[i] = 17^{bitrev7(i)} · 2^16 mod q */
+static const int16_t mlkem_zetas[128] = {
+   -1044, -758, -359,-1517, 1493, 1422,  287,  202,
+    -171,  622, 1577,  182,  962,-1202,-1474, 1468,
+     573,-1325,  264,  383, -829, 1458,-1602, -130,
+    -681, 1017,  732,  608,-1542,  411, -205,-1571,
+    1223,  652, -552, 1015,-1293, 1491, -282,-1544,
+     516,   -8, -320, -666,-1618,-1162,  126, 1469,
+    -853,  -90, -271,  830,  107,-1421, -247, -951,
+    -398,  961,-1508, -725,  448,-1065,  677,-1275,
+   -1103,  430,  555,  843,-1251,  871, 1550,  105,
+     422,  587,  177, -235, -291, -460, 1574, 1653,
+    -246,  778, 1159, -147, -777, 1483, -602, 1119,
+   -1590,  644, -872,  349,  418,  329, -156,  -75,
+     817, 1097,  603,  610, 1322,-1285,-1465,  384,
+   -1215, -136, 1218,-1335, -874,  220,-1187,-1659,
+   -1185,-1530,-1278,  794,-1510, -854, -870,  478,
+    -108, -308,  996,  991,  958,-1460, 1522, 1628
+};
+
+typedef struct { int16_t coeffs[MLKEM_N]; } mlkem_poly;
+typedef struct { mlkem_poly vec[MLKEM_K]; } mlkem_polyvec;
+
+/* Forward NTT: Cooley-Tukey, 7 layers */
+static void mlkem_ntt(mlkem_poly *p) {
+    int16_t *a = p->coeffs;
+    int k = 1;
+    for(int len=128; len>=2; len>>=1) {
+        for(int start=0; start<MLKEM_N; start+=2*len) {
+            int16_t zeta = mlkem_zetas[k++];
+            for(int j=start; j<start+len; j++) {
+                int16_t t = mlkem_montgomery_reduce((int32_t)zeta * a[j+len]);
+                a[j+len] = a[j] - t;
+                a[j] = a[j] + t;
+            }
+        }
+    }
+}
+
+/* Inverse NTT: Gentleman-Sande, 7 layers */
+static void mlkem_invntt(mlkem_poly *p) {
+    int16_t *a = p->coeffs;
+    int k = 127;
+    for(int len=2; len<=128; len<<=1) {
+        for(int start=0; start<MLKEM_N; start+=2*len) {
+            int16_t zeta = mlkem_zetas[k--];
+            for(int j=start; j<start+len; j++) {
+                int16_t t = a[j];
+                a[j] = mlkem_barrett_reduce(t + a[j+len]);
+                a[j+len] = mlkem_montgomery_reduce((int32_t)zeta * (a[j+len] - t));
+            }
+        }
+    }
+    /* Multiply by 128^{-1}·R = 3303 mod q in Montgomery form */
+    for(int i=0; i<MLKEM_N; i++)
+        a[i] = mlkem_montgomery_reduce((int32_t)a[i] * 1441);
+}
+
+/* Basemul: degree-1 poly multiply mod (X^2 - zeta) */
+static void mlkem_basemul(int16_t r[2], const int16_t a[2],
+                           const int16_t b[2], int16_t zeta) {
+    r[0] = mlkem_montgomery_reduce((int32_t)a[1]*b[1]);
+    r[0] = mlkem_montgomery_reduce((int32_t)r[0]*zeta);
+    r[0] += mlkem_montgomery_reduce((int32_t)a[0]*b[0]);
+    r[1] = mlkem_montgomery_reduce((int32_t)a[0]*b[1]);
+    r[1] += mlkem_montgomery_reduce((int32_t)a[1]*b[0]);
+}
+
+/* Polyvec inner product in NTT domain: r = sum(a[i] * b[i]) */
+static void mlkem_polyvec_basemul_acc(mlkem_poly *r, const mlkem_polyvec *a,
+                                       const mlkem_polyvec *b) {
+    mlkem_poly tmp;
+    memset(r,0,sizeof(*r));
+    for(int i=0;i<MLKEM_K;i++){
+        memset(&tmp,0,sizeof(tmp));
+        for(int j=0;j<MLKEM_N/4;j++){
+            int16_t t[2];
+            mlkem_basemul(t,
+                &a->vec[i].coeffs[4*j], &b->vec[i].coeffs[4*j],
+                mlkem_zetas[64+j]);
+            tmp.coeffs[4*j]  += t[0];
+            tmp.coeffs[4*j+1]+= t[1];
+            mlkem_basemul(t,
+                &a->vec[i].coeffs[4*j+2], &b->vec[i].coeffs[4*j+2],
+                -mlkem_zetas[64+j]);
+            tmp.coeffs[4*j+2]+= t[0];
+            tmp.coeffs[4*j+3]+= t[1];
+        }
+        for(int j=0;j<MLKEM_N;j++)
+            r->coeffs[j] += tmp.coeffs[j];
+    }
+    for(int j=0;j<MLKEM_N;j++)
+        r->coeffs[j] = mlkem_barrett_reduce(r->coeffs[j]);
+}
+
+/* Poly add/sub */
+static void mlkem_poly_add(mlkem_poly *r, const mlkem_poly *a, const mlkem_poly *b) {
+    for(int i=0;i<MLKEM_N;i++) r->coeffs[i]=a->coeffs[i]+b->coeffs[i];
+}
+static void mlkem_poly_sub(mlkem_poly *r, const mlkem_poly *a, const mlkem_poly *b) {
+    for(int i=0;i<MLKEM_N;i++) r->coeffs[i]=a->coeffs[i]-b->coeffs[i];
+}
+
+/* Reduce all coefficients */
+static void mlkem_poly_reduce(mlkem_poly *p) {
+    for(int i=0;i<MLKEM_N;i++) p->coeffs[i]=mlkem_barrett_reduce(p->coeffs[i]);
+}
+
+/* Convert from Montgomery domain to standard: multiply by R^2 mod q = 1353 */
+static void mlkem_poly_tomont(mlkem_poly *p) {
+    for(int i=0;i<MLKEM_N;i++)
+        p->coeffs[i] = mlkem_montgomery_reduce((int32_t)p->coeffs[i] * 1353);
+}
+
+/* CBD2: Centered binomial distribution with η=2 (FIPS 203 Algorithm 8) */
+static void mlkem_cbd2(mlkem_poly *p, const uint8_t buf[128]) {
+    for(int i=0;i<MLKEM_N/8;i++){
+        uint32_t t = (uint32_t)buf[4*i] | ((uint32_t)buf[4*i+1] << 8)
+                   | ((uint32_t)buf[4*i+2] << 16) | ((uint32_t)buf[4*i+3] << 24);
+        /* Popcount adjacent bit pairs: d[2k:2k+1] = bit[2k] + bit[2k+1] */
+        uint32_t d = (t & 0x55555555u) + ((t >> 1) & 0x55555555u);
+        for(int j=0;j<8;j++){
+            int16_t a_val = (int16_t)((d >> (4*j)) & 3);
+            int16_t b_val = (int16_t)((d >> (4*j+2)) & 3);
+            p->coeffs[8*i+j] = a_val - b_val;
+        }
+    }
+}
+
+/* Sample NTT polynomial via SHAKE128 rejection sampling */
+static void mlkem_sample_ntt(mlkem_poly *p, const uint8_t seed[34]) {
+    shake128_ctx xof;
+    shake128_init(&xof);
+    shake128_update(&xof, seed, 34);
+    shake128_finalize(&xof);
+    int ctr = 0;
+    while(ctr < MLKEM_N) {
+        uint8_t blk[3];
+        shake128_squeeze(&xof, blk, 3);
+        uint16_t d1 = ((uint16_t)blk[0] | ((uint16_t)(blk[1] & 0x0F) << 8));
+        uint16_t d2 = ((uint16_t)(blk[1] >> 4) | ((uint16_t)blk[2] << 4));
+        if(d1 < MLKEM_Q && ctr < MLKEM_N) p->coeffs[ctr++] = (int16_t)d1;
+        if(d2 < MLKEM_Q && ctr < MLKEM_N) p->coeffs[ctr++] = (int16_t)d2;
+    }
+}
+
+/* PRF: SHAKE256(seed || nonce) — reuses existing SHAKE256 */
+static void mlkem_prf(const uint8_t seed[32], uint8_t nonce, uint8_t *out, size_t len) {
+    shake256_ctx ctx;
+    shake256_init(&ctx);
+    shake256_update(&ctx, seed, 32);
+    shake256_update(&ctx, &nonce, 1);
+    shake256_final(&ctx, out, len);
+}
+
+/* Byte encode: pack d-bit values into bytes */
+static void mlkem_byte_encode(uint8_t *out, const mlkem_poly *p, int d) {
+    if(d == 12) {
+        for(int i=0;i<MLKEM_N/2;i++){
+            /* Map to [0, q): add q if negative (constant-time) */
+            int16_t c0 = p->coeffs[2*i]; c0 += (c0 >> 15) & MLKEM_Q;
+            int16_t c1 = p->coeffs[2*i+1]; c1 += (c1 >> 15) & MLKEM_Q;
+            uint16_t a = (uint16_t)c0;
+            uint16_t b = (uint16_t)c1;
+            out[3*i]   = (uint8_t)(a & 0xFF);
+            out[3*i+1] = (uint8_t)((a >> 8) | ((b & 0x0F) << 4));
+            out[3*i+2] = (uint8_t)(b >> 4);
+        }
+    } else if(d == 10) {
+        for(int i=0;i<MLKEM_N/4;i++){
+            uint32_t v0 = (uint16_t)p->coeffs[4*i];
+            uint32_t v1 = (uint16_t)p->coeffs[4*i+1];
+            uint32_t v2 = (uint16_t)p->coeffs[4*i+2];
+            uint32_t v3 = (uint16_t)p->coeffs[4*i+3];
+            out[5*i]   = (uint8_t)(v0);
+            out[5*i+1] = (uint8_t)((v0 >> 8) | (v1 << 2));
+            out[5*i+2] = (uint8_t)((v1 >> 6) | (v2 << 4));
+            out[5*i+3] = (uint8_t)((v2 >> 4) | (v3 << 6));
+            out[5*i+4] = (uint8_t)(v3 >> 2);
+        }
+    } else if(d == 4) {
+        for(int i=0;i<MLKEM_N/2;i++){
+            out[i] = (uint8_t)((p->coeffs[2*i] & 0x0F) | (p->coeffs[2*i+1] << 4));
+        }
+    } else if(d == 1) {
+        memset(out, 0, 32);
+        for(int i=0;i<MLKEM_N;i++)
+            out[i/8] |= (uint8_t)((p->coeffs[i] & 1) << (i % 8));
+    }
+}
+
+/* Byte decode: unpack d-bit values */
+static void mlkem_byte_decode(mlkem_poly *p, const uint8_t *in, int d) {
+    if(d == 12) {
+        for(int i=0;i<MLKEM_N/2;i++){
+            p->coeffs[2*i]   = (int16_t)(((uint16_t)in[3*i]) | (((uint16_t)(in[3*i+1] & 0x0F)) << 8));
+            p->coeffs[2*i+1] = (int16_t)(((uint16_t)(in[3*i+1] >> 4)) | (((uint16_t)in[3*i+2]) << 4));
+        }
+    } else if(d == 10) {
+        for(int i=0;i<MLKEM_N/4;i++){
+            uint32_t b0=in[5*i],b1=in[5*i+1],b2=in[5*i+2],b3=in[5*i+3],b4=in[5*i+4];
+            p->coeffs[4*i]   = (int16_t)((b0 | (b1 << 8)) & 0x3FF);
+            p->coeffs[4*i+1] = (int16_t)(((b1 >> 2) | (b2 << 6)) & 0x3FF);
+            p->coeffs[4*i+2] = (int16_t)(((b2 >> 4) | (b3 << 4)) & 0x3FF);
+            p->coeffs[4*i+3] = (int16_t)(((b3 >> 6) | (b4 << 2)) & 0x3FF);
+        }
+    } else if(d == 4) {
+        for(int i=0;i<MLKEM_N/2;i++){
+            p->coeffs[2*i]   = (int16_t)(in[i] & 0x0F);
+            p->coeffs[2*i+1] = (int16_t)(in[i] >> 4);
+        }
+    } else if(d == 1) {
+        for(int i=0;i<MLKEM_N;i++)
+            p->coeffs[i] = (int16_t)((in[i/8] >> (i % 8)) & 1);
+    }
+}
+
+/* Compress: round(2^d / q * x) mod 2^d */
+static void mlkem_compress(mlkem_poly *p, int d) {
+    for(int i=0;i<MLKEM_N;i++){
+        int32_t x = (int32_t)mlkem_barrett_reduce(p->coeffs[i]);
+        if(x < 0) x += MLKEM_Q;
+        x = (int32_t)(((uint32_t)x * (1u << d) + MLKEM_Q/2) / MLKEM_Q);
+        p->coeffs[i] = (int16_t)(x & ((1 << d) - 1));
+    }
+}
+
+/* Decompress: round(q / 2^d * x) */
+static void mlkem_decompress(mlkem_poly *p, int d) {
+    for(int i=0;i<MLKEM_N;i++){
+        uint32_t x = (uint32_t)p->coeffs[i];
+        p->coeffs[i] = (int16_t)((x * MLKEM_Q + (1u << (d-1))) >> d);
+    }
+}
+
+/* K-PKE KeyGen (inner CPA scheme) */
+static void kpke_keygen(const uint8_t d[32], uint8_t ek[1184], uint8_t dk_pke[1152]) {
+    /* G = SHA3-512(d || k) */
+    uint8_t g_in[33], g_out[64];
+    memcpy(g_in, d, 32);
+    g_in[32] = MLKEM_K;
+    sha3_512(g_in, 33, g_out);
+    const uint8_t *rho = g_out;      /* 32 bytes — public seed for A */
+    const uint8_t *sigma = g_out+32;  /* 32 bytes — private seed for s,e */
+
+    /* Generate matrix A in NTT domain via SHAKE128 */
+    mlkem_polyvec a_hat[MLKEM_K]; /* A is K×K */
+    for(int i=0;i<MLKEM_K;i++){
+        for(int j=0;j<MLKEM_K;j++){
+            uint8_t seed[34];
+            memcpy(seed, rho, 32);
+            seed[32] = (uint8_t)j;
+            seed[33] = (uint8_t)i;
+            mlkem_sample_ntt(&a_hat[i].vec[j], seed);
+        }
+    }
+
+    /* Generate s and e via CBD2 + PRF(sigma, nonce) */
+    mlkem_polyvec s, e;
+    uint8_t nonce = 0;
+    for(int i=0;i<MLKEM_K;i++){
+        uint8_t buf[128];
+        mlkem_prf(sigma, nonce++, buf, 128);
+        mlkem_cbd2(&s.vec[i], buf);
+    }
+    for(int i=0;i<MLKEM_K;i++){
+        uint8_t buf[128];
+        mlkem_prf(sigma, nonce++, buf, 128);
+        mlkem_cbd2(&e.vec[i], buf);
+    }
+
+    /* NTT(s), NTT(e) */
+    for(int i=0;i<MLKEM_K;i++){
+        mlkem_ntt(&s.vec[i]);
+        mlkem_ntt(&e.vec[i]);
+    }
+
+    /* t_hat = A_hat * s_hat + e_hat */
+    mlkem_polyvec t_hat;
+    for(int i=0;i<MLKEM_K;i++){
+        mlkem_polyvec_basemul_acc(&t_hat.vec[i], &a_hat[i], &s);
+        mlkem_poly_tomont(&t_hat.vec[i]); /* basemul output is Montgomery domain; convert back */
+        mlkem_poly_add(&t_hat.vec[i], &t_hat.vec[i], &e.vec[i]);
+        mlkem_poly_reduce(&t_hat.vec[i]);
+    }
+
+    /* Encode ek = ByteEncode_12(t_hat) || rho */
+    for(int i=0;i<MLKEM_K;i++)
+        mlkem_byte_encode(ek + 384*i, &t_hat.vec[i], 12);
+    memcpy(ek + 384*MLKEM_K, rho, 32);
+
+    /* Encode dk_pke = ByteEncode_12(s_hat) — reduce first (NTT output can exceed [-q,q)) */
+    for(int i=0;i<MLKEM_K;i++){
+        mlkem_poly_reduce(&s.vec[i]);
+        mlkem_byte_encode(dk_pke + 384*i, &s.vec[i], 12);
+    }
+
+    secure_zero(g_out, sizeof(g_out));
+    secure_zero(&s, sizeof(s));
+}
+
+/* K-PKE Encrypt */
+static void kpke_encrypt(const uint8_t ek[1184], const uint8_t m[32],
+                          const uint8_t r_seed[32], uint8_t ct[1088]) {
+    /* Decode t_hat and rho from ek */
+    mlkem_polyvec t_hat;
+    for(int i=0;i<MLKEM_K;i++)
+        mlkem_byte_decode(&t_hat.vec[i], ek + 384*i, 12);
+    const uint8_t *rho = ek + 384*MLKEM_K;
+
+    /* Regenerate A^T */
+    mlkem_polyvec a_hat_t[MLKEM_K];
+    for(int i=0;i<MLKEM_K;i++){
+        for(int j=0;j<MLKEM_K;j++){
+            uint8_t seed[34];
+            memcpy(seed, rho, 32);
+            seed[32] = (uint8_t)i;
+            seed[33] = (uint8_t)j;
+            mlkem_sample_ntt(&a_hat_t[i].vec[j], seed);
+        }
+    }
+
+    /* Sample r, e1, e2 via CBD2 */
+    mlkem_polyvec r_vec, e1;
+    mlkem_poly e2;
+    uint8_t nonce = 0;
+    for(int i=0;i<MLKEM_K;i++){
+        uint8_t buf[128];
+        mlkem_prf(r_seed, nonce++, buf, 128);
+        mlkem_cbd2(&r_vec.vec[i], buf);
+    }
+    for(int i=0;i<MLKEM_K;i++){
+        uint8_t buf[128];
+        mlkem_prf(r_seed, nonce++, buf, 128);
+        mlkem_cbd2(&e1.vec[i], buf);
+    }
+    {
+        uint8_t buf[128];
+        mlkem_prf(r_seed, nonce, buf, 128);
+        mlkem_cbd2(&e2, buf);
+    }
+
+    /* NTT(r) */
+    for(int i=0;i<MLKEM_K;i++)
+        mlkem_ntt(&r_vec.vec[i]);
+
+    /* u = invNTT(A^T * r_hat) + e1 */
+    mlkem_polyvec u;
+    for(int i=0;i<MLKEM_K;i++){
+        mlkem_polyvec_basemul_acc(&u.vec[i], &a_hat_t[i], &r_vec);
+        mlkem_invntt(&u.vec[i]);
+        mlkem_poly_add(&u.vec[i], &u.vec[i], &e1.vec[i]);
+    }
+
+    /* v = invNTT(t_hat^T * r_hat) + e2 + Decompress_1(m) */
+    mlkem_poly v;
+    {
+        /* t_hat^T * r_hat as polyvec inner product */
+        mlkem_polyvec t_as_vec;
+        memcpy(&t_as_vec, &t_hat, sizeof(t_as_vec));
+        mlkem_polyvec_basemul_acc(&v, &t_as_vec, &r_vec);
+    }
+    mlkem_invntt(&v);
+    mlkem_poly_add(&v, &v, &e2);
+    /* Add message: Decompress_1(m) = round(q/2) * m_bit */
+    mlkem_poly msg_poly;
+    mlkem_byte_decode(&msg_poly, m, 1);
+    mlkem_decompress(&msg_poly, 1);
+    mlkem_poly_add(&v, &v, &msg_poly);
+
+    /* Encode ciphertext: Compress_du(u) || Compress_dv(v)  du=10, dv=4 */
+    for(int i=0;i<MLKEM_K;i++){
+        mlkem_compress(&u.vec[i], 10);
+        mlkem_byte_encode(ct + 320*i, &u.vec[i], 10);
+    }
+    mlkem_compress(&v, 4);
+    mlkem_byte_encode(ct + 320*MLKEM_K, &v, 4);
+
+    secure_zero(&r_vec, sizeof(r_vec));
+}
+
+/* K-PKE Decrypt */
+static void kpke_decrypt(const uint8_t dk_pke[1152], const uint8_t ct[1088],
+                          uint8_t m[32]) {
+    /* Decode u from ct (du=10) */
+    mlkem_polyvec u;
+    for(int i=0;i<MLKEM_K;i++){
+        mlkem_byte_decode(&u.vec[i], ct + 320*i, 10);
+        mlkem_decompress(&u.vec[i], 10);
+    }
+
+    /* Decode v from ct (dv=4) */
+    mlkem_poly v;
+    mlkem_byte_decode(&v, ct + 320*MLKEM_K, 4);
+    mlkem_decompress(&v, 4);
+
+    /* Decode s_hat from dk */
+    mlkem_polyvec s_hat;
+    for(int i=0;i<MLKEM_K;i++)
+        mlkem_byte_decode(&s_hat.vec[i], dk_pke + 384*i, 12);
+
+    /* NTT(u) */
+    for(int i=0;i<MLKEM_K;i++)
+        mlkem_ntt(&u.vec[i]);
+
+    /* w = v - invNTT(s_hat^T * NTT(u)) */
+    mlkem_poly w;
+    mlkem_polyvec_basemul_acc(&w, &s_hat, &u);
+    mlkem_invntt(&w);
+    mlkem_poly_sub(&w, &v, &w);
+
+    /* m = Compress_1(w) */
+    mlkem_compress(&w, 1);
+    mlkem_byte_encode(m, &w, 1);
+}
+
+/* ML-KEM768 KeyGen (outer CCA, Fujisaki-Okamoto) */
+static void mlkem768_keygen(uint8_t ek[1184], uint8_t dk[2400]) {
+    uint8_t d[32], z[32];
+    random_bytes(d, 32);
+    random_bytes(z, 32);
+
+    uint8_t dk_pke[1152];
+    kpke_keygen(d, ek, dk_pke);
+
+    /* dk = dk_pke || ek || H(ek) || z */
+    memcpy(dk, dk_pke, 1152);
+    memcpy(dk + 1152, ek, 1184);
+    sha3_256(ek, 1184, dk + 1152 + 1184); /* H(ek) */
+    memcpy(dk + 1152 + 1184 + 32, z, 32);
+
+    secure_zero(d, sizeof(d));
+    secure_zero(dk_pke, sizeof(dk_pke));
+}
+
+/* ML-KEM768 Encaps */
+static void __attribute__((unused)) mlkem768_encaps(const uint8_t ek[1184],
+                             uint8_t ct[1088], uint8_t ss[32]) {
+    uint8_t m[32];
+    random_bytes(m, 32);
+
+    /* (K, r) = G(m || H(ek)) */
+    uint8_t h_ek[32];
+    sha3_256(ek, 1184, h_ek);
+    uint8_t g_in[64], g_out[64];
+    memcpy(g_in, m, 32);
+    memcpy(g_in+32, h_ek, 32);
+    sha3_512(g_in, 64, g_out);
+    /* K = g_out[0..31], r = g_out[32..63] */
+
+    kpke_encrypt(ek, m, g_out+32, ct);
+    memcpy(ss, g_out, 32);
+
+    secure_zero(m, sizeof(m));
+    secure_zero(g_in, sizeof(g_in));
+    secure_zero(g_out, sizeof(g_out));
+}
+
+/* ML-KEM768 Decaps (constant-time implicit rejection) */
+static void mlkem768_decaps(const uint8_t dk[2400], const uint8_t ct[1088],
+                             uint8_t ss[32]) {
+    const uint8_t *dk_pke = dk;
+    const uint8_t *ek     = dk + 1152;
+    const uint8_t *h_ek   = dk + 1152 + 1184;
+    const uint8_t *z      = dk + 1152 + 1184 + 32;
+
+    /* Decrypt */
+    uint8_t m_prime[32];
+    kpke_decrypt(dk_pke, ct, m_prime);
+
+    /* (K', r') = G(m' || H(ek)) */
+    uint8_t g_in[64], g_out[64];
+    memcpy(g_in, m_prime, 32);
+    memcpy(g_in+32, h_ek, 32);
+    sha3_512(g_in, 64, g_out);
+
+    /* Re-encrypt to check */
+    uint8_t ct_prime[1088];
+    kpke_encrypt(ek, m_prime, g_out+32, ct_prime);
+
+    /* Constant-time: if ct == ct', output K'; else output J = SHA3-256(z||ct) */
+    uint8_t j_in[32 + 1088];
+    memcpy(j_in, z, 32);
+    memcpy(j_in+32, ct, 1088);
+    uint8_t j[32];
+    sha3_256(j_in, sizeof(j_in), j);
+
+    int eq = ct_memeq(ct, ct_prime, 1088);
+    /* eq=1 if match, eq=0 if mismatch; select constant-time */
+    uint8_t mask = (uint8_t)(-(int8_t)eq); /* 0xFF if eq, 0x00 if not */
+    for(int i=0;i<32;i++)
+        ss[i] = (g_out[i] & mask) | (j[i] & ~mask);
+
+    secure_zero(m_prime, sizeof(m_prime));
+    secure_zero(g_in, sizeof(g_in));
+    secure_zero(g_out, sizeof(g_out));
+    secure_zero(ct_prime, sizeof(ct_prime));
+    secure_zero(j, sizeof(j));
 }
 
 /* Hash algorithm abstraction for unified HMAC/HKDF/PRF */
@@ -5510,6 +6148,7 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
                                   const uint8_t p384_pub[P384_POINT_LEN],
                                   const uint8_t x25519_pub[X25519_KEY_LEN],
                                   const uint8_t x448_pub[X448_KEY_LEN],
+                                  const uint8_t *hybrid_share, /* X25519(32) || ML-KEM ek(1184) = 1216, or NULL */
                                   const char *host,
                                   uint8_t client_random[32],
                                   const uint8_t *session_id,
@@ -5587,9 +6226,10 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 
     /* supported_groups */
     buf[p++]=0x00;buf[p++]=0x0a;
-    buf[p++]=0x00;buf[p++]=0x0a; /* ext len = 4 groups * 2 + 2 */
-    buf[p++]=0x00;buf[p++]=0x08; /* list len = 4 groups * 2 bytes */
-    buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF); /* x25519 (preferred) */
+    buf[p++]=0x00;buf[p++]=0x0c; /* ext len = 5 groups * 2 + 2 */
+    buf[p++]=0x00;buf[p++]=0x0a; /* list len = 5 groups * 2 bytes */
+    PUT16(buf+p,TLS_GROUP_X25519MLKEM768);p+=2; /* hybrid PQ (most preferred) */
+    buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF); /* x25519 */
     buf[p++]=(TLS_GROUP_X448>>8);buf[p++]=(TLS_GROUP_X448&0xFF); /* x448 */
     buf[p++]=(TLS_GROUP_SECP256R1>>8);buf[p++]=(TLS_GROUP_SECP256R1&0xFF); /* secp256r1 */
     buf[p++]=(TLS_GROUP_SECP384R1>>8);buf[p++]=(TLS_GROUP_SECP384R1&0xFF); /* secp384r1 */
@@ -5609,7 +6249,13 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 
     /* key_share */
     buf[p++]=0x00;buf[p++]=0x33;
-    if(only_group==TLS_GROUP_SECP256R1) {
+    if(only_group==TLS_GROUP_X25519MLKEM768 && hybrid_share) {
+        PUT16(buf+p,(uint16_t)(HYBRID_SHARE_LEN+4+2));p+=2;
+        PUT16(buf+p,(uint16_t)(HYBRID_SHARE_LEN+4));p+=2;
+        PUT16(buf+p,TLS_GROUP_X25519MLKEM768);p+=2;
+        PUT16(buf+p,HYBRID_SHARE_LEN);p+=2;
+        memcpy(buf+p,hybrid_share,HYBRID_SHARE_LEN);p+=HYBRID_SHARE_LEN;
+    } else if(only_group==TLS_GROUP_SECP256R1) {
         PUT16(buf+p,(uint16_t)(P256_POINT_LEN+4+2));p+=2;
         PUT16(buf+p,(uint16_t)(P256_POINT_LEN+4));p+=2;
         buf[p++]=(TLS_GROUP_SECP256R1>>8);buf[p++]=(TLS_GROUP_SECP256R1&0xFF);
@@ -5634,10 +6280,16 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
         PUT16(buf+p,X448_KEY_LEN);p+=2;
         memcpy(buf+p,x448_pub,X448_KEY_LEN);p+=X448_KEY_LEN;
     } else {
-        /* Emit X25519 first (most preferred), then X448, P-256, P-384 */
-        uint16_t shares_len=X25519_KEY_LEN+4+X448_KEY_LEN+4+P256_POINT_LEN+4+P384_POINT_LEN+4;
+        /* Emit hybrid PQ first (most preferred), then X25519, X448, P-256, P-384 */
+        uint16_t shares_len=HYBRID_SHARE_LEN+4+X25519_KEY_LEN+4+X448_KEY_LEN+4+P256_POINT_LEN+4+P384_POINT_LEN+4;
+        if(!hybrid_share) shares_len-=HYBRID_SHARE_LEN+4; /* skip hybrid if no key */
         PUT16(buf+p,(uint16_t)(shares_len+2));p+=2;
         PUT16(buf+p,shares_len);p+=2;
+        if(hybrid_share) {
+            PUT16(buf+p,TLS_GROUP_X25519MLKEM768);p+=2;
+            PUT16(buf+p,HYBRID_SHARE_LEN);p+=2;
+            memcpy(buf+p,hybrid_share,HYBRID_SHARE_LEN);p+=HYBRID_SHARE_LEN;
+        }
         buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF);
         PUT16(buf+p,X25519_KEY_LEN);p+=2;
         memcpy(buf+p,x25519_pub,X25519_KEY_LEN);p+=X25519_KEY_LEN;
@@ -5838,6 +6490,10 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
                           && elen>=4+P384_POINT_LEN) {
                     memcpy(server_pub,b+4,P384_POINT_LEN);
                     *pub_len=P384_POINT_LEN;
+                } else if(group==TLS_GROUP_X25519MLKEM768 && klen==HYBRID_RESP_LEN
+                          && elen>=4+HYBRID_RESP_LEN) {
+                    memcpy(server_pub,b+4,HYBRID_RESP_LEN);
+                    *pub_len=HYBRID_RESP_LEN;
                 }
             } else if(etype==0x002b && elen>=2) { /* supported_versions */
                 uint16_t ver=GET16(b);
@@ -6308,12 +6964,14 @@ typedef struct {
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
     uint8_t x25519_priv[X25519_KEY_LEN], x25519_pub[X25519_KEY_LEN];
     uint8_t x448_priv[X448_KEY_LEN], x448_pub[X448_KEY_LEN];
-    uint8_t server_pub[P384_POINT_LEN]; size_t server_pub_len;
+    uint8_t server_pub[HYBRID_RESP_LEN]; size_t server_pub_len; /* 1120 bytes for hybrid */
     uint16_t cipher_suite;
     sha256_ctx transcript;
     sha384_ctx transcript384;
     size_t sh_leftover;
     uint8_t *sh_leftover_data;
+    uint8_t mlkem_dk[MLKEM768_DK_LEN];           /* ML-KEM768 decapsulation key */
+    uint8_t hybrid_x25519_priv[X25519_KEY_LEN];  /* separate X25519 for hybrid — no key reuse */
 } tls_conn;
 
 /* ================================================================
@@ -7454,7 +8112,7 @@ static void tls13_handshake(const tls_conn *conn, int psk_accepted,
     st.transcript = conn->transcript;
     st.transcript384 = conn->transcript384;
 
-    uint8_t server_pub[P384_POINT_LEN];
+    uint8_t server_pub[HYBRID_RESP_LEN];
     size_t server_pub_len = conn->server_pub_len;
     memcpy(server_pub, conn->server_pub, server_pub_len);
     uint8_t p256_priv[P256_SCALAR_LEN], p384_priv[P384_SCALAR_LEN];
@@ -7466,7 +8124,8 @@ static void tls13_handshake(const tls_conn *conn, int psk_accepted,
     memcpy(x448_priv, conn->x448_priv, X448_KEY_LEN);
 
     uint16_t selected_group;
-    if(server_pub_len==X25519_KEY_LEN) selected_group=TLS_GROUP_X25519;
+    if(server_pub_len==HYBRID_RESP_LEN) selected_group=TLS_GROUP_X25519MLKEM768;
+    else if(server_pub_len==X25519_KEY_LEN) selected_group=TLS_GROUP_X25519;
     else if(server_pub_len==X448_KEY_LEN) selected_group=TLS_GROUP_X448;
     else if(server_pub_len==P256_POINT_LEN) selected_group=TLS_GROUP_SECP256R1;
     else selected_group=TLS_GROUP_SECP384R1;
@@ -7474,8 +8133,18 @@ static void tls13_handshake(const tls_conn *conn, int psk_accepted,
         cipher_suite,selected_group);
 
     /* Compute shared secret */
-    uint8_t shared[X448_KEY_LEN]; size_t shared_len; /* X448_KEY_LEN=56 is largest */
-    if(selected_group==TLS_GROUP_X25519) {
+    uint8_t shared[MLKEM768_SS_LEN + X25519_KEY_LEN]; /* 64 bytes max: hybrid = mlkem_ss(32) + x25519(32) */
+    size_t shared_len;
+    if(selected_group==TLS_GROUP_X25519MLKEM768) {
+        /* Server response: ML-KEM768 ciphertext (1088) || X25519 pub (32) */
+        const uint8_t *srv_ct     = server_pub;
+        const uint8_t *srv_x25519 = server_pub + MLKEM768_CT_LEN;
+        /* ML-KEM ss first, then X25519 ss (per draft-ietf-tls-ecdhe-mlkem) */
+        mlkem768_decaps(conn->mlkem_dk, srv_ct, shared);
+        if(x25519_shared_secret(conn->hybrid_x25519_priv, srv_x25519, shared + MLKEM768_SS_LEN) < 0)
+            die("X25519 hybrid shared secret is zero");
+        shared_len = MLKEM768_SS_LEN + X25519_KEY_LEN; /* 64 */
+    } else if(selected_group==TLS_GROUP_X25519) {
         if(x25519_shared_secret(x25519_priv,server_pub,shared)<0)
             die("X25519 shared secret is zero");
         shared_len=X25519_KEY_LEN;
@@ -7497,7 +8166,8 @@ static void tls13_handshake(const tls_conn *conn, int psk_accepted,
     secure_zero(p384_priv,sizeof(p384_priv));
     secure_zero(x25519_priv,sizeof(x25519_priv));
     secure_zero(x448_priv,sizeof(x448_priv));
-    if(tls_verbose) fprintf(stderr,"Computed ECDHE shared secret (%zu bytes)\n",shared_len);
+    if(tls_verbose) fprintf(stderr,"Computed %s shared secret (%zu bytes)\n",
+        selected_group==TLS_GROUP_X25519MLKEM768?"hybrid PQ+ECDHE":"ECDHE",shared_len);
 
     /* Phase 1: Derive handshake keys */
     tls13_derive_hs_keys(&st, shared, shared_len, psk, psk_len);
@@ -7532,6 +8202,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
                                const uint8_t p384_pub[P384_POINT_LEN],
                                const uint8_t x25519_pub[X25519_KEY_LEN],
                                const uint8_t x448_pub[X448_KEY_LEN],
+                               const uint8_t *hybrid_share,
                                const char *host,
                                uint8_t *server_pub, size_t *server_pub_len,
                                uint8_t server_random[32],
@@ -7563,7 +8234,8 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
             }
         }
     }
-    if(hrr_group!=TLS_GROUP_X25519 && hrr_group!=TLS_GROUP_X448
+    if(hrr_group!=TLS_GROUP_X25519MLKEM768 && hrr_group!=TLS_GROUP_X25519
+       && hrr_group!=TLS_GROUP_X448
        && hrr_group!=TLS_GROUP_SECP256R1 && hrr_group!=TLS_GROUP_SECP384R1)
         die("HRR selected unsupported group");
     if(tls_verbose) fprintf(stderr,"  HRR selected group 0x%04x\n",hrr_group);
@@ -7593,8 +8265,8 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
        Reuse client_random and session_id per RFC 8446 §4.1.2. */
     uint8_t *ch = malloc(CH_BUF_SIZE); if(!ch) die("malloc failed");
     uint8_t cr_copy[32]; memcpy(cr_copy, client_random, 32);
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,x448_pub,host,
-        cr_copy,session_id,hrr_group,NULL);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,x448_pub,
+        hybrid_share,host,cr_copy,session_id,hrr_group,NULL);
     if(hrr_aes256)
         sha384_update(transcript384,ch,ch_len);
     else
@@ -7659,12 +8331,22 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     x25519_keygen(x25519_priv,x25519_pub_key);
     uint8_t x448_priv[X448_KEY_LEN], x448_pub_key[X448_KEY_LEN];
     x448_keygen(x448_priv,x448_pub_key);
-    if(tls_verbose) fprintf(stderr,"Generated ECDHE keypairs (X25519 + X448 + P-256 + P-384)\n");
+
+    /* Generate X25519MLKEM768 hybrid key share (separate X25519 for no key reuse) */
+    uint8_t hybrid_x25519_priv[X25519_KEY_LEN], hybrid_x25519_pub[X25519_KEY_LEN];
+    x25519_keygen(hybrid_x25519_priv, hybrid_x25519_pub);
+    uint8_t mlkem_ek[MLKEM768_EK_LEN], mlkem_dk[MLKEM768_DK_LEN];
+    mlkem768_keygen(mlkem_ek, mlkem_dk);
+    uint8_t hybrid_share[HYBRID_SHARE_LEN];
+    memcpy(hybrid_share, mlkem_ek, MLKEM768_EK_LEN);
+    memcpy(hybrid_share + MLKEM768_EK_LEN, hybrid_x25519_pub, X25519_KEY_LEN);
+    if(tls_verbose) fprintf(stderr,"Generated keypairs (X25519MLKEM768 + X25519 + X448 + P-256 + P-384)\n");
 
     /* Build & send ClientHello */
     uint8_t *ch = malloc(CH_BUF_SIZE); if(!ch) die("malloc failed");
     uint8_t client_random[32];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,host,client_random,NULL,0,sess);
+    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,
+        hybrid_share,host,client_random,NULL,0,sess);
     /* Save session_id from ClientHello for HRR reuse (RFC 8446 §4.1.2) */
     const uint8_t *saved_session_id=ch+6+32+1; /* past: type(1)+len(3)+version(2)+random(32)+sid_len(1) */
     /* For the record layer, first ClientHello uses version 0x0301.
@@ -7697,7 +8379,7 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     }
     if(rtype!=TLS_RT_HANDSHAKE) die("expected handshake record");
     if(rec_len<4||rec[0]!=0x02) die("expected ServerHello");
-    uint8_t server_pub[P384_POINT_LEN]; size_t server_pub_len=0;
+    uint8_t server_pub[HYBRID_RESP_LEN]; size_t server_pub_len=0;
     uint8_t server_random[32];
     uint16_t cipher_suite;
     int psk_accepted=0;
@@ -7721,7 +8403,8 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     /* HelloRetryRequest handling */
     if(memcmp(server_random,HRR_RANDOM,32)==0) {
         handle_hello_retry(fd,rec,&rec_len,&cipher_suite,client_random,
-            saved_session_id,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,host,server_pub,&server_pub_len,
+            saved_session_id,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,
+            hybrid_share,host,server_pub,&server_pub_len,
             server_random,&version,&transcript,&transcript384,&sh_leftover);
         sh_msg_len=4+GET24(rec+1); /* rec now holds real ServerHello */
     }
@@ -7754,6 +8437,8 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     memcpy(conn.x448_pub, x448_pub_key, X448_KEY_LEN);
     memcpy(conn.server_pub, server_pub, server_pub_len);
     conn.server_pub_len = server_pub_len;
+    memcpy(conn.mlkem_dk, mlkem_dk, MLKEM768_DK_LEN);
+    memcpy(conn.hybrid_x25519_priv, hybrid_x25519_priv, X25519_KEY_LEN);
     conn.cipher_suite = cipher_suite;
     conn.transcript = transcript;
     conn.transcript384 = transcript384;
@@ -7769,6 +8454,9 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     secure_zero(p384_priv, sizeof(p384_priv));
     secure_zero(x25519_priv, sizeof(x25519_priv));
     secure_zero(x448_priv, sizeof(x448_priv));
+    secure_zero(hybrid_x25519_priv, sizeof(hybrid_x25519_priv));
+    secure_zero(mlkem_dk, sizeof(mlkem_dk));
+    secure_zero(mlkem_ek, sizeof(mlkem_ek));
 
     /* Copy PSK data and free old session before handshake, since
        tls13_transfer_appdata may replace *session with a new ticket */
@@ -8257,6 +8945,58 @@ int main(void) {
                 "c06991f5ecc68a4f9c8c8e40c0b55607"
                 "3ebf96a2a94e5340",priv,56);
         T("X448 reject low-order",x448_shared_secret(priv,zero_pub,out)==-1);
+    }
+
+    /* ---- SHA3-256: empty message (NIST) ---- */
+    {
+        uint8_t out[32], exp[32];
+        sha3_256((const uint8_t*)"",0,out);
+        hex2bin("a7ffc6f8bf1ed76651c14756a061d662"
+                "f580ff4de43b49fa82d80a4b80f8434a",exp,32);
+        T("SHA3-256 empty",memcmp(out,exp,32)==0);
+    }
+
+    /* ---- SHA3-512: empty message (NIST) ---- */
+    {
+        uint8_t out[64], exp[64];
+        sha3_512((const uint8_t*)"",0,out);
+        hex2bin("a69f73cca23a9ac5c8b567dc185a756e"
+                "97c982164fe25859e0d1dcc1475c80a6"
+                "15b2123af1f5f94c11e3e9402c3ac558"
+                "f500199d95b6d3e301758586281dcd26",exp,64);
+        T("SHA3-512 empty",memcmp(out,exp,64)==0);
+    }
+
+    /* ---- SHAKE128: empty input, 32 bytes (NIST) ---- */
+    {
+        uint8_t out[32], exp[32];
+        shake128_ctx ctx;
+        shake128_init(&ctx);
+        shake128_update(&ctx,(const uint8_t*)"",0);
+        shake128_finalize(&ctx);
+        shake128_squeeze(&ctx,out,32);
+        hex2bin("7f9c2ba4e88f827d616045507605853e"
+                "d73b8093f6efbc88eb1a6eacfa66ef26",exp,32);
+        T("SHAKE128 empty 32B",memcmp(out,exp,32)==0);
+    }
+
+    /* ---- ML-KEM768 round-trip: keygen → encaps → decaps ---- */
+    {
+        uint8_t ek[1184], dk[2400], ct[1088], ss_enc[32], ss_dec[32];
+        mlkem768_keygen(ek, dk);
+        mlkem768_encaps(ek, ct, ss_enc);
+        mlkem768_decaps(dk, ct, ss_dec);
+        T("ML-KEM768 round-trip",memcmp(ss_enc,ss_dec,32)==0);
+    }
+
+    /* ---- ML-KEM768 implicit rejection: corrupt ct → different ss ---- */
+    {
+        uint8_t ek[1184], dk[2400], ct[1088], ss_enc[32], ss_dec[32];
+        mlkem768_keygen(ek, dk);
+        mlkem768_encaps(ek, ct, ss_enc);
+        ct[0] ^= 0x01; /* corrupt ciphertext */
+        mlkem768_decaps(dk, ct, ss_dec);
+        T("ML-KEM768 implicit reject",memcmp(ss_enc,ss_dec,32)!=0);
     }
 
     printf("Self-tests: %d passed, %d failed\n",pass,fail);
