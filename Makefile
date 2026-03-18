@@ -1,6 +1,12 @@
 CC ?= cc
 CFLAGS ?= -std=c99 -Wall -Wextra -Werror -pedantic -O2
 
+# x86-64: enable AES-NI, PCLMULQDQ when available
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),x86_64)
+  CFLAGS += -maes -mpclmul -msse4.1 -mssse3
+endif
+
 https_get: https_get.o tls_client.o
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -57,7 +63,7 @@ test-resume: https_get
 	bash test.sh -s resume -n 25
 
 clean:
-	rm -f https_get tls_test *.o ct_log_table.inc
+	rm -f https_get tls_test tls_test_x86 tls_test_portable *.o ct_log_table.inc
 	rm -rf __pycache__
 
 .PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail test-resume clean

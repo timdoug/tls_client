@@ -35,6 +35,15 @@
 #define USE_ARM64_CRYPTO 0
 #endif
 
+/* x86-64 AES-NI, PCLMULQDQ */
+#if defined(__x86_64__) && defined(__AES__) && defined(__PCLMUL__)
+#include <wmmintrin.h>
+#include <smmintrin.h>
+#define USE_X86_AES 1
+#else
+#define USE_X86_AES 0
+#endif
+
 int tls_verbose = 0;
 
 /* ---- Detect limb width: 64-bit on 64-bit platforms, 32-bit otherwise ---- */
@@ -1472,7 +1481,7 @@ static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
     }
 }
 
-#if !USE_ARM64_CRYPTO
+#if !USE_ARM64_CRYPTO && !USE_X86_AES
 static uint8_t xt(uint8_t x){return (uint8_t)((x<<1)^((x>>7)*0x1b));}
 #endif
 
@@ -1486,6 +1495,15 @@ static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t
     state = vaeseq_u8(state, vld1q_u8(rk + 16 * (nr - 1)));
     state = veorq_u8(state, vld1q_u8(rk + 16 * nr));
     vst1q_u8(out, state);
+}
+#elif USE_X86_AES
+static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
+    __m128i state = _mm_loadu_si128((const __m128i *)in);
+    state = _mm_xor_si128(state, _mm_loadu_si128((const __m128i *)rk));
+    for (int i = 1; i < nr; i++)
+        state = _mm_aesenc_si128(state, _mm_loadu_si128((const __m128i *)(rk + 16 * i)));
+    state = _mm_aesenclast_si128(state, _mm_loadu_si128((const __m128i *)(rk + 16 * nr)));
+    _mm_storeu_si128((__m128i *)out, state);
 }
 #else
 static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
@@ -1546,6 +1564,51 @@ static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
     /* Convert back to GCM bit order */
     uint64x2_t result = vcombine_u64(vcreate_u64(r0), vcreate_u64(r1));
     vst1q_u8(r, vrbitq_u8(vreinterpretq_u8_u64(result)));
+}
+#elif USE_X86_AES
+/* Reverse bits within each byte using pshufb nibble LUT */
+static __m128i x86_rbit8(__m128i x) {
+    const __m128i lo_mask = _mm_set1_epi8(0x0F);
+    const __m128i lut = _mm_set_epi8(
+        (char)0xF,(char)0x7,(char)0xB,(char)0x3,
+        (char)0xD,(char)0x5,(char)0x9,(char)0x1,
+        (char)0xE,(char)0x6,(char)0xA,(char)0x2,
+        (char)0xC,(char)0x4,(char)0x8,(char)0x0);
+    __m128i lo = _mm_and_si128(x, lo_mask);
+    __m128i hi = _mm_and_si128(_mm_srli_epi16(x, 4), lo_mask);
+    return _mm_or_si128(_mm_slli_epi16(_mm_shuffle_epi8(lut, lo), 4),
+                        _mm_shuffle_epi8(lut, hi));
+}
+static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
+    /* Reverse bits within each byte: GCM is MSB-first, PCLMULQDQ is LSB-first */
+    __m128i a = x86_rbit8(_mm_loadu_si128((const __m128i *)x));
+    __m128i b = x86_rbit8(_mm_loadu_si128((const __m128i *)y));
+
+    /* Karatsuba: three 64×64→128 carry-less multiplies */
+    __m128i lo = _mm_clmulepi64_si128(a, b, 0x00);
+    __m128i hi = _mm_clmulepi64_si128(a, b, 0x11);
+    __m128i mid = _mm_xor_si128(
+        _mm_clmulepi64_si128(
+            _mm_xor_si128(a, _mm_srli_si128(a, 8)),
+            _mm_xor_si128(b, _mm_srli_si128(b, 8)), 0x00),
+        _mm_xor_si128(lo, hi));
+
+    /* Assemble 256-bit product [r3:r2:r1:r0] */
+    uint64_t r0, r1, r2, r3;
+    r0 = (uint64_t)_mm_extract_epi64(lo, 0);
+    r1 = (uint64_t)_mm_extract_epi64(lo, 1) ^ (uint64_t)_mm_extract_epi64(mid, 0);
+    r2 = (uint64_t)_mm_extract_epi64(hi, 0) ^ (uint64_t)_mm_extract_epi64(mid, 1);
+    r3 = (uint64_t)_mm_extract_epi64(hi, 1);
+
+    /* Reduce mod x^128 + x^7 + x^2 + x + 1 */
+    r1 ^= r3 ^ (r3 << 1) ^ (r3 << 2) ^ (r3 << 7);
+    r2 ^= (r3 >> 63) ^ (r3 >> 62) ^ (r3 >> 57);
+    r0 ^= r2 ^ (r2 << 1) ^ (r2 << 2) ^ (r2 << 7);
+    r1 ^= (r2 >> 63) ^ (r2 >> 62) ^ (r2 >> 57);
+
+    /* Convert back to GCM bit order */
+    __m128i result = _mm_set_epi64x((long long)r1, (long long)r0);
+    _mm_storeu_si128((__m128i *)r, x86_rbit8(result));
 }
 #else
 static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
@@ -1630,7 +1693,7 @@ static int aes_gcm_decrypt_impl(const uint8_t *key, size_t key_len, const uint8_
 /* ================================================================
  * AES Inverse Cipher (for CBC decrypt)
  * ================================================================ */
-#if !USE_ARM64_CRYPTO
+#if !USE_ARM64_CRYPTO && !USE_X86_AES
 static const uint8_t aes_inv_sbox[256] = {
     0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
     0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
@@ -1682,6 +1745,16 @@ static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t
     }
     state = vaesdq_u8(state, vld1q_u8(rk));
     vst1q_u8(out, state);
+}
+#elif USE_X86_AES
+static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
+    __m128i state = _mm_loadu_si128((const __m128i *)in);
+    state = _mm_xor_si128(state, _mm_loadu_si128((const __m128i *)(rk + 16 * nr)));
+    for (int i = nr - 1; i > 0; i--)
+        state = _mm_aesdec_si128(state,
+            _mm_aesimc_si128(_mm_loadu_si128((const __m128i *)(rk + 16 * i))));
+    state = _mm_aesdeclast_si128(state, _mm_loadu_si128((const __m128i *)rk));
+    _mm_storeu_si128((__m128i *)out, state);
 }
 #else
 static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
@@ -9107,6 +9180,8 @@ int main(void) {
     printf("\nBenchmarks");
 #if USE_ARM64_CRYPTO
     printf(" (ARM64 crypto extensions enabled)");
+#elif USE_X86_AES
+    printf(" (x86-64: AES-NI PCLMULQDQ)");
 #else
     printf(" (portable C)");
 #endif
