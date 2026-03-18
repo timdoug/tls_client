@@ -27,6 +27,14 @@
 #include <limits.h>
 #include "tls_client.h"
 
+/* ARM64 Crypto Extensions: AES, SHA-256, PMULL (GF multiply) */
+#if defined(__aarch64__) && (defined(__ARM_FEATURE_CRYPTO) || defined(__ARM_FEATURE_AES))
+#include <arm_neon.h>
+#define USE_ARM64_CRYPTO 1
+#else
+#define USE_ARM64_CRYPTO 0
+#endif
+
 int tls_verbose = 0;
 
 /* ---- Detect limb width: 64-bit on 64-bit platforms, 32-bit otherwise ---- */
@@ -317,6 +325,30 @@ typedef struct { uint32_t h[8]; uint8_t buf[64]; size_t buf_len; uint64_t total;
 #define SIG0(x) (RR(x,7)^RR(x,18)^((x)>>3))
 #define SIG1(x) (RR(x,17)^RR(x,19)^((x)>>10))
 
+#if USE_ARM64_CRYPTO
+static void sha256_transform(sha256_ctx *ctx, const uint8_t blk[64]) {
+    uint32x4_t ab = vld1q_u32(&ctx->h[0]);
+    uint32x4_t ef = vld1q_u32(&ctx->h[4]);
+    uint32x4_t ab_save = ab, ef_save = ef;
+    uint32x4_t m[4];
+    m[0] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blk)));
+    m[1] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blk + 16)));
+    m[2] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blk + 32)));
+    m[3] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blk + 48)));
+    for (int i = 0; i < 16; i++) {
+        uint32x4_t wk = vaddq_u32(m[i % 4], vld1q_u32(&sha256_k[4 * i]));
+        uint32x4_t t = ab;
+        ab = vsha256hq_u32(ab, ef, wk);
+        ef = vsha256h2q_u32(ef, t, wk);
+        if (i < 12)
+            m[i % 4] = vsha256su1q_u32(
+                vsha256su0q_u32(m[i % 4], m[(i + 1) % 4]),
+                m[(i + 2) % 4], m[(i + 3) % 4]);
+    }
+    vst1q_u32(&ctx->h[0], vaddq_u32(ab, ab_save));
+    vst1q_u32(&ctx->h[4], vaddq_u32(ef, ef_save));
+}
+#else
 static void sha256_transform(sha256_ctx *ctx, const uint8_t blk[64]) {
     uint32_t w[64], a,b,c,d,e,f,g,h;
     for(size_t i=0;i<16;i++)
@@ -333,6 +365,7 @@ static void sha256_transform(sha256_ctx *ctx, const uint8_t blk[64]) {
     ctx->h[0]+=a;ctx->h[1]+=b;ctx->h[2]+=c;ctx->h[3]+=d;
     ctx->h[4]+=e;ctx->h[5]+=f;ctx->h[6]+=g;ctx->h[7]+=h;
 }
+#endif
 
 static void sha256_init(sha256_ctx *ctx) {
     ctx->h[0]=0x6a09e667;ctx->h[1]=0xbb67ae85;ctx->h[2]=0x3c6ef372;ctx->h[3]=0xa54ff53a;
@@ -1439,8 +1472,22 @@ static void aes256_expand(const uint8_t key[32], uint8_t rk[240]) {
     }
 }
 
+#if !USE_ARM64_CRYPTO
 static uint8_t xt(uint8_t x){return (uint8_t)((x<<1)^((x>>7)*0x1b));}
+#endif
 
+#if USE_ARM64_CRYPTO
+static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
+    uint8x16_t state = vld1q_u8(in);
+    for (int i = 0; i < nr - 1; i++) {
+        state = vaeseq_u8(state, vld1q_u8(rk + 16 * i));
+        state = vaesmcq_u8(state);
+    }
+    state = vaeseq_u8(state, vld1q_u8(rk + 16 * (nr - 1)));
+    state = veorq_u8(state, vld1q_u8(rk + 16 * nr));
+    vst1q_u8(out, state);
+}
+#else
 static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16]; memcpy(s,in,16);
     for(int i=0;i<16;i++) s[i]^=rk[i];
@@ -1461,10 +1508,46 @@ static void aes_encrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t
     }
     memcpy(out,s,16);
 }
+#endif
 
 /* ================================================================
  * AES-GCM (128/256)
  * ================================================================ */
+#if USE_ARM64_CRYPTO
+static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
+    /* Reverse bits within each byte: GCM is MSB-first, PMULL is LSB-first */
+    uint8x16_t aa = vrbitq_u8(vld1q_u8(x));
+    uint8x16_t bb = vrbitq_u8(vld1q_u8(y));
+    poly64x2_t a = vreinterpretq_p64_u8(aa);
+    poly64x2_t b = vreinterpretq_p64_u8(bb);
+    poly64_t a0 = vgetq_lane_p64(a, 0), a1 = vgetq_lane_p64(a, 1);
+    poly64_t b0 = vgetq_lane_p64(b, 0), b1 = vgetq_lane_p64(b, 1);
+
+    /* Karatsuba: three 64x64->128 carry-less multiplies */
+    uint64x2_t lo = vreinterpretq_u64_p128(vmull_p64(a0, b0));
+    uint64x2_t hi = vreinterpretq_u64_p128(vmull_p64(a1, b1));
+    uint64x2_t mid = vreinterpretq_u64_p128(vmull_p64(
+        (poly64_t)((uint64_t)a0 ^ (uint64_t)a1),
+        (poly64_t)((uint64_t)b0 ^ (uint64_t)b1)));
+    mid = veorq_u64(veorq_u64(mid, lo), hi);
+
+    /* Assemble 256-bit product [r3:r2:r1:r0] */
+    uint64_t r0 = vgetq_lane_u64(lo, 0);
+    uint64_t r1 = vgetq_lane_u64(lo, 1) ^ vgetq_lane_u64(mid, 0);
+    uint64_t r2 = vgetq_lane_u64(hi, 0) ^ vgetq_lane_u64(mid, 1);
+    uint64_t r3 = vgetq_lane_u64(hi, 1);
+
+    /* Reduce mod x^128 + x^7 + x^2 + x + 1 */
+    r1 ^= r3 ^ (r3 << 1) ^ (r3 << 2) ^ (r3 << 7);
+    r2 ^= (r3 >> 63) ^ (r3 >> 62) ^ (r3 >> 57);
+    r0 ^= r2 ^ (r2 << 1) ^ (r2 << 2) ^ (r2 << 7);
+    r1 ^= (r2 >> 63) ^ (r2 >> 62) ^ (r2 >> 57);
+
+    /* Convert back to GCM bit order */
+    uint64x2_t result = vcombine_u64(vcreate_u64(r0), vcreate_u64(r1));
+    vst1q_u8(r, vrbitq_u8(vreinterpretq_u8_u64(result)));
+}
+#else
 static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
     uint8_t v[16],z[16]; memcpy(v,y,16); memset(z,0,16);
     for(int i=0;i<128;i++){
@@ -1476,6 +1559,7 @@ static void gf128_mul(uint8_t r[16], const uint8_t x[16], const uint8_t y[16]) {
     }
     memcpy(r,z,16);
 }
+#endif
 
 static void ghash(const uint8_t h[16], const uint8_t *aad, size_t al,
                    const uint8_t *ct, size_t cl, uint8_t out[16]) {
@@ -1546,6 +1630,7 @@ static int aes_gcm_decrypt_impl(const uint8_t *key, size_t key_len, const uint8_
 /* ================================================================
  * AES Inverse Cipher (for CBC decrypt)
  * ================================================================ */
+#if !USE_ARM64_CRYPTO
 static const uint8_t aes_inv_sbox[256] = {
     0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
     0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
@@ -1585,7 +1670,20 @@ static uint8_t xtm(uint8_t x, uint8_t m) {
     }
     return r;
 }
+#endif
 
+#if USE_ARM64_CRYPTO
+static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
+    uint8x16_t state = vld1q_u8(in);
+    state = veorq_u8(state, vld1q_u8(rk + 16 * nr));
+    for (int i = nr - 1; i > 0; i--) {
+        state = vaesdq_u8(state, vld1q_u8(rk + 16 * i));
+        state = vaesimcq_u8(state);
+    }
+    state = vaesdq_u8(state, vld1q_u8(rk));
+    vst1q_u8(out, state);
+}
+#else
 static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16]; memcpy(s,in,16);
     for(int i=0;i<16;i++) s[i]^=rk[16*nr+i];
@@ -1612,6 +1710,7 @@ static void aes_decrypt(const uint8_t *rk, int nr, const uint8_t in[16], uint8_t
     }
     memcpy(out,s,16);
 }
+#endif
 
 /* ================================================================
  * AES-CBC Encrypt / Decrypt
@@ -9000,6 +9099,73 @@ int main(void) {
     }
 
     printf("Self-tests: %d passed, %d failed\n",pass,fail);
-    return fail>0 ? 1 : 0;
+    if(fail>0) return 1;
+
+    /* ================================================================
+     * Benchmarks
+     * ================================================================ */
+    printf("\nBenchmarks");
+#if USE_ARM64_CRYPTO
+    printf(" (ARM64 crypto extensions enabled)");
+#else
+    printf(" (portable C)");
+#endif
+    printf(":\n");
+
+    {
+        #define BENCH_BYTES (4 * 1024 * 1024)
+        uint8_t *buf = malloc(BENCH_BYTES);
+        uint8_t *out = malloc(BENCH_BYTES + 16);
+        if(!buf || !out) { printf("  malloc failed\n"); return 1; }
+        memset(buf, 0xAB, BENCH_BYTES);
+
+        uint8_t key32[32] = {0}, nonce12[12] = {0}, tag[16], iv16[16] = {0};
+        struct timespec t0, t1;
+        double elapsed, mbs;
+
+        /* SHA-256 */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        { sha256_ctx c; sha256_init(&c); sha256_update(&c, buf, BENCH_BYTES); sha256_final(&c, tag); }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        mbs = ((double)BENCH_BYTES / (1024.0 * 1024.0)) / elapsed;
+        printf("  SHA-256           %8.1f MB/s\n", mbs);
+
+        /* AES-128-GCM encrypt */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        aes_gcm_encrypt_impl(key32, 16, nonce12, NULL, 0, buf, BENCH_BYTES, out, tag);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        mbs = ((double)BENCH_BYTES / (1024.0 * 1024.0)) / elapsed;
+        printf("  AES-128-GCM       %8.1f MB/s\n", mbs);
+
+        /* AES-256-GCM encrypt */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        aes_gcm_encrypt_impl(key32, 32, nonce12, NULL, 0, buf, BENCH_BYTES, out, tag);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        mbs = ((double)BENCH_BYTES / (1024.0 * 1024.0)) / elapsed;
+        printf("  AES-256-GCM       %8.1f MB/s\n", mbs);
+
+        /* AES-128-CBC encrypt */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        aes_cbc_encrypt(key32, 16, iv16, buf, BENCH_BYTES, out);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        mbs = ((double)BENCH_BYTES / (1024.0 * 1024.0)) / elapsed;
+        printf("  AES-128-CBC       %8.1f MB/s\n", mbs);
+
+        /* ChaCha20-Poly1305 encrypt */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        chacha20_poly1305_encrypt(key32, nonce12, NULL, 0, buf, BENCH_BYTES, out, tag);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        mbs = ((double)BENCH_BYTES / (1024.0 * 1024.0)) / elapsed;
+        printf("  ChaCha20-Poly1305 %8.1f MB/s\n", mbs);
+
+        free(buf); free(out);
+    }
+
+    return 0;
 }
 #endif /* TLS_TEST */
