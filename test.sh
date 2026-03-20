@@ -43,14 +43,19 @@ printf "${BLD}=== Compile ===${RST}\n"
 printf "  cc  ... "
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_client.c
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c https_get.c
-cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -DTLS_TEST -o tls_test tls_client.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_test.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c tls_bench.c
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_test tls_test.o tls_client.o
+cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_bench tls_bench.o tls_client.o
 cc -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get https_get.o tls_client.o
 printf "${GRN}ok${RST}\n"
 
 printf "  gcc-15 ... "
 gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o tls_client_gcc.o tls_client.c
 gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o https_get_gcc.o https_get.c
-gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -DTLS_TEST -o tls_test_gcc tls_client.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o tls_test_gcc.o tls_test.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -c -o tls_bench_gcc.o tls_bench.c
+gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o tls_test_gcc tls_test_gcc.o tls_client_gcc.o
 gcc-15 -std=c99 -Wall -Wextra -Werror -pedantic -O2 -o https_get_gcc https_get_gcc.o tls_client_gcc.o
 rm -f https_get_gcc tls_test_gcc *_gcc.o
 printf "${GRN}ok${RST}\n"

@@ -1,6 +1,7 @@
 # Build artifacts
 https_get
 tls_test
+tls_bench
 *.o
 *.plist
 *.dSYM/
@@ -9,5 +10,6 @@ tls_test
 ct_log_table.inc
 __pycache__/
 
-# Trust store (local runtime data)
+# Trust store and CRLs (local runtime data)
 trust_store/
+crls/

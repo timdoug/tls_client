@@ -10,11 +10,16 @@ endif
 https_get: https_get.o tls_client.o
 	$(CC) $(CFLAGS) -o $@ $^
 
-tls_test: tls_client.c tls_client.h ct_log_table.inc
-	$(CC) $(CFLAGS) -DTLS_TEST -o $@ tls_client.c
+tls_test: tls_test.o tls_client.o
+	$(CC) $(CFLAGS) -o $@ $^
 
-tls_client.o: tls_client.c tls_client.h ct_log_table.inc
+tls_bench: tls_bench.o tls_client.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+tls_client.o: tls_client.c tls_client.h tls_crypto.h ct_log_table.inc
 https_get.o: https_get.c tls_client.h
+tls_test.o: tls_test.c tls_crypto.h
+tls_bench.o: tls_bench.c tls_crypto.h
 
 getcerts:
 	@set -e; \
@@ -41,13 +46,13 @@ ct_log_table.inc:
 test: https_get tls_test
 	bash test.sh -n 25
 
-fulltest: https_get tls_test
+fulltest: https_get tls_test tls_bench
 	bash test.sh
 
 test-local: https_get tls_test
 	bash test.sh -s local
 
-test-static:
+test-static: ct_log_table.inc
 	bash test.sh -s compile,static
 
 test-sites-all: https_get
@@ -62,8 +67,11 @@ test-xfail: https_get
 test-resume: https_get
 	bash test.sh -s resume -n 25
 
+bench: tls_bench
+	./tls_bench
+
 clean:
-	rm -f https_get tls_test tls_test_x86 tls_test_portable *.o ct_log_table.inc
+	rm -f https_get tls_test tls_bench tls_test_x86 tls_test_portable *.o ct_log_table.inc
 	rm -rf __pycache__
 
-.PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail test-resume clean
+.PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail test-resume bench clean
