@@ -4244,7 +4244,7 @@ static size_t pem_to_der(const char *pem, size_t pem_len, uint8_t *der) {
 /* Read tag + length, return pointer to value. NULL on error. */
 static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
                                     uint8_t *tag, size_t *len) {
-    if(p >= end) return NULL;
+    if(!p || p >= end) return NULL;
     *tag = *p++;
     if(p >= end) return NULL;
     if(*p < 0x80) {
