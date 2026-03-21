@@ -67,6 +67,9 @@ test-xfail: https_get
 test-resume: https_get
 	bash test.sh -s resume -n 25
 
+test-vectors: tls_test
+	./tls_test
+
 bench: tls_bench
 	./tls_bench
 
@@ -74,4 +77,18 @@ clean:
 	rm -f https_get tls_test tls_bench tls_test_x86 tls_test_portable *.o ct_log_table.inc
 	rm -rf __pycache__
 
-.PHONY: getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail test-resume bench clean
+help:
+	@echo "make test           compile, static analysis, 25 random sites + xfail + local crypto"
+	@echo "make fulltest       compile, static analysis, all ~250 sites + xfail + local crypto"
+	@echo "make test-vectors   RFC/NIST test vectors for all crypto primitives (32 tests)"
+	@echo "make test-local     local openssl s_server cipher suite tests only"
+	@echo "make test-static    compile + static analysis only"
+	@echo "make test-sites     25 random site connection tests only"
+	@echo "make test-sites-all all site connection tests (pass + xfail)"
+	@echo "make test-xfail     expected-failure tests only"
+	@echo "make test-resume    session resumption tests (local + 25 random sites)"
+	@echo "make bench          crypto throughput benchmarks"
+	@echo "make getcerts       download CA trust store from Debian"
+	@echo "make clean          remove build artifacts"
+
+.PHONY: help getcerts test fulltest test-local test-static test-sites-all test-sites test-xfail test-resume test-vectors bench clean

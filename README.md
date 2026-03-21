@@ -115,13 +115,15 @@ Delete `ct_log_table.inc` and re-run `make` to refresh.
 ```
 make test           # compile, static analysis, 25 random sites + xfail + local crypto
 make fulltest       # compile, static analysis, all ~250 sites + xfail + local crypto
-make test-local     # local openssl s_server cipher suite tests only (25 tests)
+make test-vectors   # RFC/NIST test vectors for all crypto primitives (32 tests)
+make test-local     # local openssl s_server cipher suite tests only
 make test-static    # compile + static analysis only
 make test-sites     # 25 random site connection tests only
 make test-sites-all # all site connection tests (pass + xfail)
 make test-xfail     # expected-failure tests only
 make test-resume    # session resumption tests (local + 25 random sites)
-./tls_test          # RFC/NIST test vectors for all crypto primitives (32 tests)
+make bench          # crypto throughput benchmarks
+make help           # show all targets
 ```
 
 The full suite covers:
