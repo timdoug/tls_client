@@ -266,6 +266,7 @@ static inline void put_be64(uint8_t buf[8], uint64_t val) {
 #define TLS_READ_TIMEOUT_S   10
 #define AIA_READ_TIMEOUT_S   5
 #define CRL_READ_TIMEOUT_S   10
+#define HTTP_FETCH_MAX_BYTES (10u * 1024u * 1024u)
 
 static void __attribute__((noreturn)) die(const char *msg) { fprintf(stderr, "FATAL: %s\n", msg); exit(1); }
 
@@ -4253,8 +4254,12 @@ static const uint8_t *der_read_tl(const uint8_t *p, const uint8_t *end,
         int nb = *p++ & 0x7F;
         /* nb==0: reject BER indefinite length */
         if(nb == 0 || nb > 3 || p + nb > end) return NULL;
+        if(nb > 1 && p[0] == 0) return NULL; /* DER: no leading zero length octets */
         *len = 0;
         for(int i = 0; i < nb; i++) *len = (*len << 8) | *p++;
+        if(*len < 0x80) return NULL; /* DER: short form required for small lengths */
+        if((nb == 2 && *len <= 0xFF) || (nb == 3 && *len <= 0xFFFF))
+            return NULL; /* DER: long form must be minimal */
     }
     if(p + *len > end) return NULL;
     return p;
@@ -4289,10 +4294,14 @@ static time_t der_parse_time(const uint8_t *p, const uint8_t *end) {
     const char *s=(const char *)val;
     struct tm t={0};
     if(tag==0x17){ /* UTCTime */
+        if(len!=13 || s[12]!='Z') return 0;
+        for(size_t i=0;i<12;i++) if(s[i]<'0'||s[i]>'9') return 0;
         int yy=(s[0]-'0')*10+(s[1]-'0');
         t.tm_year=yy>=50?yy:yy+100;
         s+=2;
     } else if(tag==0x18){ /* GeneralizedTime */
+        if(len!=15 || s[14]!='Z') return 0;
+        for(size_t i=0;i<14;i++) if(s[i]<'0'||s[i]>'9') return 0;
         t.tm_year=(s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0')-1900;
         s+=4;
     } else return 0;
@@ -4301,7 +4310,17 @@ static time_t der_parse_time(const uint8_t *p, const uint8_t *end) {
     t.tm_hour=(s[4]-'0')*10+(s[5]-'0');
     t.tm_min=(s[6]-'0')*10+(s[7]-'0');
     t.tm_sec=(s[8]-'0')*10+(s[9]-'0');
-    return timegm(&t);
+    if(t.tm_mon<0||t.tm_mon>11||t.tm_mday<1||t.tm_mday>31||
+       t.tm_hour>23||t.tm_min>59||t.tm_sec>59)
+        return 0;
+    struct tm orig=t;
+    time_t out=timegm(&t);
+    if(out==(time_t)-1) return 0;
+    if(t.tm_year!=orig.tm_year||t.tm_mon!=orig.tm_mon||
+       t.tm_mday!=orig.tm_mday||t.tm_hour!=orig.tm_hour||
+       t.tm_min!=orig.tm_min||t.tm_sec!=orig.tm_sec)
+        return 0;
+    return out;
 }
 
 
@@ -4334,6 +4353,10 @@ static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
                               const uint8_t *sig_der, size_t sig_len,
                               const uint8_t *pubkey, size_t pk_len) {
     if(pk_len!=P384_POINT_LEN||pubkey[0]!=0x04) return 0;
+    fp384 qx_check,qy_check;
+    fp384_from_bytes(&qx_check,pubkey+1);
+    fp384_from_bytes(&qy_check,pubkey+49);
+    if(!ec384_on_curve(&qx_check,&qy_check)) return 0;
 
     /* Parse DER signature → (r, s) */
     const uint8_t *p=sig_der, *end=sig_der+sig_len;
@@ -4344,12 +4367,15 @@ static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
 
     const uint8_t *rval=der_expect(p,end,0x02,&len);
     if(!rval) return 0;
+    if(len==0||(rval[0]&0x80)||(len>1&&rval[0]==0&&!(rval[1]&0x80))) return 0;
     const uint8_t *rp=rval; size_t rlen=len;
     if(rlen>0&&rp[0]==0){rp++;rlen--;}
     p=rval+len;
 
     const uint8_t *sval=der_expect(p,end,0x02,&len);
     if(!sval) return 0;
+    if(len==0||(sval[0]&0x80)||(len>1&&sval[0]==0&&!(sval[1]&0x80))) return 0;
+    if(sval+len!=end) return 0;
     const uint8_t *sp=sval; size_t slen=len;
     if(slen>0&&sp[0]==0){sp++;slen--;}
 
@@ -4382,10 +4408,7 @@ static int ecdsa_p384_verify(const uint8_t *hash, size_t hash_len,
     /* R = u1*G + u2*Q */
     ec384 G; G.x=P384_GX; G.y=P384_GY; G.z=FP384_ONE;
     ec384 Q;
-    fp384 qx,qy;
-    fp384_from_bytes(&qx,pubkey+1);
-    fp384_from_bytes(&qy,pubkey+49);
-    Q.x=qx; Q.y=qy; Q.z=FP384_ONE;
+    Q.x=qx_check; Q.y=qy_check; Q.z=FP384_ONE;
 
     ec384 R1,R2,R;
     ec384_scalar_mul_vartime(&R1,&G,u1_bytes);
@@ -4408,6 +4431,10 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
                               const uint8_t *sig_der, size_t sig_len,
                               const uint8_t *pubkey, size_t pk_len) {
     if(pk_len!=P256_POINT_LEN||pubkey[0]!=0x04) return 0;
+    fp256 qx_check,qy_check;
+    fp256_from_bytes(&qx_check,pubkey+1);
+    fp256_from_bytes(&qy_check,pubkey+33);
+    if(!ec256_on_curve(&qx_check,&qy_check)) return 0;
 
     /* Parse DER signature → (r, s) */
     const uint8_t *p=sig_der, *end=sig_der+sig_len;
@@ -4418,12 +4445,15 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
 
     const uint8_t *rval=der_expect(p,end,0x02,&len);
     if(!rval) return 0;
+    if(len==0||(rval[0]&0x80)||(len>1&&rval[0]==0&&!(rval[1]&0x80))) return 0;
     const uint8_t *rp=rval; size_t rlen=len;
     if(rlen>0&&rp[0]==0){rp++;rlen--;}
     p=rval+len;
 
     const uint8_t *sval=der_expect(p,end,0x02,&len);
     if(!sval) return 0;
+    if(len==0||(sval[0]&0x80)||(len>1&&sval[0]==0&&!(sval[1]&0x80))) return 0;
+    if(sval+len!=end) return 0;
     const uint8_t *sp=sval; size_t slen=len;
     if(slen>0&&sp[0]==0){sp++;slen--;}
 
@@ -4458,10 +4488,7 @@ static int ecdsa_p256_verify(const uint8_t *hash, size_t hash_len,
     ec256 G;
     G.x=P256_GX; G.y=P256_GY; G.z=FP256_ONE;
 
-    fp256 qx,qy;
-    fp256_from_bytes(&qx,pubkey+1);
-    fp256_from_bytes(&qy,pubkey+33);
-    ec256 Q; Q.x=qx; Q.y=qy; Q.z=FP256_ONE;
+    ec256 Q; Q.x=qx_check; Q.y=qy_check; Q.z=FP256_ONE;
 
     ec256 R1; ec256_scalar_mul_vartime(&R1,&G,u1_bytes);
     ec256 R2; ec256_scalar_mul_vartime(&R2,&Q,u2_bytes);
@@ -4636,6 +4663,8 @@ static const uint8_t OID_SHA256_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x
 static const uint8_t OID_SHA384_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0C};
 static const uint8_t OID_SHA512_RSA[]   = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0D};
 static const uint8_t OID_EC_PUBKEY[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
+static const uint8_t OID_SECP256R1[]    = {0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07};
+static const uint8_t OID_SECP384R1[]    = {0x2B,0x81,0x04,0x00,0x22};
 static const uint8_t OID_RSA_ENC[]      = {0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01};
 static const uint8_t OID_SAN[]          = {0x55,0x1D,0x11};
 static const uint8_t OID_BASIC_CONSTRAINTS[] = {0x55,0x1D,0x13};
@@ -4681,48 +4710,78 @@ typedef struct {
     const uint8_t *spki; size_t spki_len;            /* raw DER SubjectPublicKeyInfo */
     const uint8_t *serial; size_t serial_len;        /* raw DER INTEGER (tag+len+value) */
     const uint8_t *crl_dp_url; size_t crl_dp_url_len; /* first HTTP CRL distribution point */
+    int ec_curve;                                    /* TLS_GROUP_SECP256R1 or TLS_GROUP_SECP384R1 */
 } x509_cert;
+
+static const uint8_t *x509_ext_octets(const uint8_t *eoid, size_t oid_len,
+                                      const uint8_t *ext_end,
+                                      int *critical, size_t *oct_len) {
+    uint8_t tag; size_t len;
+    const uint8_t *rest=eoid+oid_len;
+    *critical=0;
+    if(rest<ext_end&&*rest==0x01){
+        const uint8_t *cv=der_read_tl(rest,ext_end,&tag,&len);
+        if(!cv||tag!=0x01||len!=1) return NULL;
+        *critical=(cv[0]!=0);
+        rest=cv+len;
+    }
+    const uint8_t *oct=der_read_tl(rest,ext_end,&tag,&len);
+    if(!oct||tag!=0x04) return NULL;
+    if(oct+len!=ext_end) return NULL;
+    *oct_len=len;
+    return oct;
+}
 
 static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8_t *tbs_end) {
     uint8_t tag; size_t len;
     if(tp>=tbs_end||*tp!=0xA3) return 0;
     const uint8_t *ext_outer=der_read_tl(tp,tbs_end,&tag,&len);
-    if(!ext_outer) return 0;
+    if(!ext_outer||tag!=0xA3) return -1;
     const uint8_t *exts_val=der_expect(ext_outer,ext_outer+len,0x30,&len);
-    if(!exts_val) return 0;
+    if(!exts_val) return -1;
     const uint8_t *ep=exts_val, *exts_end=exts_val+len;
     #define MAX_EXT_OIDS 20
     struct { const uint8_t *oid; size_t len; } seen_oids[MAX_EXT_OIDS];
     int seen_count=0;
     while(ep<exts_end){
         const uint8_t *ext_seq=der_expect(ep,exts_end,0x30,&len);
-        if(!ext_seq) break;
+        if(!ext_seq) return -1;
         const uint8_t *ext_end2=ext_seq+len;
         ep=ext_end2;
         const uint8_t *eoid=der_expect(ext_seq,ext_end2,0x06,&len);
-        if(!eoid) continue;
+        if(!eoid) return -1;
         /* RFC 5280 §4.2: each extension OID must be unique */
         for(int si=0;si<seen_count;si++){
             if(seen_oids[si].len==len && memcmp(seen_oids[si].oid,eoid,len)==0)
                 return -1;
         }
-        if(seen_count<MAX_EXT_OIDS){
-            seen_oids[seen_count].oid=eoid;
-            seen_oids[seen_count].len=len;
-            seen_count++;
-        }
+        if(seen_count>=MAX_EXT_OIDS) return -1;
+        seen_oids[seen_count].oid=eoid;
+        seen_oids[seen_count].len=len;
+        seen_count++;
+        int critical=0;
+        size_t oct_len=0;
         if(oid_eq(eoid,len,OID_SAN,sizeof(OID_SAN))){
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){cert->san=oct;cert->san_len=len;}
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            const uint8_t *sq=der_read_tl(oct,oct+oct_len,&tag,&len);
+            if(!sq||tag!=0x30) return -1;
+            if(sq+len!=oct+oct_len) return -1;
+            const uint8_t *gn=sq, *gn_end=sq+len;
+            while(gn<gn_end) {
+                const uint8_t *gv=der_read_tl(gn,gn_end,&tag,&len);
+                if(!gv) return -1;
+                if(tag==0x82 && len==0) return -1;
+                gn=gv+len;
+            }
+            cert->san=oct; cert->san_len=oct_len;
         } else if(oid_eq(eoid,len,OID_BASIC_CONSTRAINTS,sizeof(OID_BASIC_CONSTRAINTS))){
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){
-                const uint8_t *oct_end=oct+len;
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            {
+                const uint8_t *oct_end=oct+oct_len;
                 const uint8_t *sq=der_read_tl(oct,oct_end,&tag,&len);
+                if(!sq||tag!=0x30) return -1;
                 if(sq&&tag==0x30){
                     const uint8_t *sq_end=sq+len;
                     const uint8_t *bp=sq;
@@ -4734,59 +4793,56 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
                     }
                     if(bp<sq_end&&*bp==0x02){
                         const uint8_t *pv=der_read_tl(bp,sq_end,&tag,&len);
-                        if(pv&&tag==0x02&&len>=1){
+                        if(!pv||tag!=0x02||len<1||len>4) return -1;
+                        {
                             int pl=0;
                             for(size_t j=0;j<len;j++) pl=(pl<<8)|pv[j];
                             cert->path_len=pl;
+                            bp=pv+len;
                         }
                     }
+                    if(bp!=sq_end) return -1;
                 }
             }
         } else if(oid_eq(eoid,len,OID_KEY_USAGE,sizeof(OID_KEY_USAGE))){
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){
-                const uint8_t *bs=der_read_tl(oct,oct+len,&tag,&len);
-                if(bs&&tag==0x03&&len>=2){
-                    cert->has_key_usage=1;
-                    cert->key_usage=bs[1];
-                    if(len>=3) cert->key_usage|=((uint16_t)bs[2]<<8);
-                }
-            }
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            const uint8_t *bs=der_read_tl(oct,oct+oct_len,&tag,&len);
+            if(!bs||tag!=0x03||len<2||bs[0]>7) return -1;
+            cert->has_key_usage=1;
+            cert->key_usage=bs[1];
+            if(len>=3) cert->key_usage|=((uint16_t)bs[2]<<8);
         } else if(oid_eq(eoid,len,OID_EXT_KEY_USAGE,sizeof(OID_EXT_KEY_USAGE))){
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){
-                const uint8_t *sq=der_read_tl(oct,oct+len,&tag,&len);
-                if(sq&&tag==0x30){
-                    const uint8_t *sq_end=sq+len;
-                    cert->has_eku=1;
-                    while(sq<sq_end){
-                        const uint8_t *eo=der_read_tl(sq,sq_end,&tag,&len);
-                        if(!eo||tag!=0x06) break;
-                        if(oid_eq(eo,len,OID_SERVER_AUTH,sizeof(OID_SERVER_AUTH)))
-                            cert->eku_server_auth=1;
-                        sq=eo+len;
-                    }
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            const uint8_t *sq=der_read_tl(oct,oct+oct_len,&tag,&len);
+            if(!sq||tag!=0x30) return -1;
+            {
+                const uint8_t *sq_end=sq+len;
+                cert->has_eku=1;
+                while(sq<sq_end){
+                    const uint8_t *eo=der_read_tl(sq,sq_end,&tag,&len);
+                    if(!eo||tag!=0x06) return -1;
+                    if(oid_eq(eo,len,OID_SERVER_AUTH,sizeof(OID_SERVER_AUTH)))
+                        cert->eku_server_auth=1;
+                    sq=eo+len;
                 }
             }
         } else if(oid_eq(eoid,len,OID_AIA,sizeof(OID_AIA))){
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){
-                const uint8_t *sq=der_read_tl(oct,oct+len,&tag,&len);
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            {
+                const uint8_t *sq=der_read_tl(oct,oct+oct_len,&tag,&len);
+                if(!sq||tag!=0x30) return -1;
                 if(sq&&tag==0x30){
                     const uint8_t *sq_end=sq+len;
                     while(sq<sq_end){
                         const uint8_t *ad=der_read_tl(sq,sq_end,&tag,&len);
-                        if(!ad||tag!=0x30) break;
+                        if(!ad||tag!=0x30) return -1;
                         const uint8_t *ad_end=ad+len;
                         sq=ad_end;
                         const uint8_t *moid=der_read_tl(ad,ad_end,&tag,&len);
-                        if(!moid||tag!=0x06) continue;
+                        if(!moid||tag!=0x06) return -1;
                         if(!oid_eq(moid,len,OID_CA_ISSUERS,sizeof(OID_CA_ISSUERS)))
                             continue;
                         const uint8_t *loc=moid+len;
@@ -4802,34 +4858,37 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
                 }
             }
         } else if(oid_eq(eoid,len,OID_NAME_CONSTRAINTS,sizeof(OID_NAME_CONSTRAINTS))){
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){cert->name_constraints=oct;cert->name_constraints_len=len;}
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            const uint8_t *sq=der_read_tl(oct,oct+oct_len,&tag,&len);
+            if(!sq||tag!=0x30) return -1;
+            cert->name_constraints=oct; cert->name_constraints_len=oct_len;
         } else if(oid_eq(eoid,len,OID_POLICY_CONSTRAINTS,sizeof(OID_POLICY_CONSTRAINTS))){
-            /* Recognized to avoid critical-extension rejection; not enforced */
-            (void)0;
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            const uint8_t *sq=der_read_tl(oct,oct+oct_len,&tag,&len);
+            if(!sq||tag!=0x30) return -1;
+            if(critical) return -1; /* recognized, but not implemented */
         } else if(oid_eq(eoid,len,OID_SCT_LIST,sizeof(OID_SCT_LIST))){
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){cert->sct_list=oct;cert->sct_list_len=len;}
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            cert->sct_list=oct; cert->sct_list_len=oct_len;
         } else if(oid_eq(eoid,len,OID_CRL_DIST_POINTS,sizeof(OID_CRL_DIST_POINTS))){
             /* CRL Distribution Points: SEQUENCE OF DistributionPoint
              * DistributionPoint ::= SEQUENCE { distributionPoint [0] { fullName [0] GeneralNames } }
              * GeneralName ::= uniformResourceIdentifier [6] IA5String */
-            const uint8_t *rest=eoid+len;
-            if(rest<ext_end2&&*rest==0x01) rest=der_skip(rest,ext_end2);
-            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
-            if(oct&&tag==0x04){
+            const uint8_t *oct=x509_ext_octets(eoid,len,ext_end2,&critical,&oct_len);
+            if(!oct) return -1;
+            {
                 /* OCTET STRING wraps SEQUENCE OF DistributionPoint */
-                const uint8_t *sq=der_expect(oct,oct+len,0x30,&len);
+                const uint8_t *sq=der_expect(oct,oct+oct_len,0x30,&len);
+                if(!sq) return -1;
                 if(sq){
                     const uint8_t *sq_end=sq+len;
                     while(sq<sq_end&&!cert->crl_dp_url){
                         /* DistributionPoint SEQUENCE */
                         const uint8_t *dp=der_read_tl(sq,sq_end,&tag,&len);
-                        if(!dp||tag!=0x30) break;
+                        if(!dp||tag!=0x30) return -1;
                         const uint8_t *dp_end=dp+len;
                         sq=dp_end;
                         /* distributionPoint [0] EXPLICIT */
@@ -4859,6 +4918,7 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
                                 }
                             }
                         }
+                        if(sq>sq_end) return -1;
                     }
                 }
             }
@@ -4867,9 +4927,12 @@ static int parse_x509_extensions(x509_cert *cert, const uint8_t *tp, const uint8
             const uint8_t *rest=eoid+len;
             if(rest<ext_end2&&*rest==0x01){
                 const uint8_t *cv=der_read_tl(rest,ext_end2,&tag,&len);
-                if(cv&&tag==0x01&&len==1&&cv[0]!=0)
-                    return -1;
+                if(!cv||tag!=0x01||len!=1) return -1;
+                if(cv[0]!=0) return -1;
+                rest=cv+len;
             }
+            const uint8_t *oct=der_read_tl(rest,ext_end2,&tag,&len);
+            if(!oct||tag!=0x04||oct+len!=ext_end2) return -1;
         }
     }
     return 0;
@@ -4885,6 +4948,7 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     p=der_expect(p,end,0x30,&len);
     if(!p) return -1;
     const uint8_t *cert_end=p+len;
+    if(cert_end!=end) return -1;
 
     /* TBSCertificate — save raw bytes including tag+length */
     const uint8_t *tbs_start=p;
@@ -4925,6 +4989,7 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
         cert->not_before=der_parse_time(vld,vld_end);
         const uint8_t *after_nb=der_skip(vld,vld_end);
         cert->not_after=der_parse_time(after_nb,vld_end);
+        if(cert->not_before==0||cert->not_after==0) return -1;
         tp=vld_end;
     }
 
@@ -4954,10 +5019,33 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     int is_rsa=oid_eq(pk_oid,len,OID_RSA_ENC,sizeof(OID_RSA_ENC));
     int is_ed25519=oid_eq(pk_oid,len,OID_ED25519,sizeof(OID_ED25519));
     int is_ed448=oid_eq(pk_oid,len,OID_ED448,sizeof(OID_ED448));
+    const uint8_t *alg_params=pk_oid+len;
+    int ec_curve=0;
+    if(is_ec){
+        const uint8_t *curve_oid=der_expect(alg_params,alg_end,0x06,&len);
+        if(!curve_oid) return -1;
+        if(oid_eq(curve_oid,len,OID_SECP256R1,sizeof(OID_SECP256R1)))
+            ec_curve=TLS_GROUP_SECP256R1;
+        else if(oid_eq(curve_oid,len,OID_SECP384R1,sizeof(OID_SECP384R1)))
+            ec_curve=TLS_GROUP_SECP384R1;
+        else return -1;
+        if(curve_oid+len!=alg_end) return -1;
+    } else if(is_rsa) {
+        if(alg_params<alg_end) {
+            const uint8_t *param=der_read_tl(alg_params,alg_end,&tag,&len);
+            if(!param||tag!=0x05||len!=0||param+len!=alg_end) return -1;
+        }
+    } else if(is_ed25519||is_ed448) {
+        if(alg_params!=alg_end) return -1;
+    } else {
+        return -1;
+    }
 
     /* BIT STRING with public key follows AlgorithmIdentifier */
     const uint8_t *bs_val=der_read_tl(alg_end,spki_end,&tag,&len);
     if(!bs_val||tag!=0x03||len<2) return -1;
+    if(bs_val[0]!=0) return -1;
+    if(bs_val+len!=spki_end) return -1;
 
     if(is_ed25519){
         cert->key_type=3;
@@ -4969,8 +5057,24 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
         cert->pubkey_len=len-1;
     } else if(is_ec){
         cert->key_type=1;
+        cert->ec_curve=ec_curve;
         cert->pubkey=bs_val+1; /* skip unused-bits byte */
         cert->pubkey_len=len-1;
+        if(ec_curve==TLS_GROUP_SECP256R1) {
+            if(cert->pubkey_len!=P256_POINT_LEN || cert->pubkey[0]!=0x04)
+                return -1;
+            fp256 qx,qy;
+            fp256_from_bytes(&qx,cert->pubkey+1);
+            fp256_from_bytes(&qy,cert->pubkey+33);
+            if(!ec256_on_curve(&qx,&qy)) return -1;
+        } else if(ec_curve==TLS_GROUP_SECP384R1) {
+            if(cert->pubkey_len!=P384_POINT_LEN || cert->pubkey[0]!=0x04)
+                return -1;
+            fp384 qx,qy;
+            fp384_from_bytes(&qx,cert->pubkey+1);
+            fp384_from_bytes(&qy,cert->pubkey+49);
+            if(!ec384_on_curve(&qx,&qy)) return -1;
+        }
     } else if(is_rsa){
         cert->key_type=2;
         const uint8_t *rsa_p=bs_val+1, *rsa_end2=bs_val+len;
@@ -4980,17 +5084,30 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
         /* INTEGER n */
         const uint8_t *nv=der_expect(rsa_seq,rsa_seq_end,0x02,&len);
         if(!nv) return -1;
+        if(len==0||(nv[0]&0x80)||(len>1&&nv[0]==0&&!(nv[1]&0x80))) return -1;
         cert->rsa_n=nv; cert->rsa_n_len=len;
         if(cert->rsa_n_len>0&&cert->rsa_n[0]==0){cert->rsa_n++;cert->rsa_n_len--;}
         /* INTEGER e */
         const uint8_t *ev=der_expect(nv+len,rsa_seq_end,0x02,&len);
         if(!ev) return -1;
+        if(len==0||(ev[0]&0x80)||(len>1&&ev[0]==0&&!(ev[1]&0x80))) return -1;
+        if(ev+len!=rsa_seq_end) return -1;
         cert->rsa_e=ev; cert->rsa_e_len=len;
         if(cert->rsa_e_len>0&&cert->rsa_e[0]==0){cert->rsa_e++;cert->rsa_e_len--;}
+        if(cert->rsa_e_len==0 || !(cert->rsa_e[cert->rsa_e_len-1]&1)) return -1;
     }
 
-    /* Extensions [3] */
-    if(parse_x509_extensions(cert,tp,tbs_end)<0) return -1;
+    /* Optional issuerUniqueID [1] and subjectUniqueID [2], then extensions [3]. */
+    while(tp<tbs_end&&(*tp==0x81||*tp==0x82)){
+        tp=der_skip(tp,tbs_end);
+        if(!tp) return -1;
+    }
+    if(tp<tbs_end){
+        if(*tp!=0xA3) return -1;
+        const uint8_t *ext_next=der_skip(tp,tbs_end);
+        if(!ext_next||ext_next!=tbs_end) return -1;
+        if(parse_x509_extensions(cert,tp,tbs_end)<0) return -1;
+    }
 
     /* signatureAlgorithm (after TBS) */
     p=cert->tbs+cert->tbs_len;
@@ -5005,6 +5122,8 @@ static int x509_parse(x509_cert *cert, const uint8_t *der, size_t der_len) {
     p=sa_end;
     const uint8_t *sv=der_read_tl(p,cert_end,&tag,&len);
     if(!sv||tag!=0x03||len<2) return -1;
+    if(sv[0]!=0) return -1;
+    if(sv+len!=cert_end) return -1;
     cert->sig=sv+1; cert->sig_len=len-1;
     return 0;
 }
@@ -5042,19 +5161,20 @@ static int verify_hostname(const x509_cert *cert, const char *hostname) {
         const uint8_t *p=cert->san, *end=cert->san+cert->san_len;
         int has_dns_name=0;
         p=der_read_tl(p,end,&tag,&len);
-        if(p&&tag==0x30){
-            end=p+len;
-            while(p<end){
-                const uint8_t *val=der_read_tl(p,end,&tag,&len);
-                if(!val) break;
-                if(tag==0x82){ /* dNSName */
-                    has_dns_name=1;
-                    if(dns_name_eq(val,len,hostname,hn_len)) return 1;
-                    if(wildcard_match(val,len,hostname)) return 1;
-                }
-                p=val+len;
+        if(!p||tag!=0x30||p+len!=end) return 0;
+        end=p+len;
+        while(p<end){
+            const uint8_t *val=der_read_tl(p,end,&tag,&len);
+            if(!val) return 0;
+            if(tag==0x82){ /* dNSName */
+                if(len==0) return 0;
+                has_dns_name=1;
+                if(dns_name_eq(val,len,hostname,hn_len)) return 1;
+                if(wildcard_match(val,len,hostname)) return 1;
             }
+            p=val+len;
         }
+        if(p!=end) return 0;
         /* RFC 6125 §6.4.4: if SAN has dNSName entries, don't fall back to CN */
         if(has_dns_name) return 0;
     }
@@ -5062,22 +5182,30 @@ static int verify_hostname(const x509_cert *cert, const char *hostname) {
     static const uint8_t OID_CN[]={0x55,0x04,0x03};
     const uint8_t *p=cert->subject, *end=cert->subject+cert->subject_len;
     p=der_expect(p,end,0x30,&len);
-    if(!p) return 0;
+    if(!p||p+len!=end) return 0;
     end=p+len;
     while(p<end){
         const uint8_t *set_val=der_expect(p,end,0x31,&len);
-        if(!set_val) break;
-        p=set_val+len;
-        const uint8_t *seq_val=der_expect(set_val,set_val+len,0x30,&len);
-        if(!seq_val) continue;
-        const uint8_t *seq_end=seq_val+len;
-        const uint8_t *ov=der_expect(seq_val,seq_end,0x06,&len);
-        if(!ov) continue;
-        if(oid_eq(ov,len,OID_CN,sizeof(OID_CN))){
-            const uint8_t *cv=der_read_tl(ov+len,seq_end,&tag,&len);
-            if(cv&&dns_name_eq(cv,len,hostname,hn_len)) return 1;
+        if(!set_val) return 0;
+        const uint8_t *set_end=set_val+len;
+        p=set_end;
+        const uint8_t *rp=set_val;
+        while(rp<set_end){
+            const uint8_t *seq_val=der_expect(rp,set_end,0x30,&len);
+            if(!seq_val) return 0;
+            const uint8_t *seq_end=seq_val+len;
+            rp=seq_end;
+            const uint8_t *ov=der_expect(seq_val,seq_end,0x06,&len);
+            if(!ov) return 0;
+            if(oid_eq(ov,len,OID_CN,sizeof(OID_CN))){
+                const uint8_t *cv=der_read_tl(ov+len,seq_end,&tag,&len);
+                if(!cv||cv+len!=seq_end) return 0;
+                if(dns_name_eq(cv,len,hostname,hn_len)) return 1;
+            }
         }
+        if(rp!=set_end) return 0;
     }
+    if(p!=end) return 0;
     return 0;
 }
 
@@ -5205,7 +5333,8 @@ static int verify_signature(const uint8_t *tbs, size_t tbs_len,
 }
 
 /* Validate leaf certificate: hostname, EKU, keyUsage */
-static int validate_leaf_cert(const x509_cert *leaf, const char *hostname) {
+static int validate_leaf_cert(const x509_cert *leaf, const char *hostname,
+                              int rsa_key_transport) {
     if(!verify_hostname(leaf,hostname)){
         fprintf(stderr,"Hostname verification failed for %s\n",hostname);
         return -1;
@@ -5215,9 +5344,16 @@ static int validate_leaf_cert(const x509_cert *leaf, const char *hostname) {
         fprintf(stderr,"Leaf certificate EKU does not include serverAuth\n");
         return -1;
     }
-    if(leaf->has_key_usage && !(leaf->key_usage & 0x80)){
-        fprintf(stderr,"Leaf certificate keyUsage missing digitalSignature\n");
-        return -1;
+    if(leaf->has_key_usage) {
+        if(rsa_key_transport) {
+            if(!(leaf->key_usage & 0x20)){
+                fprintf(stderr,"Leaf certificate keyUsage missing keyEncipherment\n");
+                return -1;
+            }
+        } else if(!(leaf->key_usage & 0x80)){
+            fprintf(stderr,"Leaf certificate keyUsage missing digitalSignature\n");
+            return -1;
+        }
     }
     return 0;
 }
@@ -5276,7 +5412,9 @@ static int http_fetch(const uint8_t *url, size_t url_len, int timeout_s,
     if(!buf){ close(fd); return -1; }
     for(;;){
         if(total==cap){
+            if(cap>=HTTP_FETCH_MAX_BYTES){ free(buf); close(fd); return -1; }
             cap*=2;
+            if(cap>HTTP_FETCH_MAX_BYTES) cap=HTTP_FETCH_MAX_BYTES;
             uint8_t *nb=realloc(buf,cap);
             if(!nb){ free(buf); close(fd); return -1; }
             buf=nb;
@@ -5356,6 +5494,7 @@ static int check_name_constraints(const x509_cert *ca, const x509_cert *leaf,
     /* NameConstraints ::= SEQUENCE { permittedSubtrees [0], excludedSubtrees [1] } */
     const uint8_t *seq=der_expect(p,nc_end,0x30,&len);
     if(!seq) return -1;
+    if(seq+len!=nc_end) return -1;
     const uint8_t *seq_end=seq+len;
     const uint8_t *sp=seq;
 
@@ -5366,33 +5505,37 @@ static int check_name_constraints(const x509_cert *ca, const x509_cert *leaf,
 
     while(sp<seq_end){
         const uint8_t *sub=der_read_tl(sp,seq_end,&tag,&len);
-        if(!sub) break;
+        if(!sub) return -1;
         const uint8_t *sub_end=sub+len;
         sp=sub_end;
         int is_permitted=(tag==0xA0);
         int is_excluded=(tag==0xA1);
-        if(!is_permitted&&!is_excluded) continue;
+        if(!is_permitted&&!is_excluded) return -1;
         /* Parse GeneralSubtrees: SEQUENCE OF GeneralSubtree */
         const uint8_t *gp=sub;
         while(gp<sub_end){
             const uint8_t *gs=der_read_tl(gp,sub_end,&tag,&len);
-            if(!gs||tag!=0x30) break;
+            if(!gs||tag!=0x30) return -1;
             const uint8_t *gs_end=gs+len;
             gp=gs_end;
             /* GeneralSubtree.base is a GeneralName; dNSName = tag 0x82 */
             const uint8_t *base=der_read_tl(gs,gs_end,&tag,&len);
-            if(!base) continue;
+            if(!base) return -1;
             if(tag==0x82){ /* dNSName */
-                if(is_permitted&&n_permitted<MAX_NC_NAMES){
+                if(len==0) return -1;
+                if(is_permitted){
+                    if(n_permitted>=MAX_NC_NAMES) return -1;
                     permitted[n_permitted].name=base;
                     permitted[n_permitted].len=len;
                     n_permitted++;
-                } else if(is_excluded&&n_excluded<MAX_NC_NAMES){
+                } else if(is_excluded){
+                    if(n_excluded>=MAX_NC_NAMES) return -1;
                     excluded[n_excluded].name=base;
                     excluded[n_excluded].len=len;
                     n_excluded++;
                 }
             }
+            if(base+len!=gs_end) return -1;
         }
     }
     #undef MAX_NC_NAMES
@@ -5429,15 +5572,16 @@ static int check_name_constraints(const x509_cert *ca, const x509_cert *leaf,
             lend=lp+len;
             while(lp<lend){
                 const uint8_t *val=der_read_tl(lp,lend,&tag,&len);
-                if(!val) break;
+                if(!val) return -1;
                 if(tag==0x82&&len>0){ /* dNSName */
+                    if(len>=MAX_HOSTNAME) return -1;
                     char nbuf[MAX_HOSTNAME];
-                    size_t nlen=len<sizeof(nbuf)?len:sizeof(nbuf)-1;
-                    memcpy(nbuf,val,nlen); nbuf[nlen]='\0';
-                    CHECK_NAME(nbuf,nlen);
+                    memcpy(nbuf,val,len); nbuf[len]='\0';
+                    CHECK_NAME(nbuf,len);
                 }
                 lp=val+len;
             }
+            if(lp!=lend) return -1;
         }
     }
 
@@ -5616,6 +5760,7 @@ static int ct_verify_sct(const uint8_t *precert_tbs, size_t precert_tbs_len,
     uint16_t sig_len2 = (uint16_t)((sp[0]<<8)|sp[1]); sp += 2;
     if(sp + sig_len2 > sct_end) return 0;
     const uint8_t *sig = sp;
+    if(sp + sig_len2 != sct_end) return 0;
 
     /* Look up log */
     const ct_log_entry *log = ct_find_log(log_id);
@@ -5623,7 +5768,12 @@ static int ct_verify_sct(const uint8_t *precert_tbs, size_t precert_tbs_len,
 
     /* Build signed data: version(1) + sig_type(1) + timestamp(8) +
        entry_type(2) + issuer_key_hash(32) + tbs_len(3) + tbs + ext_len(2) + ext */
-    size_t signed_data_len = 1 + 1 + 8 + 2 + 32 + 3 + precert_tbs_len + 2 + ext_len;
+    size_t signed_fixed_len = 1 + 1 + 8 + 2 + 32 + 3 + 2;
+    if(precert_tbs_len > 0xFFFFFFu ||
+       precert_tbs_len > SIZE_MAX - signed_fixed_len ||
+       ext_len > SIZE_MAX - signed_fixed_len - precert_tbs_len)
+        return 0;
+    size_t signed_data_len = signed_fixed_len + precert_tbs_len + ext_len;
     uint8_t *signed_data = malloc(signed_data_len);
     if(!signed_data) return 0;
 
@@ -5668,7 +5818,8 @@ static int ct_verify_scts(const x509_cert *leaf, const uint8_t *issuer_key_hash)
     /* Inner OCTET STRING wrapping (some certs have double OCTET STRING) */
     uint8_t tag; size_t ilen;
     const uint8_t *inner = der_read_tl(p, end, &tag, &ilen);
-    if(inner && tag == 0x04 && inner + ilen <= end) {
+    if(inner && tag == 0x04) {
+        if(inner + ilen != end) return -1;
         p = inner;
         end = inner + ilen;
     }
@@ -5679,7 +5830,10 @@ static int ct_verify_scts(const x509_cert *leaf, const uint8_t *issuer_key_hash)
         return -1;
     }
     uint16_t list_len = (uint16_t)((p[0]<<8)|p[1]); p += 2;
-    if(p + list_len > end) list_len = (uint16_t)(end - p);
+    if(p + list_len != end) {
+        fprintf(stderr, "SCT list length mismatch\n");
+        return -1;
+    }
 
     const uint8_t *list_end = p + list_len;
 
@@ -5704,7 +5858,11 @@ static int ct_verify_scts(const x509_cert *leaf, const uint8_t *issuer_key_hash)
 
     while(p + 2 <= list_end) {
         uint16_t sct_len = (uint16_t)((p[0]<<8)|p[1]); p += 2;
-        if(p + sct_len > list_end) break;
+        if(sct_len == 0 || p + sct_len > list_end) {
+            free(precert_tbs);
+            fprintf(stderr, "Malformed SCT list entry\n");
+            return -1;
+        }
 
         if(ct_verify_sct(precert_tbs, precert_tbs_len, issuer_key_hash, p, sct_len)) {
             total_scts++;
@@ -5723,6 +5881,11 @@ static int ct_verify_scts(const x509_cert *leaf, const uint8_t *issuer_key_hash)
             }
         }
         p += sct_len;
+    }
+    if(p != list_end) {
+        free(precert_tbs);
+        fprintf(stderr, "Malformed SCT list tail\n");
+        return -1;
     }
 
     free(precert_tbs);
@@ -5999,7 +6162,8 @@ done:
  * Certificate Chain Validation
  * ================================================================ */
 static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
-                              const char *hostname, int is_tls13) {
+                              const char *hostname, int is_tls13,
+                              int rsa_key_transport) {
     const uint8_t *p=cert_msg;
     const uint8_t *msg_end=cert_msg+cert_msg_len;
     if(is_tls13) {
@@ -6010,8 +6174,8 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     }
     if(p+3>msg_end) return -1;
     uint32_t list_len=GET24(p); p+=3;
+    if((size_t)(msg_end-p)<list_len) return -1;
     const uint8_t *end=p+list_len;
-    if(end>msg_end) end=msg_end;
 
     #define MAX_CHAIN 5
     const uint8_t *chain_der[MAX_CHAIN];
@@ -6019,20 +6183,26 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     int chain_count=0;
     uint8_t *aia_alloc=NULL; /* dynamically fetched AIA cert, freed on exit */
 
-    while(p+3<=end&&chain_count<MAX_CHAIN){
+    while(p<end){
+        if(chain_count>=MAX_CHAIN) {
+            fprintf(stderr,"Certificate chain too long\n");
+            return -1;
+        }
+        if((size_t)(end-p)<3) return -1;
         uint32_t cl=GET24(p); p+=3;
-        if(p+cl>end) break;
+        if((size_t)(end-p)<cl) return -1;
         chain_der[chain_count]=p;
         chain_len[chain_count]=cl;
         chain_count++;
         p+=cl;
         if(is_tls13) {
-            if(p+2>end) break;
+            if((size_t)(end-p)<2) return -1;
             uint16_t el=GET16(p); p+=2;
-            if(p+el>end) break;
+            if((size_t)(end-p)<el) return -1;
             p+=el;
         }
     }
+    if(p!=end) return -1;
     if(chain_count==0){fprintf(stderr,"No certificates in chain\n");return -1;}
 
     x509_cert certs[MAX_CHAIN];
@@ -6053,7 +6223,7 @@ static int verify_cert_chain(const uint8_t *cert_msg, size_t cert_msg_len,
     }
 
     /* Validate leaf certificate */
-    if(validate_leaf_cert(&certs[0],hostname)<0) return -1;
+    if(validate_leaf_cert(&certs[0],hostname,rsa_key_transport)<0) return -1;
 
     /* Check validity period for all chain certs */
     time_t now=time(NULL);
@@ -6246,6 +6416,7 @@ static int tcp_connect(const char *host, int port) {
 /* Send a TLS record (header + body in a single write to avoid TCP fragmentation
    issues with middleboxes that can't reassemble split TLS record headers) */
 static void tls_send_record(int fd, uint8_t type, const uint8_t *data, size_t len) {
+    if(len>UINT16_MAX) die("TLS record too large");
     uint8_t *buf = malloc(5+len);
     if(!buf) die("malloc failed");
     buf[0]=type; buf[1]=(TLS_VERSION_12>>8); buf[2]=(TLS_VERSION_12&0xFF);
@@ -6281,6 +6452,8 @@ struct tls_session {
     size_t psk_len;             /* 32 (SHA-256) or 48 (SHA-384) */
     uint16_t cipher_suite;      /* must match on resumption */
     uint64_t timestamp;         /* time() when ticket was received */
+    char host[MAX_HOSTNAME];    /* endpoint this ticket is bound to */
+    int port;
 };
 
 void tls_session_free(tls_session *s) {
@@ -6291,7 +6464,8 @@ void tls_session_free(tls_session *s) {
    only_group: 0 = emit all key shares (initial CH),
                specific group = emit only that group's key share (after HRR)
    session_id: NULL = generate new (initial CH), non-NULL = reuse (HRR per RFC 8446 §4.1.2) */
-static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT_LEN],
+static size_t build_client_hello(uint8_t *buf, size_t cap,
+                                  const uint8_t p256_pub[P256_POINT_LEN],
                                   const uint8_t p384_pub[P384_POINT_LEN],
                                   const uint8_t x25519_pub[X25519_KEY_LEN],
                                   const uint8_t x448_pub[X448_KEY_LEN],
@@ -6302,6 +6476,8 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
                                   uint16_t only_group,
                                   const tls_session *sess) {
     size_t p=0;
+#define CH_NEED(n) do { size_t need__=(size_t)(n); if(need__ > cap || p > cap - need__) die("ClientHello buffer overflow"); } while(0)
+    CH_NEED(2048); /* fixed ClientHello fields plus all normal key shares */
     /* Handshake header - fill length later */
     buf[p++]=0x01; /* ClientHello */
     buf[p++]=0; buf[p++]=0; buf[p++]=0; /* length placeholder */
@@ -6356,6 +6532,8 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     /* SNI */
     {
         size_t hl=strlen(host);
+        if(hl==0 || hl>=MAX_HOSTNAME) die("invalid hostname length");
+        CH_NEED(4 + 2 + 1 + 2 + hl);
         buf[p++]=0x00;buf[p++]=0x00; /* extension type */
         size_t el=hl+5;
         PUT16(buf+p,(uint16_t)el);p+=2;
@@ -6397,30 +6575,35 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     /* key_share */
     buf[p++]=0x00;buf[p++]=0x33;
     if(only_group==TLS_GROUP_X25519MLKEM768 && hybrid_share) {
+        CH_NEED(2 + 2 + 2 + 2 + HYBRID_SHARE_LEN);
         PUT16(buf+p,(uint16_t)(HYBRID_SHARE_LEN+4+2));p+=2;
         PUT16(buf+p,(uint16_t)(HYBRID_SHARE_LEN+4));p+=2;
         PUT16(buf+p,TLS_GROUP_X25519MLKEM768);p+=2;
         PUT16(buf+p,HYBRID_SHARE_LEN);p+=2;
         memcpy(buf+p,hybrid_share,HYBRID_SHARE_LEN);p+=HYBRID_SHARE_LEN;
     } else if(only_group==TLS_GROUP_SECP256R1) {
+        CH_NEED(2 + 2 + 2 + 2 + P256_POINT_LEN);
         PUT16(buf+p,(uint16_t)(P256_POINT_LEN+4+2));p+=2;
         PUT16(buf+p,(uint16_t)(P256_POINT_LEN+4));p+=2;
         buf[p++]=(TLS_GROUP_SECP256R1>>8);buf[p++]=(TLS_GROUP_SECP256R1&0xFF);
         PUT16(buf+p,P256_POINT_LEN);p+=2;
         memcpy(buf+p,p256_pub,P256_POINT_LEN);p+=P256_POINT_LEN;
     } else if(only_group==TLS_GROUP_SECP384R1) {
+        CH_NEED(2 + 2 + 2 + 2 + P384_POINT_LEN);
         PUT16(buf+p,(uint16_t)(P384_POINT_LEN+4+2));p+=2;
         PUT16(buf+p,(uint16_t)(P384_POINT_LEN+4));p+=2;
         buf[p++]=(TLS_GROUP_SECP384R1>>8);buf[p++]=(TLS_GROUP_SECP384R1&0xFF);
         PUT16(buf+p,P384_POINT_LEN);p+=2;
         memcpy(buf+p,p384_pub,P384_POINT_LEN);p+=P384_POINT_LEN;
     } else if(only_group==TLS_GROUP_X25519) {
+        CH_NEED(2 + 2 + 2 + 2 + X25519_KEY_LEN);
         PUT16(buf+p,(uint16_t)(X25519_KEY_LEN+4+2));p+=2;
         PUT16(buf+p,(uint16_t)(X25519_KEY_LEN+4));p+=2;
         buf[p++]=(TLS_GROUP_X25519>>8);buf[p++]=(TLS_GROUP_X25519&0xFF);
         PUT16(buf+p,X25519_KEY_LEN);p+=2;
         memcpy(buf+p,x25519_pub,X25519_KEY_LEN);p+=X25519_KEY_LEN;
     } else if(only_group==TLS_GROUP_X448) {
+        CH_NEED(2 + 2 + 2 + 2 + X448_KEY_LEN);
         PUT16(buf+p,(uint16_t)(X448_KEY_LEN+4+2));p+=2;
         PUT16(buf+p,(uint16_t)(X448_KEY_LEN+4));p+=2;
         buf[p++]=(TLS_GROUP_X448>>8);buf[p++]=(TLS_GROUP_X448&0xFF);
@@ -6430,6 +6613,7 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
         /* Emit hybrid PQ first (most preferred), then X25519, X448, P-256, P-384 */
         uint16_t shares_len=HYBRID_SHARE_LEN+4+X25519_KEY_LEN+4+X448_KEY_LEN+4+P256_POINT_LEN+4+P384_POINT_LEN+4;
         if(!hybrid_share) shares_len-=HYBRID_SHARE_LEN+4; /* skip hybrid if no key */
+        CH_NEED(2 + 2 + shares_len);
         PUT16(buf+p,(uint16_t)(shares_len+2));p+=2;
         PUT16(buf+p,shares_len);p+=2;
         if(hybrid_share) {
@@ -6473,6 +6657,7 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
 
     /* pre_shared_key extension — MUST be final extension */
     if(sess && sess->ticket && sess->ticket_len>0) {
+        if(sess->ticket_len > UINT16_MAX) die("session ticket too large");
         /* Determine hash length for binder */
         size_t hash_len=sess->psk_len; /* 32 or 48 */
         const hash_alg *psk_alg=(hash_len==48)?&SHA384_ALG:&SHA256_ALG;
@@ -6491,6 +6676,9 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
         size_t identities_inner=2+sess->ticket_len+4;
         size_t binders_inner=1+hash_len;
         size_t ext_data_len=2+identities_inner+2+binders_inner;
+        if(identities_inner > UINT16_MAX || ext_data_len > UINT16_MAX)
+            die("session ticket too large");
+        CH_NEED(4 + ext_data_len);
 
         buf[p++]=0x00;buf[p++]=0x29; /* extension type */
         PUT16(buf+p,(uint16_t)ext_data_len);p+=2;
@@ -6551,6 +6739,7 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
         secure_zero(binder_key,sizeof(binder_key));
         secure_zero(finished_key,sizeof(finished_key));
 
+#undef CH_NEED
         return p;
     }
 
@@ -6558,6 +6747,7 @@ static size_t build_client_hello(uint8_t *buf, const uint8_t p256_pub[P256_POINT
     PUT16(buf+ext_len_pos,(uint16_t)(p-ext_len_pos-2));
     uint32_t body_len=(uint32_t)(p-4);
     buf[1]=(body_len>>16)&0xFF;buf[2]=(body_len>>8)&0xFF;buf[3]=body_len&0xFF;
+#undef CH_NEED
     return p;
 }
 
@@ -6612,47 +6802,79 @@ static uint16_t parse_server_hello(const uint8_t *msg, size_t len,
     uint16_t version=TLS_VERSION_12; /* default TLS 1.2 */
     *pub_len=0;
     if(psk_accepted) *psk_accepted=0;
+    int seen_supported_versions=0;
+    int seen_key_share=0;
+    int seen_psk=0;
     if(b+2<=sh_end) {
         uint16_t ext_total=GET16(b); b+=2;
         const uint8_t *ext_end=b+ext_total;
-        if(ext_end>sh_end) ext_end=sh_end;
+        if(ext_end>sh_end) die("ServerHello extensions exceed message");
         while(b+4<=ext_end) {
             uint16_t etype=GET16(b); b+=2;
             uint16_t elen=GET16(b); b+=2;
-            if(b+elen>ext_end) break;
-            if(etype==0x0033 && elen>=4) { /* key_share */
+            if(b+elen>ext_end) die("ServerHello extension length exceeds message");
+            if(etype==0x0033) { /* key_share */
+                if(seen_key_share) die("duplicate ServerHello key_share");
+                seen_key_share=1;
+                if(elen==2) { /* HelloRetryRequest selected_group form */
+                    b+=elen;
+                    continue;
+                }
+                if(elen<4) die("ServerHello key_share too short");
                 uint16_t group=GET16(b);
                 uint16_t klen=GET16(b+2);
-                if(group==TLS_GROUP_X25519 && klen==X25519_KEY_LEN && elen>=4+X25519_KEY_LEN) {
+                if((size_t)elen!=4u+klen) die("ServerHello key_share length mismatch");
+                if(group==TLS_GROUP_X25519 && klen==X25519_KEY_LEN) {
                     memcpy(server_pub,b+4,X25519_KEY_LEN);
                     *pub_len=X25519_KEY_LEN;
-                } else if(group==TLS_GROUP_X448 && klen==X448_KEY_LEN && elen>=4+X448_KEY_LEN) {
+                } else if(group==TLS_GROUP_X448 && klen==X448_KEY_LEN) {
                     memcpy(server_pub,b+4,X448_KEY_LEN);
                     *pub_len=X448_KEY_LEN;
                 } else if(group==TLS_GROUP_SECP256R1 && klen==P256_POINT_LEN
-                          && elen>=4+P256_POINT_LEN) {
+                          && b[4]==0x04) {
                     memcpy(server_pub,b+4,P256_POINT_LEN);
                     *pub_len=P256_POINT_LEN;
                 } else if(group==TLS_GROUP_SECP384R1 && klen==P384_POINT_LEN
-                          && elen>=4+P384_POINT_LEN) {
+                          && b[4]==0x04) {
                     memcpy(server_pub,b+4,P384_POINT_LEN);
                     *pub_len=P384_POINT_LEN;
                 } else if(group==TLS_GROUP_X25519MLKEM768 && klen==HYBRID_RESP_LEN
-                          && elen>=4+HYBRID_RESP_LEN) {
+                          && elen==4+HYBRID_RESP_LEN) {
                     memcpy(server_pub,b+4,HYBRID_RESP_LEN);
                     *pub_len=HYBRID_RESP_LEN;
+                } else {
+                    die("unsupported or malformed ServerHello key_share");
                 }
-            } else if(etype==0x002b && elen>=2) { /* supported_versions */
+            } else if(etype==0x002b) { /* supported_versions */
+                if(seen_supported_versions) die("duplicate ServerHello supported_versions");
+                if(elen!=2) die("ServerHello supported_versions length mismatch");
+                seen_supported_versions=1;
                 uint16_t ver=GET16(b);
                 if(ver==TLS_VERSION_13) version=TLS_VERSION_13;
-            } else if(etype==0x0029 && elen>=2 && psk_accepted) { /* pre_shared_key */
+            } else if(etype==0x0029) { /* pre_shared_key */
+                if(seen_psk) die("duplicate ServerHello pre_shared_key");
+                if(elen!=2) die("ServerHello pre_shared_key length mismatch");
+                seen_psk=1;
                 uint16_t selected=GET16(b);
-                if(selected==0) *psk_accepted=1;
+                if(selected!=0) die("ServerHello selected unknown PSK identity");
+                if(psk_accepted) *psk_accepted=1;
             }
             b+=elen;
         }
+        if(b!=ext_end) die("truncated ServerHello extension header");
+    } else if(b!=sh_end) {
+        die("trailing byte in ServerHello");
     }
     (void)end;
+    if(version==TLS_VERSION_13) {
+        if(cs!=TLS_AES_128_GCM_SHA256 && cs!=TLS_AES_256_GCM_SHA384 &&
+           cs!=TLS_CHACHA20_POLY1305_SHA256)
+            die("TLS 1.3 negotiated a non-TLS 1.3 cipher suite");
+    } else {
+        if(cs==TLS_AES_128_GCM_SHA256 || cs==TLS_AES_256_GCM_SHA384 ||
+           cs==TLS_CHACHA20_POLY1305_SHA256)
+            die("TLS 1.2 ServerHello selected a TLS 1.3 cipher suite");
+    }
     /* Note: pub_len==0 with version TLS_VERSION_13 is valid for HelloRetryRequest */
     return version;
 }
@@ -6774,6 +6996,7 @@ static void tls12_encrypt_and_send(int fd, uint8_t content_type,
                                      const uint8_t write_iv[4],
                                      uint64_t seq, size_t key_len) {
     if(seq==UINT64_MAX) die("sequence number overflow");
+    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.2 record too large to encrypt");
     uint8_t nonce[AES_GCM_NONCE_LEN];
     memcpy(nonce, write_iv, 4);
     put_be64(nonce+4, seq);
@@ -6781,7 +7004,6 @@ static void tls12_encrypt_and_send(int fd, uint8_t content_type,
     uint8_t aad[13];
     build_tls12_aad(aad, seq, content_type, (uint16_t)len);
 
-    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.2 record too large to encrypt");
     uint8_t *ct=malloc(len);
     if(!ct) die("malloc failed");
     uint8_t tag[AES_GCM_TAG_LEN];
@@ -6835,6 +7057,7 @@ static void tls12_encrypt_and_send_cbc(int fd, uint8_t content_type,
                                          const uint8_t *write_key, size_t key_len,
                                          const uint8_t *mac_key, size_t mac_key_len,
                                          const hash_alg *mac_alg, uint64_t seq) {
+    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.2 CBC record too large");
     /* Compute MAC: HMAC(mac_key, seq||type||version||length||data) */
     size_t mac_len=mac_alg->digest_len;
     uint8_t mac_input_hdr[13];
@@ -6965,13 +7188,13 @@ static void tls12_encrypt_and_send_chacha(int fd, uint8_t content_type,
                                             const uint8_t write_iv[12],
                                             uint64_t seq) {
     if(seq==UINT64_MAX) die("sequence number overflow");
+    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.2 ChaCha record too large");
     uint8_t nonce[12];
     make_nonce(nonce,write_iv,seq);
 
     uint8_t aad[13];
     build_tls12_aad(aad, seq, content_type, (uint16_t)len);
 
-    if(len>TLS_MAX_PLAINTEXT) die("TLS 1.2 ChaCha record too large");
     uint8_t *ct=malloc(len);
     if(!ct) die("malloc failed");
     uint8_t tag[CHACHA20_POLY1305_TAG_LEN];
@@ -7106,6 +7329,7 @@ static int verify_sig_algo(uint16_t algo, const uint8_t *data, size_t data_len,
 typedef struct {
     int fd;
     const char *host, *path;
+    int port;
     uint8_t client_random[32], server_random[32];
     uint8_t p256_priv[P256_SCALAR_LEN], p256_pub[P256_POINT_LEN];
     uint8_t p384_priv[P384_SCALAR_LEN], p384_pub[P384_POINT_LEN];
@@ -7195,6 +7419,40 @@ typedef struct {
     uint16_t ske_curve;
 } tls12_server_params;
 
+static int tls12_cipher_expects_rsa_auth(uint16_t cs) {
+    return cs==TLS_ECDHE_RSA_CHACHA_POLY ||
+           cs==TLS_ECDHE_RSA_AES128_GCM ||
+           cs==TLS_ECDHE_RSA_AES256_GCM ||
+           cs==TLS_ECDHE_RSA_AES256_CBC ||
+           cs==TLS_ECDHE_RSA_AES128_CBC ||
+           cs==TLS_RSA_AES256_GCM ||
+           cs==TLS_RSA_AES128_GCM ||
+           cs==TLS_RSA_AES256_CBC ||
+           cs==TLS_RSA_AES128_CBC;
+}
+
+static int tls12_cipher_expects_ec_auth(uint16_t cs) {
+    return cs==TLS_ECDHE_ECDSA_CHACHA_POLY ||
+           cs==TLS_ECDHE_ECDSA_AES128_GCM ||
+           cs==TLS_ECDHE_ECDSA_AES256_GCM ||
+           cs==TLS_ECDHE_ECDSA_AES256_CBC ||
+           cs==TLS_ECDHE_ECDSA_AES128_CBC;
+}
+
+static int tls12_sig_algo_is_rsa(uint16_t sig_algo) {
+    return sig_algo==TLS_SIG_RSA_PSS_SHA256 ||
+           sig_algo==TLS_SIG_RSA_PSS_SHA384 ||
+           sig_algo==TLS_SIG_RSA_PKCS1_SHA256 ||
+           sig_algo==TLS_SIG_RSA_PKCS1_SHA384;
+}
+
+static int tls12_sig_algo_is_ec(uint16_t sig_algo) {
+    return sig_algo==TLS_SIG_ECDSA_SECP256R1_SHA256 ||
+           sig_algo==TLS_SIG_ECDSA_SECP384R1_SHA384 ||
+           sig_algo==TLS_SIG_ED25519 ||
+           sig_algo==TLS_SIG_ED448;
+}
+
 /* Phase 1: Read Certificate, ServerKeyExchange, ServerHelloDone */
 static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                                     sha384_ctx *transcript384,
@@ -7203,6 +7461,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                                     const uint8_t client_random[32],
                                     const uint8_t server_random[32],
                                     const char *host,
+                                    uint16_t cipher_suite,
                                     tls12_server_params *out) {
     uint8_t *rec = malloc(REC_BUF_SIZE); if(!rec) die("malloc failed");
     size_t rec_len;
@@ -7308,6 +7567,15 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
                     x509_cert leaf;
                     if(x509_parse(&leaf,cp,first_cert_len)!=0)
                         die("Failed to parse leaf cert");
+                    if(tls12_cipher_expects_rsa_auth(cipher_suite)) {
+                        if(leaf.key_type!=2 || !tls12_sig_algo_is_rsa(sig_algo))
+                            die("TLS 1.2 RSA-auth cipher used non-RSA certificate/signature");
+                    } else if(tls12_cipher_expects_ec_auth(cipher_suite)) {
+                        if(leaf.key_type!=1 && leaf.key_type!=3)
+                            die("TLS 1.2 ECDSA-auth cipher used non-EC certificate");
+                        if(!tls12_sig_algo_is_ec(sig_algo))
+                            die("TLS 1.2 ECDSA-auth cipher used non-EC signature");
+                    }
 
                     int sig_ok=verify_sig_algo(sig_algo,signed_data,
                         signed_len,sig_ptr,sig_len_val,&leaf);
@@ -7338,7 +7606,7 @@ static void tls12_read_server_msgs(int fd, sha256_ctx *transcript,
 
     if(out->cert_msg) {
         if(tls_verbose) fprintf(stderr,"  Validating certificate chain...\n");
-        if(verify_cert_chain(out->cert_msg,out->cert_msg_len,host,0)<0)
+        if(verify_cert_chain(out->cert_msg,out->cert_msg_len,host,0,is_rsa_kex)<0)
             die("Certificate verification failed");
     }
     free(rec); free(hs12_buf);
@@ -7520,9 +7788,9 @@ static void tls12_exchange_finished(int fd, cipher_mode_t mode,
             mode,tk->s_wk,tk->key_len,tk->s_mk,tk->mac_key_len,
             tk->mac_alg,tk->s_wiv,0,pt12,&pt12_len);
         if(dec_ok<0) die("Failed to decrypt server Finished");
-        if(pt12[0]!=0x14) die("expected Finished message type");
         if(pt12_len<4||GET24(pt12+1)!=12)
             die("Server Finished length mismatch");
+        if(pt12[0]!=0x14) die("expected Finished message type");
 
         uint8_t th12_sf[SHA384_DIGEST_LEN];
         size_t th12_sf_len;
@@ -7559,9 +7827,13 @@ static struct {
 static void http_output_init(void) { memset(&ho,0,sizeof(ho)); }
 
 static void ho_append(const uint8_t *data, size_t len) {
+    if(len > SIZE_MAX - ho.body_len) die("HTTP response too large");
     if(ho.body_len + len > ho.body_cap) {
         size_t new_cap = ho.body_cap ? ho.body_cap * 2 : 4096;
-        while(new_cap < ho.body_len + len) new_cap *= 2;
+        while(new_cap < ho.body_len + len) {
+            if(new_cap > SIZE_MAX / 2) die("HTTP response too large");
+            new_cap *= 2;
+        }
         ho.body = realloc(ho.body, new_cap);
         if(!ho.body) die("realloc");
         ho.body_cap = new_cap;
@@ -7632,6 +7904,8 @@ static void http_output(const uint8_t *d, size_t len) {
                 else if(c>='a'&&c<='f') v=10+c-'a';
                 else if(c>='A'&&c<='F') v=10+c-'A';
                 else { ho.hex_done=1; continue; }
+                if(ho.chunk_rem > (SIZE_MAX - (size_t)v) / 16)
+                    die("HTTP chunk size overflow");
                 ho.chunk_rem=ho.chunk_rem*16+(size_t)v;
             }
             break;
@@ -7658,14 +7932,22 @@ static void tls12_transfer_appdata(int fd, const char *path, const char *host,
                                     cipher_mode_t mode, const tls12_keys *tk) {
     uint64_t c12_seq=1;
     {
-        char req[REQ_BUF_SIZE];
-        int rlen=snprintf(req,sizeof(req),
+        int rlen=snprintf(NULL,0,
             "GET %s HTTP/1.1\r\nHost: %s\r\n"
             "Connection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             path,host);
+        if(rlen<0) die("failed to format HTTP request");
+        char *req=malloc((size_t)rlen+1);
+        if(!req) die("malloc failed");
+        int rlen2=snprintf(req,(size_t)rlen+1,
+            "GET %s HTTP/1.1\r\nHost: %s\r\n"
+            "Connection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
+            path,host);
+        if(rlen2!=rlen) die("failed to format HTTP request");
         tls12_send_encrypted(fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             mode,tk->c_wk,tk->key_len,tk->c_mk,tk->mac_key_len,
             tk->mac_alg,tk->c_wiv,c12_seq++);
+        free(req);
         if(tls_verbose) fprintf(stderr,"Sent HTTP GET %s\n\n",path);
     }
 
@@ -7744,7 +8026,7 @@ static void tls12_handshake(const tls_conn *conn) {
     memset(&srv,0,sizeof(srv));
     tls12_read_server_msgs(fd, &transcript, &transcript384,
         conn->sh_leftover_data, conn->sh_leftover,
-        is_rsa_kex, client_random, server_random, host, &srv);
+        is_rsa_kex, client_random, server_random, host, cipher_suite, &srv);
 
     /* Phase 2: Key exchange and derivation */
     tls12_keys tk;
@@ -7785,6 +8067,7 @@ static void tls13_transcript_hash(int is_aes256,
 typedef struct {
     int fd;
     const char *host, *path;
+    int port;
     int is_aes256;
     cipher_mode_t mode;
     const hash_alg *alg;
@@ -7920,7 +8203,7 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     if(st->cert_msg){
                         if(tls_verbose) fprintf(stderr,"  Validating certificate chain...\n");
                         if(verify_cert_chain(st->cert_msg,st->cert_msg_len,
-                                             st->host,1)<0)
+                                             st->host,1,0)<0)
                             die("Certificate verification failed");
                     }
                     if(mlen<4) die("CertificateVerify too short");
@@ -7954,9 +8237,18 @@ static void tls13_process_encrypted_hs(tls13_hs_state *st) {
                     if(!st->cert_msg)
                         die("No certificate for CertificateVerify");
                     const uint8_t *cp2=st->cert_msg;
-                    uint8_t ctx_len2=*cp2++; cp2+=ctx_len2;
-                    cp2+=3;
+                    const uint8_t *cert_end=st->cert_msg+st->cert_msg_len;
+                    if(cp2>=cert_end) die("Certificate message too short for CV");
+                    uint8_t ctx_len2=*cp2++;
+                    if((size_t)(cert_end-cp2)<(size_t)ctx_len2+3u)
+                        die("Certificate message truncated for CV");
+                    cp2+=ctx_len2;
+                    uint32_t cert_list_len=GET24(cp2); cp2+=3;
+                    if((size_t)(cert_end-cp2)<cert_list_len || cert_list_len<3)
+                        die("Certificate list truncated for CV");
                     uint32_t leaf_len=GET24(cp2); cp2+=3;
+                    if((size_t)(cert_end-cp2)<leaf_len)
+                        die("Leaf certificate truncated for CV");
                     x509_cert leaf;
                     if(x509_parse(&leaf,cp2,leaf_len)!=0)
                         die("Failed to parse leaf cert for CV");
@@ -8115,13 +8407,21 @@ static void tls13_send_client_finished(tls13_hs_state *st) {
 static void tls13_transfer_appdata(tls13_hs_state *st) {
     uint64_t c_ap_seq=0;
     {
-        char req[REQ_BUF_SIZE];
-        int rlen=snprintf(req,sizeof(req),
+        int rlen=snprintf(NULL,0,
             "GET %s HTTP/1.1\r\nHost: %s\r\n"
             "Connection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
             st->path,st->host);
+        if(rlen<0) die("failed to format HTTP request");
+        char *req=malloc((size_t)rlen+1);
+        if(!req) die("malloc failed");
+        int rlen2=snprintf(req,(size_t)rlen+1,
+            "GET %s HTTP/1.1\r\nHost: %s\r\n"
+            "Connection: close\r\nUser-Agent: tls_client/0.1\r\n\r\n",
+            st->path,st->host);
+        if(rlen2!=rlen) die("failed to format HTTP request");
         encrypt_and_send(st->fd,TLS_RT_APPDATA,(uint8_t*)req,(size_t)rlen,
             st->c_ap_key,st->c_ap_iv,c_ap_seq++,st->mode,st->kl);
+        free(req);
         if(tls_verbose) fprintf(stderr,"Sent HTTP GET %s\n\n",st->path);
     }
 
@@ -8143,7 +8443,8 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
                 http_output(pt,pt_len);
             } else if(inner==TLS_RT_ALERT) {
                 if(pt_len>=2 && pt[0]==1 && pt[1]==0) break;
-                printf("\n[TLS Alert: %d %d]\n",pt[0],pt_len>1?pt[1]:-1);
+                printf("\n[TLS Alert: %d %d]\n",
+                       pt_len>0?pt[0]:-1,pt_len>1?pt[1]:-1);
                 break;
             } else if(inner==TLS_RT_HANDSHAKE) {
                 /* Parse handshake messages inside app data records */
@@ -8151,20 +8452,24 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
                 while(hpos+4<=pt_len) {
                     uint8_t hmtype=pt[hpos];
                     uint32_t hmlen=GET24(pt+hpos+1);
-                    if(hpos+4+hmlen>pt_len) break;
+                    if(hpos+4+hmlen>pt_len) die("truncated TLS 1.3 post-handshake message");
                     if(hmtype==4 && st->out_session) {
                         /* NewSessionTicket (type 4) */
                         const uint8_t *tp=pt+hpos+4;
-                        if(hmlen<13) { hpos+=4+hmlen; continue; }
+                        if(hmlen<13) die("NewSessionTicket too short");
                         uint32_t lifetime=(uint32_t)tp[0]<<24|(uint32_t)tp[1]<<16|
                                           (uint32_t)tp[2]<<8|tp[3];
                         uint32_t age_add=(uint32_t)tp[4]<<24|(uint32_t)tp[5]<<16|
                                          (uint32_t)tp[6]<<8|tp[7];
                         uint8_t nonce_len=tp[8];
-                        if(9u+nonce_len+2>hmlen) { hpos+=4+hmlen; continue; }
+                        if(9u+nonce_len+2>hmlen) die("NewSessionTicket nonce truncated");
                         const uint8_t *nonce=tp+9;
                         uint16_t tkt_len=GET16(tp+9+nonce_len);
-                        if(9u+nonce_len+2+tkt_len>hmlen) { hpos+=4+hmlen; continue; }
+                        if(9u+nonce_len+2+tkt_len>hmlen) die("NewSessionTicket ticket truncated");
+                        if(lifetime==0 || lifetime>604800 || tkt_len==0) {
+                            hpos+=4+hmlen;
+                            continue;
+                        }
                         const uint8_t *tkt_data=tp+9+nonce_len+2;
                         /* Derive PSK from res_master + ticket_nonce */
                         tls_session *sess=calloc(1,sizeof(tls_session));
@@ -8179,6 +8484,8 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
                             TLS_AES_256_GCM_SHA384 : TLS_AES_128_GCM_SHA256;
                         if(st->mode==CIPHER_CHACHA)
                             sess->cipher_suite=TLS_CHACHA20_POLY1305_SHA256;
+                        snprintf(sess->host,sizeof(sess->host),"%s",st->host);
+                        sess->port=st->port;
                         sess->psk_len=st->alg->digest_len;
                         hkdf_expand_label_u(st->alg,st->res_master,"resumption",
                             nonce,nonce_len,sess->psk,sess->psk_len);
@@ -8191,6 +8498,7 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
                     } else if(hmtype==24 && hmlen==1) {
                         /* KeyUpdate — handle inline */
                         uint8_t request_update=pt[hpos+4];
+                        if(request_update > 1) die("invalid KeyUpdate request value");
                         {
                             uint8_t new_s[SHA384_DIGEST_LEN];
                             hkdf_expand_label_u(st->alg,st->s_ap_traffic,
@@ -8224,6 +8532,7 @@ static void tls13_transfer_appdata(tls13_hs_state *st) {
                     }
                     hpos+=4+hmlen;
                 }
+                if(hpos!=pt_len) die("trailing partial TLS 1.3 post-handshake message");
             }
         } else {
             break;
@@ -8247,6 +8556,7 @@ static void tls13_handshake(const tls_conn *conn, int psk_accepted,
     st.fd = conn->fd;
     st.host = conn->host;
     st.path = conn->path;
+    st.port = conn->port;
     st.psk_mode = psk_accepted;
     st.out_session = out_session;
     uint16_t cipher_suite = conn->cipher_suite;
@@ -8354,31 +8664,44 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
                                uint8_t *server_pub, size_t *server_pub_len,
                                uint8_t server_random[32],
                                uint16_t *version,
+                               int *psk_accepted,
                                sha256_ctx *transcript,
                                sha384_ctx *transcript384,
                                size_t *sh_leftover) {
+    if(*rec_len<4) die("HRR too short");
     uint32_t sh_msg_len=4+GET24(rec+1);
+    if(sh_msg_len>*rec_len) die("HRR length exceeds record");
     if(tls_verbose) fprintf(stderr,"Received HelloRetryRequest (cipher=0x%04x)\n",*cipher_suite);
 
     /* Parse HRR extensions to find selected group */
     uint16_t hrr_group=0;
     {
         const uint8_t *b=rec+4;
+        const uint8_t *sh_end=rec+sh_msg_len;
+        if(b+2+32+1+2+1>sh_end) die("HRR truncated");
         b+=2; b+=32;
-        uint8_t sid_len=*b++; b+=sid_len;
+        uint8_t sid_len=*b++;
+        if((size_t)(sh_end-b)<(size_t)sid_len+3u) die("HRR session_id exceeds message");
+        b+=sid_len;
         b+=2; b++;
-        if(b+2<=rec+sh_msg_len) {
+        if(b+2<=sh_end) {
             uint16_t ext_total=GET16(b); b+=2;
             const uint8_t *ext_end=b+ext_total;
-            if(ext_end>rec+sh_msg_len) ext_end=rec+sh_msg_len;
+            if(ext_end>sh_end) die("HRR extensions exceed message");
+            int seen_key_share=0;
             while(b+4<=ext_end) {
                 uint16_t etype=GET16(b); b+=2;
                 uint16_t elen=GET16(b); b+=2;
-                if(b+elen>ext_end) break;
-                if(etype==0x0033 && elen==2)
+                if(b+elen>ext_end) die("HRR extension length exceeds message");
+                if(etype==0x0033) {
+                    if(seen_key_share) die("duplicate HRR key_share");
+                    if(elen!=2) die("HRR key_share length mismatch");
+                    seen_key_share=1;
                     hrr_group=GET16(b);
+                }
                 b+=elen;
             }
+            if(b!=ext_end) die("truncated HRR extension header");
         }
     }
     if(hrr_group!=TLS_GROUP_X25519MLKEM768 && hrr_group!=TLS_GROUP_X25519
@@ -8412,7 +8735,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
        Reuse client_random and session_id per RFC 8446 §4.1.2. */
     uint8_t *ch = malloc(CH_BUF_SIZE); if(!ch) die("malloc failed");
     uint8_t cr_copy[32]; memcpy(cr_copy, client_random, 32);
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub,x448_pub,
+    size_t ch_len=build_client_hello(ch,CH_BUF_SIZE,p256_pub,p384_pub,x25519_pub,x448_pub,
         hybrid_share,host,cr_copy,session_id,hrr_group,NULL);
     if(hrr_aes256)
         sha384_update(transcript384,ch,ch_len);
@@ -8433,7 +8756,7 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
     if(rtype!=TLS_RT_HANDSHAKE) die("expected handshake record after HRR");
     if(rec[0]!=0x02) die("expected ServerHello after HRR");
     *version=parse_server_hello(rec,*rec_len,server_pub,
-        server_pub_len,server_random,cipher_suite,NULL);
+        server_pub_len,server_random,cipher_suite,psk_accepted);
     if(*version!=TLS_VERSION_13) die("expected TLS 1.3 after HRR");
     if(*server_pub_len==0) die("no key_share in real ServerHello after HRR");
     sh_msg_len=4+GET24(rec+1);
@@ -8449,6 +8772,10 @@ static void handle_hello_retry(int fd, uint8_t *rec, size_t *rec_len,
 /* Main TLS handshake + HTTP GET with optional session resumption */
 uint8_t *do_https_get_session(const char *host, int port, const char *path,
                                size_t *out_len, tls_session **session) {
+    if(!host || !path || !out_len) die("invalid argument");
+    size_t host_len=strlen(host);
+    if(host_len==0 || host_len>=MAX_HOSTNAME) die("invalid hostname length");
+
     load_trust_store("trust_store");
 
     /* Check if we have a valid session for PSK resumption */
@@ -8458,6 +8785,16 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
         uint64_t now=(uint64_t)time(NULL);
         if(now - sess->timestamp > sess->ticket_lifetime) {
             if(tls_verbose) fprintf(stderr,"Session ticket expired, doing full handshake\n");
+            tls_session_free(sess);
+            if(session) *session=NULL;
+            sess=NULL;
+        }
+    }
+    if(sess) {
+        size_t sess_host_len=strlen(sess->host);
+        if(sess->port!=port ||
+           !dns_name_eq((const uint8_t *)sess->host,sess_host_len,host,host_len)) {
+            if(tls_verbose) fprintf(stderr,"Session ticket endpoint mismatch, doing full handshake\n");
             tls_session_free(sess);
             if(session) *session=NULL;
             sess=NULL;
@@ -8492,7 +8829,7 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     /* Build & send ClientHello */
     uint8_t *ch = malloc(CH_BUF_SIZE); if(!ch) die("malloc failed");
     uint8_t client_random[32];
-    size_t ch_len=build_client_hello(ch,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,
+    size_t ch_len=build_client_hello(ch,CH_BUF_SIZE,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,
         hybrid_share,host,client_random,NULL,0,sess);
     /* Save session_id from ClientHello for HRR reuse (RFC 8446 §4.1.2) */
     const uint8_t *saved_session_id=ch+6+32+1; /* past: type(1)+len(3)+version(2)+random(32)+sid_len(1) */
@@ -8537,24 +8874,31 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     sha384_update(&transcript384,rec,sh_msg_len);
     size_t sh_leftover=rec_len>sh_msg_len ? rec_len-sh_msg_len : 0;
 
-    /* If we offered PSK but server didn't accept, fall back to full handshake */
-    if(sess && !psk_accepted) {
-        if(tls_verbose) fprintf(stderr,"Server did not accept PSK, falling back to full handshake\n");
-        tls_session_free(sess);
-        if(session) *session=NULL;
-        sess=NULL;
-    }
-    if(psk_accepted && tls_verbose)
-        fprintf(stderr,"Server accepted PSK resumption\n");
+    if(psk_accepted && !sess)
+        die("server accepted PSK that was not offered");
 
     /* HelloRetryRequest handling */
     if(memcmp(server_random,HRR_RANDOM,32)==0) {
         handle_hello_retry(fd,rec,&rec_len,&cipher_suite,client_random,
             saved_session_id,p256_pub,p384_pub,x25519_pub_key,x448_pub_key,
             hybrid_share,host,server_pub,&server_pub_len,
-            server_random,&version,&transcript,&transcript384,&sh_leftover);
+            server_random,&version,&psk_accepted,&transcript,&transcript384,&sh_leftover);
         sh_msg_len=4+GET24(rec+1); /* rec now holds real ServerHello */
+        if(psk_accepted && !sess)
+            die("server accepted PSK that was not offered");
     }
+
+    /* If we offered PSK but server didn't accept, fall back to full handshake. */
+    if(sess && !psk_accepted) {
+        if(tls_verbose) fprintf(stderr,"Server did not accept PSK, falling back to full handshake\n");
+        tls_session_free(sess);
+        if(session) *session=NULL;
+        sess=NULL;
+    }
+    if(sess && psk_accepted && sess->cipher_suite!=cipher_suite)
+        die("server accepted PSK with mismatched cipher suite");
+    if(psk_accepted && tls_verbose)
+        fprintf(stderr,"Server accepted PSK resumption\n");
 
     /* RFC 8446 §4.1.3: detect MITM downgrade from TLS 1.3 to 1.2/1.1 */
     if(version!=TLS_VERSION_13) {
@@ -8572,6 +8916,7 @@ uint8_t *do_https_get_session(const char *host, int port, const char *path,
     conn.fd = fd;
     conn.host = host;
     conn.path = path;
+    conn.port = port;
     memcpy(conn.client_random, client_random, 32);
     memcpy(conn.server_random, server_random, 32);
     memcpy(conn.p256_priv, p256_priv, P256_SCALAR_LEN);
